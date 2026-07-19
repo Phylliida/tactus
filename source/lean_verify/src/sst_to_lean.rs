@@ -1268,23 +1268,8 @@ pub fn exec_fn_theorems_to_ast<'a>(
         // projection-typed needs ride assoc-typ traits, which the
         // outparam filter above already defers.
         if !fn_sst.x.typ_params.is_empty() {
-            let all_fns: Vec<&vir::ast::FunctionX> =
-                krate.functions.iter().map(|f| &f.x).collect();
-            let multi_variant: std::collections::HashSet<&vir::ast::Path> = krate
-                .datatypes
-                .iter()
-                .filter(|d| d.x.variants.len() > 1)
-                .filter_map(|d| match &d.x.name {
-                    vir::ast::Dt::Path(p) => Some(p),
-                    vir::ast::Dt::Tuple(_) => None,
-                })
-                .collect();
-            let needs = crate::nonempty::compute_nonempty_needs(
-                &all_fns,
-                &|p| multi_variant.contains(p),
-            );
-            if let Some(need) = needs.get(&fn_sst.x.name) {
-                for &i in need.params.iter() {
+            if let Some(need) = cached_nonempty_need(krate, &fn_sst.x.name) {
+                for &i in need.0.iter() {
                     if let Some(tp) = fn_sst.x.typ_params.get(i) {
                         bound_binders.push(LBinder::instance(LExpr::app(
                             LExpr::var_lit("Nonempty"),
@@ -5200,6 +5185,58 @@ fn walk_let<'a>(
 /// every theorem the walker emits for the fn — they sit on
 /// `ObligationEmitter::base_binders` and prepend to each
 /// theorem's binder list at emit time.
+thread_local! {
+    /// Per-thread once-per-crate cache of the Nonempty needs map
+    /// (param indices only — the projection needs ride assoc-typ
+    /// traits, deferred with the outparam filter). Keyed by the
+    /// krate's address: `compute_nonempty_needs` walks the WHOLE
+    /// crate (call-graph propagation), and the obligation path runs
+    /// once per fn — recomputing per generic fn was quadratic and
+    /// dominated gt's all-proofs emission memory/time (observed
+    /// 2026-07-19). Bucket threads each compute at most once per
+    /// crate; the map stores OWNED param-index vectors.
+    static NONEMPTY_NEEDS_CACHE: std::cell::RefCell<Option<(usize, std::collections::HashMap<Fun, (Vec<usize>,)>)>> =
+        std::cell::RefCell::new(None);
+}
+
+fn cached_nonempty_need(krate: &KrateX, name: &Fun) -> Option<(Vec<usize>,)> {
+    let key = krate as *const KrateX as usize;
+    NONEMPTY_NEEDS_CACHE.with(|c| {
+        let mut slot = c.borrow_mut();
+        let stale = match &*slot {
+            Some((k, _)) => *k != key,
+            None => true,
+        };
+        if stale {
+            let all_fns: Vec<&vir::ast::FunctionX> =
+                krate.functions.iter().map(|f| &f.x).collect();
+            let multi_variant: std::collections::HashSet<&vir::ast::Path> = krate
+                .datatypes
+                .iter()
+                .filter(|d| d.x.variants.len() > 1)
+                .filter_map(|d| match &d.x.name {
+                    vir::ast::Dt::Path(p) => Some(p),
+                    vir::ast::Dt::Tuple(_) => None,
+                })
+                .collect();
+            let needs = crate::nonempty::compute_nonempty_needs(
+                &all_fns,
+                &|p| multi_variant.contains(p),
+            );
+            let owned: std::collections::HashMap<Fun, (Vec<usize>,)> = needs
+                .iter()
+                .map(|(f, n)| {
+                    let mut ps: Vec<usize> = n.params.iter().copied().collect();
+                    ps.sort();
+                    ((*f).clone(), (ps,))
+                })
+                .collect();
+            *slot = Some((key, owned));
+        }
+        slot.as_ref().and_then(|(_, m)| m.get(name).cloned())
+    })
+}
+
 fn build_param_binders(fn_sst: &FunctionSst) -> Vec<LBinder> {
     let mut out: Vec<LBinder> = Vec::new();
     // Type parameters first, so value params can reference them in
