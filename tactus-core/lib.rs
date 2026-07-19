@@ -532,7 +532,18 @@ pub enum FrameList {
     /// name carry 0 (never rendered in wrap mode).
     FHyp(u64, u64, Box<FrameList>),
     /// (binder id, value leaf, tail) — a let-binding in the spine.
+    /// Post-N1 (bootstrap-74): a PLAIN FLet marks a NON-hoistable let
+    /// (Bool-typed or typ-less — production's hoist_all None cases);
+    /// its presence in a frame list is the wrap-mode gate.
     FLet(u64, u64, Box<FrameList>),
+    /// (binder id, typ leaf, value leaf, eq-name leaf, eq-prop leaf,
+    /// tail) — a HOISTABLE let (bootstrap-74 N1 mirror). In hoist mode
+    /// it renders as the production binder pair `(x : T)
+    /// (_h_x_hoist1 : x = v)` = `All(x, typ) ∘ All(eq_name, eq_prop)`;
+    /// in wrap mode (a plain FLet somewhere in the list) it renders
+    /// `Let(x, v)` exactly like FLet. The typ/eq leaves are serializer
+    /// renderings (production's exact texts, interned).
+    FLetH(u64, u64, u64, u64, u64, Box<FrameList>),
 }
 
 pub type CtxFrame = FrameList;
@@ -608,6 +619,7 @@ pub open spec fn frame_len(f: FrameList) -> nat
         FrameList::FNil => 0,
         FrameList::FBind(_id, _typ, t) => 1 + frame_len(*t),
         FrameList::FHyp(_hn, _h, t) => 1 + frame_len(*t),
+        FrameList::FLetH(_x, _ty, _v, _en, _ep, t) => 1 + frame_len(*t),
         FrameList::FLet(_id, _v, t) => 1 + frame_len(*t),
     }
 }
@@ -1877,6 +1889,7 @@ pub open spec fn frame_append(f: FrameList, g: FrameList) -> FrameList
         FrameList::FNil => g,
         FrameList::FBind(id, typ, t) => FrameList::FBind(id, typ, Box::new(frame_append(*t, g))),
         FrameList::FHyp(hn, h, t) => FrameList::FHyp(hn, h, Box::new(frame_append(*t, g))),
+        FrameList::FLetH(x, ty, v, en, ep, t) => FrameList::FLetH(x, ty, v, en, ep, Box::new(frame_append(*t, g))),
         FrameList::FLet(id, v, t) => FrameList::FLet(id, v, Box::new(frame_append(*t, g))),
     }
 }
@@ -1912,6 +1925,7 @@ pub open spec fn close(f: FrameList, obligation: u64) -> GoalData
         FrameList::FNil => GoalData::Leaf(obligation),
         FrameList::FBind(id, typ, t) => GoalData::All(id, typ, Box::new(close(*t, obligation))),
         FrameList::FHyp(_hn, h, t) => GoalData::Imp(h, Box::new(close(*t, obligation))),
+        FrameList::FLetH(id, _ty, v, _en, _ep, t) => GoalData::Let(id, v, Box::new(close(*t, obligation))),
         FrameList::FLet(id, v, t) => GoalData::Let(id, v, Box::new(close(*t, obligation))),
     }
 }
@@ -1925,15 +1939,62 @@ pub open spec fn close(f: FrameList, obligation: u64) -> GoalData
 // (the architecture decision: a symmetric deepen is FORCED — `goals_eq`
 // compares `LeafE` against `LeafE`, never `LeafE` against `Leaf`).
 #[verifier::structural_decreases]
-pub open spec fn close_e(f: FrameList, ob: RawExp) -> GoalData
+// The N1 all-or-nothing gate (bootstrap-74): production's `hoist_all`
+// returns None — whole goal renders old-style — iff ANY let frame is
+// non-hoistable. The mirror: any plain `FLet` in the list.
+#[verifier::structural_decreases]
+pub open spec fn has_plain_flet(f: FrameList) -> bool
+    decreases f
+{
+    match f {
+        FrameList::FNil => false,
+        FrameList::FBind(_x, _ty, t) => has_plain_flet(*t),
+        FrameList::FHyp(_n, _h, t) => has_plain_flet(*t),
+        FrameList::FLet(_x, _v, _t) => true,
+        FrameList::FLetH(_x, _ty, _v, _en, _ep, t) => has_plain_flet(*t),
+    }
+}
+
+// Wrap-mode rendering (production's goal-position wrap — the pre-N1
+// shape, still used whenever the gate trips): hyps are anonymous
+// implications, lets (both kinds) are goal-position Lets.
+#[verifier::structural_decreases]
+pub open spec fn close_e_wrap(f: FrameList, ob: RawExp) -> GoalData
     decreases f
 {
     match f {
         FrameList::FNil => GoalData::LeafE(render_exp(ob)),
-        FrameList::FBind(id, typ, t) => GoalData::All(id, typ, Box::new(close_e(*t, ob))),
-        FrameList::FHyp(_hn, h, t) => GoalData::Imp(h, Box::new(close_e(*t, ob))),
-        FrameList::FLet(id, v, t) => GoalData::Let(id, v, Box::new(close_e(*t, ob))),
+        FrameList::FBind(id, typ, t) => GoalData::All(id, typ, Box::new(close_e_wrap(*t, ob))),
+        FrameList::FHyp(_hn, h, t) => GoalData::Imp(h, Box::new(close_e_wrap(*t, ob))),
+        FrameList::FLet(id, v, t) => GoalData::Let(id, v, Box::new(close_e_wrap(*t, ob))),
+        FrameList::FLetH(id, _ty, v, _en, _ep, t) => GoalData::Let(id, v, Box::new(close_e_wrap(*t, ob))),
     }
+}
+
+// Hoist-mode rendering (production's hoist_all): every frame becomes a
+// theorem-level binder — hyps NAMED (`All(name, prop)`, the finding-2
+// FBind-encoding), hoistable lets the pair `All(x, typ) ∘
+// All(eq_name, eq_prop)`. A plain FLet cannot occur under the gate;
+// its arm renders Let for totality (unreachable when dispatched).
+#[verifier::structural_decreases]
+pub open spec fn close_e_hoist(f: FrameList, ob: RawExp) -> GoalData
+    decreases f
+{
+    match f {
+        FrameList::FNil => GoalData::LeafE(render_exp(ob)),
+        FrameList::FBind(id, typ, t) => GoalData::All(id, typ, Box::new(close_e_hoist(*t, ob))),
+        FrameList::FHyp(hn, h, t) => GoalData::All(hn, h, Box::new(close_e_hoist(*t, ob))),
+        FrameList::FLet(id, v, t) => GoalData::Let(id, v, Box::new(close_e_hoist(*t, ob))),
+        FrameList::FLetH(id, ty, _v, en, ep, t) =>
+            GoalData::All(id, ty, Box::new(GoalData::All(en, ep, Box::new(close_e_hoist(*t, ob))))),
+    }
+}
+
+// The gated dispatcher — the ONE rendering entry point (all callers
+// unchanged). Mode is decided ONCE over the whole frame list, exactly
+// as production inspects all frames before hoisting (§hoist_all).
+pub open spec fn close_e(f: FrameList, ob: RawExp) -> GoalData {
+    if has_plain_flet(f) { close_e_wrap(f, ob) } else { close_e_hoist(f, ob) }
 }
 
 // W6d.1b: the bare-atom obligation. An obligation leaf that carries no deep
@@ -2017,6 +2078,12 @@ pub open spec fn havoc_lets(f: FrameList, mods: BinderList) -> FrameList
             } else {
                 FrameList::FLet(id, v, Box::new(havoc_lets(*t, mods)))
             },
+        FrameList::FLetH(id, ty, v, en, ep, t) =>
+            if binder_has_id(mods, id) == 1 {
+                havoc_lets(*t, mods)
+            } else {
+                FrameList::FLetH(id, ty, v, en, ep, Box::new(havoc_lets(*t, mods)))
+            },
     }
 }
 
@@ -2083,6 +2150,7 @@ pub open spec fn has_let(f: FrameList) -> nat
         FrameList::FBind(_id, _typ, t) => has_let(*t),
         FrameList::FHyp(_hn, _h, t) => has_let(*t),
         FrameList::FLet(_id, _v, _t) => 1,
+        FrameList::FLetH(_id, _ty, _v, _en, _ep, _t) => 1,
     }
 }
 
@@ -2233,6 +2301,7 @@ pub open spec fn strip_hyps(f: FrameList) -> FrameList
         FrameList::FBind(x, ty, t) => FrameList::FBind(x, ty, Box::new(strip_hyps(*t))),
         FrameList::FHyp(_hn, _h, t) => strip_hyps(*t),
         FrameList::FLet(x, v, t) => FrameList::FLet(x, v, Box::new(strip_hyps(*t))),
+        FrameList::FLetH(x, ty, v, en, ep, t) => FrameList::FLetH(x, ty, v, en, ep, Box::new(strip_hyps(*t))),
     }
 }
 
@@ -3204,32 +3273,79 @@ pub open spec fn obligs_safe(he: HeOracle, l: RawExpList, st: St) -> bool
 /// defunctionalized form of hand-Lean
 /// `closeSem f st (fun st' => he (render_exp o) st')`.
 #[verifier::structural_decreases]
-pub open spec fn close_sem_e(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, o: RawExp) -> bool
+pub open spec fn close_sem_e_wrap(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, o: RawExp) -> bool
     decreases f
 {
     match f {
         FrameList::FNil => he(render_exp(o), st),
         FrameList::FBind(x, _ty, t) =>
-            forall|n: int| #[trigger] close_sem_e(hp, he, lv, *t, upd(st, x, n), o),
-        FrameList::FHyp(_hn, h, t) => hp(h, st) ==> close_sem_e(hp, he, lv, *t, st, o),
-        FrameList::FLet(x, v, t) => close_sem_e(hp, he, lv, *t, upd(st, x, lv(v, st)), o),
+            forall|n: int| #[trigger] close_sem_e_wrap(hp, he, lv, *t, upd(st, x, n), o),
+        FrameList::FHyp(_hn, h, t) => hp(h, st) ==> close_sem_e_wrap(hp, he, lv, *t, st, o),
+        FrameList::FLet(x, v, t) => close_sem_e_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), o),
+        FrameList::FLetH(x, _ty, v, _en, _ep, t) => close_sem_e_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), o),
     }
+}
+
+// Hoist-mode semantics — parallels close_e_hoist arm-for-arm so
+// holds(close_e_hoist …) == close_sem_e_hoist … is a mechanical
+// induction: named hyps and let-pairs read as ∀-binders (the abstract
+// FBind reading; the adequacy layer recovers the dependent-product
+// meaning, exactly as it already does for the reqs binders).
+#[verifier::structural_decreases]
+pub open spec fn close_sem_e_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, o: RawExp) -> bool
+    decreases f
+{
+    match f {
+        FrameList::FNil => he(render_exp(o), st),
+        FrameList::FBind(x, _ty, t) =>
+            forall|n: int| #[trigger] close_sem_e_hoist(hp, he, lv, *t, upd(st, x, n), o),
+        FrameList::FHyp(hn, _h, t) =>
+            forall|n: int| #[trigger] close_sem_e_hoist(hp, he, lv, *t, upd(st, hn, n), o),
+        FrameList::FLet(x, v, t) => close_sem_e_hoist(hp, he, lv, *t, upd(st, x, lv(v, st)), o),
+        FrameList::FLetH(x, _ty, _v, en, _ep, t) =>
+            forall|a: int, b: int| #[trigger] close_sem_e_hoist(hp, he, lv, *t, upd(upd(st, x, a), en, b), o),
+    }
+}
+
+pub open spec fn close_sem_e(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, o: RawExp) -> bool {
+    if has_plain_flet(f) { close_sem_e_wrap(hp, he, lv, f, st, o) } else { close_sem_e_hoist(hp, he, lv, f, st, o) }
 }
 
 /// Frame-telescope interpretation, continuation = "every obligation in
 /// `l` holds at the inner state" (the second and last continuation shape
 /// `exec_safe_f` needs).
 #[verifier::structural_decreases]
-pub open spec fn close_sem_obligs(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, l: RawExpList) -> bool
+pub open spec fn close_sem_obligs_wrap(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, l: RawExpList) -> bool
     decreases f
 {
     match f {
         FrameList::FNil => obligs_safe(he, l, st),
         FrameList::FBind(x, _ty, t) =>
-            forall|n: int| #[trigger] close_sem_obligs(hp, he, lv, *t, upd(st, x, n), l),
-        FrameList::FHyp(_hn, h, t) => hp(h, st) ==> close_sem_obligs(hp, he, lv, *t, st, l),
-        FrameList::FLet(x, v, t) => close_sem_obligs(hp, he, lv, *t, upd(st, x, lv(v, st)), l),
+            forall|n: int| #[trigger] close_sem_obligs_wrap(hp, he, lv, *t, upd(st, x, n), l),
+        FrameList::FHyp(_hn, h, t) => hp(h, st) ==> close_sem_obligs_wrap(hp, he, lv, *t, st, l),
+        FrameList::FLet(x, v, t) => close_sem_obligs_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), l),
+        FrameList::FLetH(x, _ty, v, _en, _ep, t) => close_sem_obligs_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), l),
     }
+}
+
+#[verifier::structural_decreases]
+pub open spec fn close_sem_obligs_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, l: RawExpList) -> bool
+    decreases f
+{
+    match f {
+        FrameList::FNil => obligs_safe(he, l, st),
+        FrameList::FBind(x, _ty, t) =>
+            forall|n: int| #[trigger] close_sem_obligs_hoist(hp, he, lv, *t, upd(st, x, n), l),
+        FrameList::FHyp(hn, _h, t) =>
+            forall|n: int| #[trigger] close_sem_obligs_hoist(hp, he, lv, *t, upd(st, hn, n), l),
+        FrameList::FLet(x, v, t) => close_sem_obligs_hoist(hp, he, lv, *t, upd(st, x, lv(v, st)), l),
+        FrameList::FLetH(x, _ty, _v, en, _ep, t) =>
+            forall|a: int, b: int| #[trigger] close_sem_obligs_hoist(hp, he, lv, *t, upd(upd(st, x, a), en, b), l),
+    }
+}
+
+pub open spec fn close_sem_obligs(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, l: RawExpList) -> bool {
+    if has_plain_flet(f) { close_sem_obligs_wrap(hp, he, lv, f, st, l) } else { close_sem_obligs_hoist(hp, he, lv, f, st, l) }
 }
 
 /// Operational safety — FRAME-CARRYING (the W5c lift, probe24): mirrors
