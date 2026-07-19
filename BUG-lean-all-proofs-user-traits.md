@@ -3,15 +3,33 @@
 **Date:** 2026-07-16
 **Found by:** the tactus-algebra arc (verified-CAD program) — first trait-heavy
 corpus pointed at `--lean-all-proofs`.
-**Status:** diagnosed, not fixed. **Re-verified still reproducing
-2026-07-19** on post-triple-merge main (minimal repro: 1 verified /
-1 errors, same mode-(b) shape; error text now reads "simp_all made no
-progress" under the derived closers). None of the recent arcs touched
-trait emission — b70/b71 was wp-cert serializer generics, and the
-vec_field closure (BUG-vecfield-clone-ensures.md) explicitly named
-THIS arc as where the call_ensures/trait-ensures encoding belongs.
-Two customers now waiting: tactus-algebra/cad-01 Lean discharge, and
-the general call_ensures encoding. Companion to `DESIGN-lean-all-proofs-bugs.md`
+**Status (2026-07-19 evening): EMISSION PHASE CLOSED (e3da0f9).**
+Both failure modes below dissolve; the minimal repro passes 2/0 in
+single- AND cross-module form. The trait→class / impl→instance
+machinery (trait_emit.rs, 1200 lines) predated this arc and mostly
+worked — the sketch's items 1+2 were already built; what was missing
+was six narrow completions, each pulled from a corpus error:
+goal-mentioned trait-method simp unfolds (impl obligations reduce
+through the registered instance); trait-bound instance binders +
+[Nonempty T] brackets on the SST obligation path; nullary-method
+result annotations (T::zero() Self-inference); defs roots through
+instance-field bodies; seq-companion gate hoist + companion-citation
+import edges. Acceptance corpus (tactus-algebra, --lean-all-proofs):
+**2/182 → 60 verified, elaboration 100% clean** — every remaining
+failure is proof POWER on the crate's hard poly/ring lemmas (171×
+"omega could not prove" + 2 maxRecDepth), i.e. the closer arc, not
+trait emission. Follow-ons tracked: (i) assoc-typed trait bounds on
+obligation theorems need impl_subst's standalone augmentation (the
+outparam filter defers them today); (ii) instance PROOF fields are
+`by sorry` placeholders (TACTIC_BODY_FALLBACK) — a latent-trust
+design question (the real proofs are the separate obligation
+theorems, unreferencable from the defs layer; the Z3-mirroring
+alternative is per-trait axioms justified per-impl); (iii) the
+call_ensures encoding (BUG-vecfield-clone-ensures.md item 1) remains
+its own arc.
+
+Original status: diagnosed, not fixed. Re-verified still reproducing
+2026-07-19 morning on post-triple-merge main. Companion to `DESIGN-lean-all-proofs-bugs.md`
 (B1–B5 families); this is a distinct family those fixes don't cover — gt is
 nearly trait-free, so it never surfaced there.
 
