@@ -21,6 +21,7 @@ pub mod prelude;
 pub mod project;
 pub mod ret_subst;
 pub mod sanity;
+pub mod script;
 pub mod tactic_select;
 pub mod source_util;
 pub mod sourcemap;

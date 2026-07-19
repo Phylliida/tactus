@@ -1373,6 +1373,31 @@ pub fn exec_fn_theorems_to_ast<'a>(
             }
         })
         .collect();
+    // Have-names of the PROP-valued equation rewrites among the
+    // broadcast lemmas (`(s1 = s2) = …` — the ext_equal family): used
+    // as simp `simp_all` rewrites they explode a goal's own Seq
+    // equality into len∧pointwise form, which is exactly the
+    // structural tail's failure on the pmul definitional asserts. The
+    // script's StructuralTail excludes them by name (same-pass naming
+    // contract — the haves are seeded below by this same loop).
+    let bc_ext_haves: Vec<String> = broadcast_lemmas
+        .iter()
+        .enumerate()
+        .filter_map(|(i, fun)| {
+            let fx = krate.functions.iter().find(|f| &f.x.name == *fun)?;
+            if fx.x.ensure.0.len() != 1 {
+                return None;
+            }
+            match &fx.x.ensure.0[0].x {
+                vir::ast::ExprX::Binary(vir::ast::BinaryOp::Eq(_), l, _)
+                    if matches!(&*vir::ast_util::undecorate_typ(&l.typ), vir::ast::TypX::Bool) =>
+                {
+                    Some(format!("_tactus_bc_{}", i))
+                }
+                _ => None,
+            }
+        })
+        .collect();
     if !broadcast_lemmas.is_empty() {
         let haves: String = broadcast_lemmas.iter().enumerate()
             .map(|(i, f)| format!("have _tactus_bc_{} := @{}", i, lean_name(&f.path)))
@@ -1390,6 +1415,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
         tactic_prefix,
         eliminators,
         broadcast_count: broadcast_lemmas.len(),
+        bc_ext_haves,
         req_binder_start,
         baseline_prefix_len,
         default_closer,
@@ -2231,6 +2257,11 @@ struct ObligationEmitter {
     /// blow up the one-step-unfold close. Same-pass naming contract —
     /// the haves are seeded by this same construction site.
     broadcast_count: usize,
+    /// Have-names of the PROP-valued equation rewrites among the
+    /// broadcast lemmas (the ext_equal family) — the script's
+    /// StructuralTail excludes just these (the guard simp excludes
+    /// everything, the tail still wants the arithmetic seq axioms).
+    bc_ext_haves: Vec<String>,
     /// Index in `base_binders` where the trailing `h_req<i>` run starts
     /// (usize::MAX when there is none — shell/test emitters). Lets
     /// `build_goal_shape` mark requires-hyps `Requires { index }` by
@@ -2492,15 +2523,56 @@ impl ObligationEmitter {
                     // default closer (kernel rungs + explicit peel +
                     // fixed CORE normalizer + structural rung),
                     // replacing the `tactus_auto` search.
-                    None => Tactic::Raw(crate::tactic_select::derived_closer(
-                        &goal,
-                        &self.dt_inventory,
-                        &binders,
-                        self.tactic_prefix.len() > self.baseline_prefix_len,
-                        &self.eliminators,
-                        self.broadcast_count,
-                        Some(&mut census),
-                    )),
+                    None => {
+                        // N3-M2: try authoring a script first (the
+                        // emitter holds the goal + provenance spine —
+                        // information flows forward). A script rides
+                        // PRIMARY with the derived chain as fallback;
+                        // when no v1 form applies, the derived chain
+                        // alone (the census marks that separately).
+                        let user_prefix =
+                            self.tactic_prefix.len() > self.baseline_prefix_len;
+                        let scripted = if !user_prefix {
+                            goal_shape.as_ref().and_then(|shape| {
+                                crate::script::author_v1(
+                                    &goal,
+                                    shape,
+                                    &self.dt_inventory,
+                                    &self.bc_ext_haves,
+                                )
+                            })
+                        } else {
+                            None
+                        };
+                        match scripted {
+                            Some((moves, form)) => {
+                                census = form.census();
+                                let script_text = crate::script::render_script(&moves);
+                                let chain = crate::tactic_select::derived_closer(
+                                    &goal,
+                                    &self.dt_inventory,
+                                    &binders,
+                                    user_prefix,
+                                    &self.eliminators,
+                                    self.broadcast_count,
+                                    None,
+                                );
+                                Tactic::Raw(format!(
+                                    "first | ({}) | ({})",
+                                    script_text, chain
+                                ))
+                            }
+                            None => Tactic::Raw(crate::tactic_select::derived_closer(
+                                &goal,
+                                &self.dt_inventory,
+                                &binders,
+                                user_prefix,
+                                &self.eliminators,
+                                self.broadcast_count,
+                                Some(&mut census),
+                            )),
+                        }
+                    }
                 }
             }
             _ => closer,
@@ -4964,6 +5036,7 @@ pub(crate) fn cert_call_leaves<'a>(
         tactic_prefix: Vec::new(),
         eliminators: Vec::new(),
         broadcast_count: 0,
+        bc_ext_haves: Vec::new(),
         req_binder_start: usize::MAX,
         baseline_prefix_len: 0,
         default_closer: Tactic::Named("tactus_auto".to_string()),

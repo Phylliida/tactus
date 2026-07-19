@@ -1,6 +1,27 @@
 # DESIGN — N3: Provenance-Driven Proof Scripts
 
 **Status:** DRAFT v0.1 (2026-07-19), for iteration with Danielle.
+**M2 LANDED (2026-07-19):** script IR (`script.rs`: 14-move
+vocabulary + render + render-time name discipline) + author v1
+(forms A, B) + primary-with-fallback emission. Census:
+`script:formA`/`script:formB` classes live (algebra: 444 script
+(A:413 B:31) / 393 rung:formE / 37 rung-only — form B covers 31/31
+of the recursive-LHS obligations, subsuming M1's UnfoldOnce arm
+entirely). Algebra: 205 → 166 failing obligations, 87 verified, zero
+fn-level regressions; rust_verify_test 138/140 (2 pre-existing);
+phantom audit: all 27 direct-Mathlib pkg files elaborate clean.
+Lessons beyond M1's: (5) the definitional asserts live on the WRAP
+path (Prop-typed lets block N1 hoisting) — the author must walk the
+let spine itself (intro+subst, naming antecedents `h_scr_N`);
+(6) `simp only [facts] at *` is the one-move normalization for
+fact-hyp bounds (h_len rewrites h_sub's `↑(len x)` to `↑1`) — the
+exact case M1 couldn't reach; (7) the structural tail's `simp_all`
+must exclude the PROP-valued equation rewrites (ext_equal family) BY
+LOCAL HAVE NAME or it explodes the goal's Seq equality — the emitter
+computes `bc_ext_haves` from the broadcast list itself;
+(8) `rfl`/`omega`/`intro` ERROR on zero goals — every script close
+ends `| done` or a GuardSimp that closed the goal mid-script kills
+the arm with "No goals to be solved".
 **M0 LANDED (2026-07-19):** provenance completion + census harness.
 `Other` split into `Requires/HoistEq/CtorEq/LoopInv/AssertFact/
 AssumeFact` (+ `LoopPhase`); CallFactInfo carries the coarse ensures

@@ -183,6 +183,12 @@ pub enum CloserCensus {
     /// User-supplied closer (`tactus_tactic` attr, assert-by tactic,
     /// or a hand-authored exec-theorem tactic).
     User,
+    /// N3-M2: an authored script (form A — branch + woven fact) is
+    /// primary, the derived chain rides fallback.
+    ScriptFormA,
+    /// N3-M2: an authored script (form B — definitional step of a
+    /// recursive spec fn) is primary, the derived chain rides fallback.
+    ScriptFormB,
 }
 
 impl CloserCensus {
@@ -196,6 +202,8 @@ impl CloserCensus {
             CloserCensus::RungFormE => "rung:formE",
             CloserCensus::RungFormBE => "rung:formB+formE",
             CloserCensus::User => "user",
+            CloserCensus::ScriptFormA => "script:formA",
+            CloserCensus::ScriptFormB => "script:formB",
         }
     }
 }
