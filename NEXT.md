@@ -12,15 +12,10 @@ exec certs wait on it). Design is FINAL on the card (three passes,
 converged). State:
 
 - **Slice 1a DONE** (`d08b6c1`): FHyp name-field arity migration.
-- **Slice 1b WIP** (`bd2d92f`): spec layer DONE (FLetH variant,
-  `has_plain_flet` gate, close_e / close_sem_e / close_sem_obligs
-  wrap-hoist split + gated dispatchers, six matcher arms).
-  **Remaining: the proof layer** — precise numbered map in the card's
-  "Slice 1b WIP state" section: 3 proof matches to mode-split
-  (holds_close_e, cso_nil_true, cso_cons_split), u_cse_hyp/u_cso_hyp
-  wrap-only restatements, prophecy_sound×2 ∀-form restatements.
-  ⚠ 0-sentinel hyp names collide in hoist mode — use distinct ids in
-  model fixtures; serializer must never emit 0 names.
+- **Slice 1b DONE** (`17b6e72`): spec + proof layers complete, 182/0 +
+  package gate green, discharge 102/4 (residual = §5 Q1
+  Other-provenance equation hyps, emitter-side — not b74 scope).
+  Architecture + closer recipes recorded on the card.
 - **Slice 2 (serializer)**: `_h_hoist_i` ordinal naming, FLetH
   classification (type_map typ + non-Bool), Call-post + RetBind
   conversion, goals-side deepener follow-up for hoisted shapes.
