@@ -4742,11 +4742,13 @@ pub(crate) fn cert_call_leaves<'a>(
     }
     // Same-fn spec source (non-trait): specs live on the callee itself.
     let spec_callee = callee;
-    // No generics — keeps `typ_subst` empty (the restricted subset does
-    // not model type-arg-instantiated leaves).
-    if !callee.typ_params.is_empty() {
-        return Err("call-generic".to_string());
-    }
+    // Generics (bootstrap-70): allowed. `build_call_substitutions`
+    // populates `typ_subst` from `typ_args`; requires leaves substitute
+    // it explicitly (Phase D), ensures leaves get it via
+    // `build_ens_post_render_subst`, and the ret typ is instantiated at
+    // the VIR level below (`ret_typ_subst`, mirroring production's
+    // dest-let binder typ) so `type_bound_predicate`/`coerce_lexpr`
+    // see the concrete typ, not a bare `TypParam`.
     // No `&mut` params — the mut-arg existential / rebind / prophecy
     // machinery is out of the restricted subset.
     if callee.params.iter()
@@ -4832,6 +4834,17 @@ pub(crate) fn cert_call_leaves<'a>(
     // / push_ret_frames, no mut/prophecy). Structure assembly is the
     // serializer's job; here we only render the leaves + tag the path. ──
     let ret = &callee.ret.x;
+    // VIR-level instantiated ret typ (production: the dest-let binder
+    // typ site). Identity for non-generic callees.
+    let ret_typ_subst: Typ = if callee.typ_params.len() == typ_args.len() {
+        let map: HashMap<vir::ast::Ident, Typ> = callee.typ_params.iter()
+            .cloned()
+            .zip(typ_args.iter().cloned())
+            .collect();
+        vir::sst_util::subst_typ(&map, &ret.typ)
+    } else {
+        ret.typ.clone()
+    };
     let ret_eq = vir_find_ret_eq(&inlined.ensures, &subst);
     let substituted_ensures = render_call_ensures(
         &inlined.ensures, &subst, None, callee, &render_ctx_ens,
@@ -4846,10 +4859,10 @@ pub(crate) fn cert_call_leaves<'a>(
             // excluded by the restricted subset, so the bridge always
             // applies (identity when sort + wrappers already match).
             let dest_value = crate::expr_shared::coerce_lexpr(
-                e_raw.clone(), &q.rhs.typ, &ret.typ,
+                e_raw.clone(), &q.rhs.typ, &ret_typ_subst,
             );
             // Bound goes on RAW E (`0 ≤ E ∧ E < hi` over E's own sort).
-            let e_bound = crate::to_lean_sst_expr::type_bound_predicate(&e_raw, &ret.typ);
+            let e_bound = crate::to_lean_sst_expr::type_bound_predicate(&e_raw, &ret_typ_subst);
             // REST: eq conjunct already dropped by render_call_ensures'
             // skip; substitute fresh_ret → bridged E, keep only if
             // non-trivial (matches push_ret_frames).
@@ -4865,7 +4878,7 @@ pub(crate) fn cert_call_leaves<'a>(
             CertCallPost::RetEq { e_bound, rest, dest_value }
         }
         None => {
-            let ret_typ = substitute(&typ_to_expr(&ret.typ), &subst.typ_subst);
+            let ret_typ = substitute(&typ_to_expr(&ret_typ_subst), &subst.typ_subst);
             let dest_lean = crate::lean_name::LeanName::from_var_ident(dest_ident);
             // Approach A: name the ∀-bound result with the dest's own name
             // (skip the alias FLet) unless the dest is free in the ensures.
@@ -4877,7 +4890,7 @@ pub(crate) fn cert_call_leaves<'a>(
                 subst.fresh_ret_name.clone()
             };
             let ret_bound = crate::to_lean_sst_expr::type_bound_predicate(
-                &LExpr::var(binder_name.clone()), &ret.typ,
+                &LExpr::var(binder_name.clone()), &ret_typ_subst,
             );
             let ens = substituted_ensures.map(|conj| {
                 if use_dest_name {
