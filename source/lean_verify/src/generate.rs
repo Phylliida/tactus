@@ -2851,6 +2851,58 @@ static DISCHARGE_DETAIL: std::sync::OnceLock<std::sync::Mutex<String>> =
 static ISLAND_CACHED_VERDICTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+// N3-M0 closer census counters (DESIGN-N3-provenance-scripts.md §8):
+// bumped once per emitted theorem by `census_bump` (the emitter sets
+// the class alongside the closer selection); read once per crate run
+// by `closer_census_report`. Six counters, one per `CloserCensus`
+// variant — atomic like the other per-crate tallies above.
+static CENSUS_S1_OMEGA: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static CENSUS_RUNG_ONLY: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static CENSUS_FORM_B: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static CENSUS_FORM_E: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static CENSUS_FORM_BE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static CENSUS_USER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Increment the census counter for one emitted theorem.
+pub fn census_bump(c: crate::lean_ast::CloserCensus) {
+    use std::sync::atomic::Ordering::Relaxed;
+    match c {
+        crate::lean_ast::CloserCensus::S1Omega => CENSUS_S1_OMEGA.fetch_add(1, Relaxed),
+        crate::lean_ast::CloserCensus::RungOnly => CENSUS_RUNG_ONLY.fetch_add(1, Relaxed),
+        crate::lean_ast::CloserCensus::RungFormB => CENSUS_FORM_B.fetch_add(1, Relaxed),
+        crate::lean_ast::CloserCensus::RungFormE => CENSUS_FORM_E.fetch_add(1, Relaxed),
+        crate::lean_ast::CloserCensus::RungFormBE => CENSUS_FORM_BE.fetch_add(1, Relaxed),
+        crate::lean_ast::CloserCensus::User => CENSUS_USER.fetch_add(1, Relaxed),
+    };
+}
+
+/// The N4 summary line (DESIGN-N3 §8): one line per crate run, printed
+/// unconditionally at crate end (empty when nothing was emitted — the
+/// Lean backend wasn't in play). Script classes join in M2; the
+/// ratchet asserts the script share never decreases from then on.
+pub fn closer_census_report() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s1 = CENSUS_S1_OMEGA.load(Relaxed);
+    let rung = CENSUS_RUNG_ONLY.load(Relaxed);
+    let b = CENSUS_FORM_B.load(Relaxed);
+    let e = CENSUS_FORM_E.load(Relaxed);
+    let be = CENSUS_FORM_BE.load(Relaxed);
+    let u = CENSUS_USER.load(Relaxed);
+    if s1 + rung + b + e + be + u == 0 {
+        return String::new();
+    }
+    format!(
+        "tactus: closers: {} s1-omega / {} rung:formB / {} rung:formE / {} rung:formB+formE / {} rung-only / {} user-supplied",
+        s1, b, e, be, rung, u
+    )
+}
+
 static PKG_OLEAN_BUILT: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
 > = std::sync::OnceLock::new();
@@ -5206,6 +5258,17 @@ fn write_spine_sidecar(
                                             esc(&arg.text), esc(&tag)));
                                     }
                                     j.push(']');
+                                j.push_str(",\"ens\":[");
+                                for (k, s) in info.ensures_summary.iter().enumerate() {
+                                    if k > 0 { j.push(','); }
+                                    j.push_str(&format!("\"{}\"", match s {
+                                        crate::lean_ast::EnsuresShape::LenEq => "leneq",
+                                        crate::lean_ast::EnsuresShape::ForallPointwise => "pointwise",
+                                        crate::lean_ast::EnsuresShape::OtherEq => "eq",
+                                        crate::lean_ast::EnsuresShape::Other => "other",
+                                    }));
+                                }
+                                j.push(']');
                                 }
                                 Some(HypProvenance::Branch(None)) =>
                                     j.push_str(",\"p\":\"branch\""),
@@ -5214,6 +5277,27 @@ fn write_spine_sidecar(
                                     esc(&t.scrutinee), esc(&t.datatype), esc(&t.variant), t.positive)),
                                 Some(HypProvenance::HeightFact) =>
                                     j.push_str(",\"p\":\"height\""),
+                                Some(HypProvenance::Requires { index }) =>
+                                    j.push_str(&format!(",\"p\":\"requires\",\"i\":{}", index)),
+                                Some(HypProvenance::HoistEq { binder }) =>
+                                    j.push_str(&format!(
+                                        ",\"p\":\"hoist\",\"binder\":\"{}\"", esc(binder.as_str()))),
+                                Some(HypProvenance::CtorEq { scrutinee, variant, .. }) =>
+                                    j.push_str(&format!(
+                                        ",\"p\":\"ctor\",\"scrut\":\"{}\",\"variant\":\"{}\"",
+                                        esc(scrutinee.as_str()), esc(variant))),
+                                Some(HypProvenance::LoopInv { index, at }) =>
+                                    j.push_str(&format!(
+                                        ",\"p\":\"loopinv\",\"i\":{},\"at\":\"{}\"",
+                                        index,
+                                        match at {
+                                            crate::lean_ast::LoopPhase::Maintain => "maintain",
+                                            crate::lean_ast::LoopPhase::Exit => "exit",
+                                        })),
+                                Some(HypProvenance::AssertFact) =>
+                                    j.push_str(",\"p\":\"assert\""),
+                                Some(HypProvenance::AssumeFact) =>
+                                    j.push_str(",\"p\":\"assume\""),
                                 Some(HypProvenance::Other) =>
                                     j.push_str(",\"p\":\"other\""),
                                 None => {}
@@ -5231,6 +5315,27 @@ fn write_spine_sidecar(
                                 esc(&t.scrutinee), esc(&t.datatype), esc(&t.variant), t.positive)),
                             HypProvenance::HeightFact =>
                                 j.push_str("{\"k\":\"imp\",\"p\":\"height\"}"),
+                            HypProvenance::Requires { index } =>
+                                j.push_str(&format!("{{\"k\":\"imp\",\"p\":\"requires\",\"i\":{}}}", index)),
+                            HypProvenance::HoistEq { binder } =>
+                                j.push_str(&format!(
+                                    "{{\"k\":\"imp\",\"p\":\"hoist\",\"binder\":\"{}\"}}", esc(binder.as_str()))),
+                            HypProvenance::CtorEq { scrutinee, variant, .. } =>
+                                j.push_str(&format!(
+                                    "{{\"k\":\"imp\",\"p\":\"ctor\",\"scrut\":\"{}\",\"variant\":\"{}\"}}",
+                                    esc(scrutinee.as_str()), esc(variant))),
+                            HypProvenance::LoopInv { index, at } =>
+                                j.push_str(&format!(
+                                    "{{\"k\":\"imp\",\"p\":\"loopinv\",\"i\":{},\"at\":\"{}\"}}",
+                                    index,
+                                    match at {
+                                        crate::lean_ast::LoopPhase::Maintain => "maintain",
+                                        crate::lean_ast::LoopPhase::Exit => "exit",
+                                    })),
+                            HypProvenance::AssertFact =>
+                                j.push_str("{\"k\":\"imp\",\"p\":\"assert\"}"),
+                            HypProvenance::AssumeFact =>
+                                j.push_str("{\"k\":\"imp\",\"p\":\"assume\"}"),
                             HypProvenance::Other =>
                                 j.push_str("{\"k\":\"imp\",\"p\":\"other\"}"),
                             HypProvenance::CallFact(info) => {
@@ -5247,6 +5352,16 @@ fn write_spine_sidecar(
                                     j.push_str(&format!(
                                         "{{\"text\":\"{}\",\"tag\":\"{}\"}}",
                                         esc(&arg.text), esc(&tag)));
+                                }
+                                j.push_str("],\"ens\":[");
+                                for (k, s) in info.ensures_summary.iter().enumerate() {
+                                    if k > 0 { j.push(','); }
+                                    j.push_str(&format!("\"{}\"", match s {
+                                        crate::lean_ast::EnsuresShape::LenEq => "leneq",
+                                        crate::lean_ast::EnsuresShape::ForallPointwise => "pointwise",
+                                        crate::lean_ast::EnsuresShape::OtherEq => "eq",
+                                        crate::lean_ast::EnsuresShape::Other => "other",
+                                    }));
                                 }
                                 j.push_str("]}");
                             }

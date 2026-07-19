@@ -861,6 +861,7 @@ fn branch_ctor_frames(
     let var_san = crate::to_lean_type::sanitize(p.variant);
     let mut frames: Vec<CtxFrame> = Vec::new();
     let mut args: Vec<LExpr> = Vec::new();
+    let mut field_names: Vec<LeanName> = Vec::new();
     for f in variant.fields.iter() {
         let fty = vir::sst_util::subst_typ_for_datatype(
             &dx.typ_params, typ_args, &f.a.0,
@@ -868,6 +869,7 @@ fn branch_ctor_frames(
         let fname = LeanName::synthetic(format!(
             "{}_{}", p.scrut.as_str(), crate::to_lean_fn::field_name(&f.name),
         ));
+        field_names.push(fname.clone());
         frames.push(CtxFrame::Binder(LBinder::explicit(
             fname.clone(),
             crate::to_lean_type::typ_to_expr(&fty),
@@ -895,7 +897,13 @@ fn branch_ctor_frames(
     );
     frames.push(CtxFrame::Hyp(
         eq,
-        HypProvenance::Branch(branch_test_of(cond, true)),
+        // N2's constructor equation — distinct from the branch
+        // condition that produced it (N3 §3.3).
+        HypProvenance::CtorEq {
+            scrutinee: p.scrut.clone(),
+            variant: var_san.clone(),
+            fields: field_names,
+        },
     ));
     Some(frames)
 }
@@ -1292,6 +1300,10 @@ pub fn exec_fn_theorems_to_ast<'a>(
         }
     }
     binders.extend(build_borrow_mut_binders(check));
+    // Req binders land as the trailing `h_req<i>` run of `base_binders`
+    // — remember where the run starts so `build_goal_shape` can mark
+    // them `Requires { index }` (N3-M0) instead of name-sniffing.
+    let req_binder_start = binders.len();
     binders.extend(build_req_binders(fn_sst, check, &mut_param_names, &fn_map));
 
     // Build the whole WP tree from the (mut-ref-rewritten) body,
@@ -1378,6 +1390,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
         tactic_prefix,
         eliminators,
         broadcast_count: broadcast_lemmas.len(),
+        req_binder_start,
         baseline_prefix_len,
         default_closer,
         heartbeats: fn_sst.x.attrs.tactus_heartbeats,
@@ -2033,12 +2046,13 @@ impl OblCtx {
                     out.push((
                         LBinder::explicit(
                             eq_name,
-                            LExpr::eq(LExpr::var(chosen), v2),
+                            LExpr::eq(LExpr::var(chosen.clone()), v2),
                         ),
-                        // Definitional-equation hypothesis; census-Other
-                        // for the Link-discharge spine until a dedicated
-                        // provenance variant exists (doc §5 Q1).
-                        Some(HypProvenance::Other),
+                        // Definitional-equation hypothesis for the
+                        // hoisted let-binder — N1's HoistEq, the
+                        // SubstHoists script move's target (N3 §3.3;
+                        // resolves doc §5 Q1).
+                        Some(HypProvenance::HoistEq { binder: chosen.clone() }),
                     ));
                 }
                 CtxFrame::Hyp(p, prov) => {
@@ -2217,6 +2231,12 @@ struct ObligationEmitter {
     /// blow up the one-step-unfold close. Same-pass naming contract —
     /// the haves are seeded by this same construction site.
     broadcast_count: usize,
+    /// Index in `base_binders` where the trailing `h_req<i>` run starts
+    /// (usize::MAX when there is none — shell/test emitters). Lets
+    /// `build_goal_shape` mark requires-hyps `Requires { index }` by
+    /// position rather than by sniffing names (N3's information-flows-
+    /// forward rule).
+    req_binder_start: usize,
     /// `tactic_prefix.len()` at construction — the broadcast-lemma
     /// `have` block only. Entries beyond this are USER prefixes
     /// (walk-pushed `proof { tac }` scopes), which reshape goals;
@@ -2403,8 +2423,13 @@ impl ObligationEmitter {
         leaf: &LExpr,
     ) -> GoalShape {
         let mut spine: Vec<GoalSpine> = Vec::new();
-        for b in self.base_binders.iter() {
-            spine.push(GoalSpine::All(b.clone(), None));
+        for (i, b) in self.base_binders.iter().enumerate() {
+            let prov = if i >= self.req_binder_start {
+                Some(HypProvenance::Requires { index: i - self.req_binder_start })
+            } else {
+                None
+            };
+            spine.push(GoalSpine::All(b.clone(), prov));
         }
         for (b, prov) in extras.iter() {
             spine.push(GoalSpine::All(b.clone(), prov.clone()));
@@ -2441,6 +2466,10 @@ impl ObligationEmitter {
     ) {
         let mut binders = self.base_binders.clone();
         binders.extend(extra_binders);
+        // N3-M0 census: which closer the emitter authored (see
+        // `CloserCensus`). Set alongside every closer selection below;
+        // aggregated per crate run by `generate::closer_census_report`.
+        let mut census = crate::lean_ast::CloserCensus::User;
         // Deterministic floor (S1, tactic_select): when the DEFAULT
         // closer would run and the goal (hypotheses included — they
         // are binder types and wrapped implications) lies in the
@@ -2455,7 +2484,10 @@ impl ObligationEmitter {
         let mut closer = match &closer {
             Tactic::Named(n) if n == "tactus_auto" => {
                 match crate::tactic_select::select_deterministic(&goal, &binders) {
-                    Some(sel) => Tactic::Raw(sel.tactic_text(&goal)),
+                    Some(sel) => {
+                        census = crate::lean_ast::CloserCensus::S1Omega;
+                        Tactic::Raw(sel.tactic_text(&goal))
+                    }
                     // S2c (§3.4): no fragment answer → the derived
                     // default closer (kernel rungs + explicit peel +
                     // fixed CORE normalizer + structural rung),
@@ -2467,6 +2499,7 @@ impl ObligationEmitter {
                         self.tactic_prefix.len() > self.baseline_prefix_len,
                         &self.eliminators,
                         self.broadcast_count,
+                        Some(&mut census),
                     )),
                 }
             }
@@ -2484,10 +2517,12 @@ impl ObligationEmitter {
                         self.tactic_prefix.len() > self.baseline_prefix_len,
                         &self.eliminators,
                         self.broadcast_count,
+                        Some(&mut census),
                     ),
                 ));
             }
         }
+        crate::generate::census_bump(census);
         let tactic = self.compose_tactic(closer);
         // Lockstep with `out.push` below: one shape per emitted theorem.
         self.goal_shapes.push(goal_shape);
@@ -2496,6 +2531,7 @@ impl ObligationEmitter {
             binders,
             goal,
             tactic,
+            closer_census: Some(census),
             requires_preamble,
             heartbeats: self.heartbeats,
             // Exec-fn obligation theorems are flat (recursion lives in the
@@ -2581,7 +2617,7 @@ fn obl_with_choose_hyps(exp: &Exp, ctx: &WpCtx, obl: &OblCtx) -> OblCtx {
     .unwrap_or_default();
     let mut out = obl.clone();
     for h in hyps {
-        out = out.with_frame(CtxFrame::Hyp(h, HypProvenance::Other));
+        out = out.with_frame(CtxFrame::Hyp(h, HypProvenance::AssumeFact));
     }
     out
 }
@@ -2638,7 +2674,7 @@ fn walk_obligations<'a>(
             let prov = if matches!(kind, AssertKind::Obligation(ObligationKind::Termination)) {
                 HypProvenance::HeightFact
             } else {
-                HypProvenance::Other
+                HypProvenance::AssertFact
             };
             let new_obl = obl.with_frame(CtxFrame::Hyp(cond_ast, prov));
             walk_obligations(body, ctx, &new_obl, e);
@@ -2652,7 +2688,7 @@ fn walk_obligations<'a>(
                     p,
                     &ctx.render_ctx().with_let_binder_typs(&obl.let_binder_typs),
                 ),
-                HypProvenance::Other,
+                HypProvenance::AssumeFact,
             ));
             walk_obligations(body, ctx, &new_obl, e);
         }
@@ -2982,7 +3018,7 @@ fn walk_assert_by_tactus<'a>(
                 e.emit_split(name, goal, obl);
             }
             // Cond as hypothesis for body theorems (reuse cond_ast).
-            let new_obl = obl.with_frame(CtxFrame::Hyp(cond_ast, HypProvenance::Other));
+            let new_obl = obl.with_frame(CtxFrame::Hyp(cond_ast, HypProvenance::AssertFact));
             walk_obligations(body, ctx, &new_obl, e);
         }
         None => {
@@ -3171,8 +3207,11 @@ fn walk_loop<'a>(
     // they're only required at break.
     let mut maintain_obl = obl.clone();
     push_mod_var_frames(&mut maintain_obl, modified_vars);
-    for inv in &entry_invs_marked {
-        maintain_obl.frames.push_back(CtxFrame::Hyp(inv.clone(), HypProvenance::Other));
+    for (i, inv) in entry_invs_marked.iter().enumerate() {
+        maintain_obl.frames.push_back(CtxFrame::Hyp(
+            inv.clone(),
+            HypProvenance::LoopInv { index: i, at: crate::lean_ast::LoopPhase::Maintain },
+        ));
     }
     if let Some(c) = cond {
         maintain_obl.frames.push_back(CtxFrame::Hyp(cond_marked(&c), HypProvenance::Branch(None)));
@@ -3207,8 +3246,11 @@ fn walk_loop<'a>(
     // to fall-through inside the body.
     let mut use_obl = obl.clone();
     push_mod_var_frames(&mut use_obl, modified_vars);
-    for inv in &exit_invs_marked {
-        use_obl.frames.push_back(CtxFrame::Hyp(inv.clone(), HypProvenance::Other));
+    for (i, inv) in exit_invs_marked.iter().enumerate() {
+        use_obl.frames.push_back(CtxFrame::Hyp(
+            inv.clone(),
+            HypProvenance::LoopInv { index: i, at: crate::lean_ast::LoopPhase::Exit },
+        ));
     }
     if let Some(c) = cond {
         use_obl.frames.push_back(CtxFrame::Hyp(LExpr::not(cond_marked(&c)), HypProvenance::Branch(None)));
@@ -4585,7 +4627,51 @@ fn build_call_fact_info(
         })
         .collect();
     let callee_name = crate::to_lean_type::lean_name_relative(&callee.name.path);
-    CallFactInfo { is_self: callee_name == e.fn_name, callee: callee_name, args }
+    CallFactInfo {
+        is_self: callee_name == e.fn_name,
+        callee: callee_name,
+        args,
+        ensures_summary: ensures_shape_summary(callee),
+    }
+}
+
+/// N3-M0 (§3.3): coarse per-conjunct shape summary of a callee's
+/// ensures, recorded at weave time. Deliberately shallow — the M3
+/// form-D author refines as corpus customers appear.
+fn ensures_shape_summary(callee: &FunctionX) -> Vec<crate::lean_ast::EnsuresShape> {
+    use crate::lean_ast::EnsuresShape;
+    let mut out = Vec::new();
+    for ens in callee.ensure.0.iter() {
+        let mut cs = Vec::new();
+        vir_top_conjuncts(ens, &mut cs);
+        for c in cs {
+            out.push(match &c.x {
+                ExprX::Binary(BinaryOp::Eq(_), l, r) => {
+                    if is_len_call(l) || is_len_call(r) {
+                        EnsuresShape::LenEq
+                    } else {
+                        EnsuresShape::OtherEq
+                    }
+                }
+                ExprX::Quant(q, _, _) if q.quant == air::ast::Quant::Forall => {
+                    EnsuresShape::ForallPointwise
+                }
+                _ => EnsuresShape::Other,
+            });
+        }
+    }
+    out
+}
+
+/// Is the expression a `*.len`-named spec call? (Coarse check for the
+/// ensures summary — last path segment only.)
+fn is_len_call(e: &Expr) -> bool {
+    match &e.x {
+        ExprX::Call(vir::ast::CallTarget::Fun(_, fun, _, _, _, _), _, _) => {
+            fun.path.segments.last().map(|s| s.as_str() == "len").unwrap_or(false)
+        }
+        _ => false,
+    }
 }
 
 fn push_ret_frames(
@@ -4878,6 +4964,7 @@ pub(crate) fn cert_call_leaves<'a>(
         tactic_prefix: Vec::new(),
         eliminators: Vec::new(),
         broadcast_count: 0,
+        req_binder_start: usize::MAX,
         baseline_prefix_len: 0,
         default_closer: Tactic::Named("tactus_auto".to_string()),
         heartbeats: None,

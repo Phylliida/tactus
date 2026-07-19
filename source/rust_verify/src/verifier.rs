@@ -3480,6 +3480,17 @@ impl Verifier {
             }
         }
 
+        // N3-M0 closer census (DESIGN-N3-provenance-scripts.md §8): one
+        // summary line per crate run, unconditionally at crate end, so the
+        // N4 ratchet can read emission choices independent of verdicts.
+        {
+            let report = lean_verify::closer_census_report();
+            if !report.is_empty() {
+                let reporter = Reporter::new(spans, compiler);
+                reporter.report_now(&note_bare(report).to_any());
+            }
+        }
+
         let time_verify_crate_end = Instant::now();
         self.time_verify_crate = time_verify_crate_end - time_verify_crate_start;
 

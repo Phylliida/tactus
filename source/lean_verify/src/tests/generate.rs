@@ -14,6 +14,7 @@ fn stub_theorem(name: &str, requires_preamble: Vec<PreambleFragment>) -> Theorem
         name: name.to_string(),
         binders: Vec::new(),
         goal: LExpr::lit_bool(true),
+        closer_census: None,
         tactic: Tactic::Named("tactus_auto".to_string()),
         requires_preamble,
         heartbeats: None,

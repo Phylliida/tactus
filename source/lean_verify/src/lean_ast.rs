@@ -162,12 +162,55 @@ pub struct DefCurried {
     pub equations: Vec<MatchArm>,
 }
 
+/// N3-M0 closer census (DESIGN-N3-provenance-scripts.md §8): the
+/// emission-time record of WHICH closer the emitter authored for a
+/// theorem. Greppable in artifacts (`-- tactus-closer: <class>`) so N4
+/// metrics are computable from artifacts alone; aggregated per crate
+/// run by the summary line (`generate::closer_census_report`). Script
+/// forms (`script:formX` / `script-fallback:rung`) join in M2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloserCensus {
+    /// The S1 deterministic floor selected `omega` / peel-omega.
+    S1Omega,
+    /// The derived chain with no N3-M1 arm applicable.
+    RungOnly,
+    /// Derived chain with the UnfoldOnce (form B) arm present.
+    RungFormB,
+    /// Derived chain with the two-phase form E arm present.
+    RungFormE,
+    /// Derived chain with both M1 arms present.
+    RungFormBE,
+    /// User-supplied closer (`tactus_tactic` attr, assert-by tactic,
+    /// or a hand-authored exec-theorem tactic).
+    User,
+}
+
+impl CloserCensus {
+    /// The artifact-comment spelling. Fixed format — the N4 ratchet
+    /// greps for it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CloserCensus::S1Omega => "s1-omega",
+            CloserCensus::RungOnly => "rung-only",
+            CloserCensus::RungFormB => "rung:formB",
+            CloserCensus::RungFormE => "rung:formE",
+            CloserCensus::RungFormBE => "rung:formB+formE",
+            CloserCensus::User => "user",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Theorem {
     pub name: String,
     pub binders: Vec<Binder>,
     pub goal: Expr,
     pub tactic: Tactic,
+    /// Which closer the emitter authored (see `CloserCensus`). `Some`
+    /// on every production path through `emit_with_extras`; `None` in
+    /// tests and on emit paths the census doesn't cover — the pp only
+    /// prints the comment for `Some`.
+    pub closer_census: Option<CloserCensus>,
     /// Preamble fragments this theorem needs to elaborate. Aggregated
     /// across all of an exec fn's theorems by `generate.rs`'s
     /// `krate_preamble`, then deduped and emitted once at the top of
@@ -289,6 +332,12 @@ pub enum GoalSpine {
 /// discharge term must supply a proof for every `Imp` it applies
 /// through, and the recipe depends on where the hypothesis came from.
 /// Documentation-plus-data only: never affects the rendered theorem.
+///
+/// N3-M0 (DESIGN-N3-provenance-scripts.md §3.3) split the old
+/// catch-all `Other` into typed variants — the script author's moves
+/// (SubstHoists, GuardSimp, ExactHyp, loop forms) key on these, as
+/// does the Link-discharge census. `Other` remains for auxiliary
+/// machinery hyps (type-bound predicates, call-fact build fallbacks).
 #[derive(Debug, Clone, PartialEq)]
 pub enum HypProvenance {
     /// A callee-ensures fact woven by a proof-body call: discharged by
@@ -305,9 +354,39 @@ pub enum HypProvenance {
     /// Termination assert carried forward): discharged by the emitted
     /// termination VC theorem.
     HeightFact,
-    /// Anything else (assumes, invariants, passed plain asserts…) —
-    /// not dischargeable mechanically; census-tagged by the generator.
+    /// A fn `requires` clause (theorem binder `h_req<index>`).
+    Requires { index: usize },
+    /// N1 let-hoisting's definitional equation for a hoisted binder —
+    /// the SubstHoists script move's target (N3 §4).
+    HoistEq { binder: crate::lean_name::LeanName },
+    /// N2's constructor equation `scrut = Dt.Variant f0 f1 …`
+    /// (positive IsVariant branch, leaf-normal upgrade).
+    CtorEq {
+        scrutinee: crate::lean_name::LeanName,
+        variant: String,
+        fields: Vec<crate::lean_name::LeanName>,
+    },
+    /// A loop invariant hypothesis.
+    LoopInv { index: usize, at: LoopPhase },
+    /// A passed user `assert(P)` (any closer) carried forward as a
+    /// hypothesis for the rest of the body.
+    AssertFact,
+    /// An `assume(P)` or an auxiliary witness fact (choose-witness
+    /// hypothesis from `obl_with_choose_hyps`).
+    AssumeFact,
+    /// Auxiliary machinery hyps (type-bound predicates, call-fact
+    /// build fallbacks) — census-tagged by the generator.
     Other,
+}
+
+/// Which loop context a `LoopInv` hypothesis was pushed for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopPhase {
+    /// The maintain (in-iteration) context: invariant assumed at the
+    /// loop header for the body walk.
+    Maintain,
+    /// The after-loop context: invariant established at loop exit.
+    Exit,
 }
 
 /// Instantiation record for one woven callee fact.
@@ -319,6 +398,28 @@ pub struct CallFactInfo {
     pub is_self: bool,
     /// Rendered instantiation, in callee param order.
     pub args: Vec<SpineArg>,
+    /// Coarse shape summary of the callee's ensures conjuncts,
+    /// recorded at weave time while the emitter is holding the
+    /// callee's ensures (N3-M0 §3.3 / form D §6): the ExtSplit script
+    /// move (M3) reads these to know whether the call supplies the
+    /// len-eq and pointwise conjuncts an ext-close needs.
+    pub ensures_summary: Vec<EnsuresShape>,
+}
+
+/// Coarse shape class of one ensures conjunct (N3 form D's input).
+/// Deliberately shallow — the M3 author refines as corpus customers
+/// appear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsuresShape {
+    /// An equation whose either side is a length-of application
+    /// (a `*.len`-named spec call).
+    LenEq,
+    /// A universal quantification (the pointwise-view shape).
+    ForallPointwise,
+    /// Any other equation.
+    OtherEq,
+    /// Anything else.
+    Other,
 }
 
 /// One rendered call argument plus the bound-discharge recipe hint.

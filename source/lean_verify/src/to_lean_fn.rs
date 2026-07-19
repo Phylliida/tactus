@@ -1095,6 +1095,9 @@ pub fn proof_fn_to_ast(
         binders,
         goal,
         tactic: Tactic::Raw(tactic_body.to_string()),
+        // User-supplied tactic body (the `#[verifier::tactus_tactic]`
+        // path) — the census class is `User`.
+        closer_census: Some(crate::lean_ast::CloserCensus::User),
         requires_preamble: Vec::new(),
         heartbeats: f.attrs.tactus_heartbeats,
         termination_by,
