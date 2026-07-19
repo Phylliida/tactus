@@ -128,3 +128,35 @@ spurious quantifier. Corrected plan:
   where oracles are real (probe37 territory).
 - "Semantics untouched" in the earlier sketch was WRONG — semantics
   gains ImpN + gated close_sem, both mechanical.
+
+### Design FINAL (2026-07-19, third pass — the reqs precedent decides it)
+
+The ImpN correction was itself overcorrected. `FnCtxData.reqs`
+(finding-2) already established the encoding for named prop binders:
+`FBind(name, prop)` → `All(name, prop)` with the abstract ∀-reading
+(holds ignores the typ slot); the ADEQUACY layer recovers the real
+dependent-product meaning (`∀ (h : P), G` IS `P → G` in real Lean).
+The hoisted forms reuse it wholesale:
+
+- Hyp → `FBind(_h_hoist_i, prop)`-style rendering via a NAMED FHyp:
+  `FHyp(name, prop, rest)` renders `All(name, prop)` in hoist mode,
+  `Imp(prop)` in wrap mode.
+- Hoistable let → `FLetH(x, typ, v, eq_name, eq_prop, rest)`:
+  hoist mode `All(x,typ) ∘ All(eq_name, eq_prop)`; wrap mode
+  `Let(x, v)`. Plain `FLet` remains (non-hoistable), and its presence
+  IS the gate: `has_plain_flet(f)` → whole goal wraps (mirrors
+  hoist_all's all-or-nothing None).
+- `close_e` / `close_sem_e` / `close_sem_obligs` split into
+  wrap/hoist recursions with the gate applied ONCE at the top (suffix
+  recursion never re-checks — matches production inspecting the whole
+  frame list once). Semantics parallels rendering per mode
+  (hoist-mode FHyp/FLetH read as ∀-binders like FBind; wrap mode as
+  today). GoalData UNCHANGED; goals transcriber UNCHANGED.
+- NO wrap↔hoist equivalence obligation in the oracle-parametric layer.
+
+Serializer half (step 2): FHyp name ids = production's `_h_hoist_i`
+ordinal among FHyps in the frame prefix (per-branch walk state); reqs
+already named; Assign classification (type_map typ, non-Bool →
+FLetH); Call-post FLet → FLetH; RetBind let likewise; shadow
+freshening = documented honest-fail initially (no-shadow common case
+first).
