@@ -1,0 +1,6 @@
+import TactusDefs_lib_exec
+set_option linter.unusedVariables false
+set_option maxHeartbeats 800000
+set_option autoImplicit false
+@[reducible] noncomputable def _tactus_postcondition_u_ceh_hyp_at_lib_3718_13_1_stmt : Prop :=
+  ∀ (n : Int) (h_n_bound : 0 ≤ n ∧ n < 18446744073709551616) (h : Int) (h_h_bound : 0 ≤ h ∧ h < 18446744073709551616) (t : Tactus.Box lib.FrameList) (ob : lib.RawExp), /- @rust:lib.rs:3718:13 -/ lib.close_e_hoist (lib.FrameList.FHyp n h t) ob = lib.GoalData.All n h (Tactus.Box.mk (lib.close_e_hoist t.deref ob))
