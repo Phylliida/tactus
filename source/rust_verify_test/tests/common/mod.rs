@@ -407,7 +407,9 @@ pub fn run_verus(
         } else if *option == "--lean-backend" {
             verus_args.push("--lean-backend".to_string());
         } else if *option == "--lean-all-proofs" {
-            verus_args.push("--lean-all-proofs".to_string());
+            // Historical no-op: proof-fn routing is always on under
+            // --lean-backend since 2026-07-19; the flag was removed.
+            // Swallowed here so existing tests' option lists stay valid.
         } else if *option == "vstd" {
             // ignore
         } else if *option == "-V allow-inline-air" {
@@ -425,7 +427,7 @@ pub fn run_verus(
             verus_args.push("-V".to_string());
             verus_args.push("new-mut-ref".to_string());
         } else if *option == "lean-all-proofs" {
-            verus_args.push("--lean-all-proofs".to_string());
+            // Historical no-op (see the "--lean-all-proofs" arm above).
         } else if *option == "no-bv-simplify" {
             verus_args.push("-V".to_string());
             verus_args.push("no-bv-simplify".to_string());

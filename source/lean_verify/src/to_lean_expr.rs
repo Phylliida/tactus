@@ -506,7 +506,24 @@ fn expr_to_node(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
             // load-bearing for Lean's instance synthesis.
             let is_class_method = matches!(target,
                 CallTarget::Fun(CallTargetKind::DynamicResolved { .. }, _, _, _, _, _)
-                | CallTarget::Fun(CallTargetKind::Dynamic, _, _, _, _, _));
+                | CallTarget::Fun(CallTargetKind::Dynamic, _, _, _, _, _))
+                // Statically-resolved calls to a TRAIT METHOD DECL
+                // (`Self::picked()` in an impl's copied ensures) must
+                // also route through class dispatch — the generic
+                // fallthrough renders the projection bare with
+                // POSITIONAL type args, which mis-elaborates
+                // ("(Self : Type) → [inst] → Int expected Int").
+                || match target {
+                    CallTarget::Fun(_, fun, _, _, _, _) => ctx
+                        .fn_map
+                        .and_then(|m| m.get(fun))
+                        .map(|f| matches!(
+                            &f.kind,
+                            vir::ast::FunctionKind::TraitMethodDecl { .. }
+                        ))
+                        .unwrap_or(false),
+                    _ => false,
+                };
             if is_class_method {
                 let (fun_for_lookup, typ_args) = match target {
                     CallTarget::Fun(_, fun, typs, _, _, _) => (fun, typs),
@@ -573,7 +590,30 @@ fn expr_to_node(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
                     }
                 }).collect();
                 let app = if app_args.is_empty() {
-                    head
+                    // NULLARY method (`T::zero()`, `Self::picked()`):
+                    // no value arg pins `Self`, and the result
+                    // annotation below only helps when the return typ
+                    // MENTIONS Self (`zero : Self`) — `picked : Int`
+                    // leaves `?Self` stuck. Pin it explicitly with a
+                    // named argument from the call's first type arg
+                    // (the trait's Self instantiation).
+                    match typ_args.first() {
+                        // Inside the trait's OWN declaration (default
+                        // bodies, method ensures copied into the
+                        // class), the Self instantiation is the `Self`
+                        // TYPE PARAM itself and the reference resolves
+                        // to the sibling FIELD, which takes no Self
+                        // argument — pinning there is ill-formed
+                        // ("Invalid argument name Self"). Skip: the
+                        // pre-existing result annotation suffices.
+                        Some(self_typ) if !is_self_param(self_typ) => {
+                            LExpr::app(head, vec![LExpr::var_lit(&format!(
+                                "(Self := ({}))",
+                                crate::lean_pp::pp_expr(&typ_to_expr(self_typ)),
+                            ))])
+                        }
+                        _ => head,
+                    }
                 } else {
                     LExpr::app(head, app_args)
                 };
@@ -1089,6 +1129,15 @@ fn call_to_node(target: &CallTarget, args: &Exprs, ctx: &crate::expr_shared::Ren
 /// `MyTrait.method` while the class was `mymod.MyTrait`). Cross-crate vstd
 /// traits live under a module (`view::View`), so last-2 emitted bare
 /// `View.view` against a `view.View` class — unresolved (#122 B2).
+/// Is this typ the trait's own `Self` type param? (VIR spells it
+/// `Self%`; the binder normalizes to `Self`.) Discriminates
+/// inside-trait-decl references (sibling fields, no Self argument)
+/// from instantiated call sites (global projections, pin Self).
+fn is_self_param(t: &Typ) -> bool {
+    matches!(&**t, vir::ast::TypX::TypParam(n)
+        if n.as_str() == "Self%" || n.as_str() == "Self")
+}
+
 fn trait_method_ref(fun: &Fun) -> LExpr {
     var(&lean_name(&fun.path))
 }

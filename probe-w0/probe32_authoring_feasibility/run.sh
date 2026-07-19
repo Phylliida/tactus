@@ -18,7 +18,7 @@ echo
 
 t0=$(date +%s%N)
 TACTUS_LEAN_OUT="$OUT" "$VERUS" \
-  --crate-type=lib --lean-backend --lean-all-proofs -V cache \
+  --crate-type=lib --lean-backend -V cache \
   "$HERE/lib.rs" 2>&1 | tee "$OUT/run.log"
 rc=${PIPESTATUS[0]}
 t1=$(date +%s%N)

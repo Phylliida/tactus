@@ -221,6 +221,34 @@ its absence is how the S2c regression shipped.
 
 ---
 
+## N3 investigation notes (2026-07-19, pre-design probes)
+
+> Probes in `probe-n3-scripts/` (all hand-validated on tactus-algebra
+> artifacts). Findings that shape the N3 design:
+>
+> 1. **Hypothesis completeness holds.** User proof-body lemma calls
+>    land as complete hoisted hypotheses (N1). "The body is the script
+>    skeleton" is viable for proof fns: transcribe the call sequence,
+>    close leaves by assumption/omega.
+> 2. **Two script forms validated.** Form A (branch + axiom-call):
+>    subst hoist-eqs → unfold goal spec fns → split → guard-omega /
+>    exact-hyp. Form B (definitional step of recursive spec fn):
+>    spine-intros → ONE-STEP `rw [head-fn]` → branch-hyp guard simp →
+>    rfl. Both fully derivable from provenance + goal shape.
+> 3. **Recursive spec fns can never ride simp sets** — their `eq_1`
+>    loops (rewritten RHS re-matches; observed maxRecDepth). One-step
+>    `rw` is the tool, and bare `rw` suffices (first-match
+>    instantiation spares differently-instantiated recursive calls).
+>    This also bounds the unfold-list rule: the non-recursive filter
+>    stays; recursion is script territory, period.
+> 4. **Interim rung win available without provenance:** a
+>    `split <;> simp_all <;> omega` arm after the simp tail closes the
+>    unfold-exposes-omega-guarded-if class (zpoly_generic probe).
+> 5. **Corpus taxonomy** (tactus-algebra 171): pmul family ~100+
+>    (forms A/B + eqv-transitivity chains), Rational nonlinear ~16
+>    (ring/field power — out of script scope, needs its own story),
+>    divmod 9, tail = split-arm food.
+
 ## 3a. Residue notebook (squeeze debt — RESOLVED to 1, 2026-07-18)
 
 > **STATUS: the proper Return→Wp::Let landed (session 3) with four
