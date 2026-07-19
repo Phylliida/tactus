@@ -487,7 +487,7 @@ fn unfold_once_spine(goal: &Expr) -> (Vec<String>, &Expr) {
 /// name. Only the LHS head qualifies: that is the position `rw [f]`'s
 /// first-match instantiation hits (probe `pmul_conv.lean`), keeping
 /// the rewrite exactly one measured step.
-fn recursive_lhs_head<'a>(core: &'a Expr, dts: &DtDefInventory) -> Option<&'a str> {
+pub(crate) fn recursive_lhs_head<'a>(core: &'a Expr, dts: &DtDefInventory) -> Option<&'a str> {
     // Real goals arrive annotated: `(eq : Prop)` around the whole
     // obligation, SpanMarks from the source mapping. Both are
     // transparent at the Lean level; look through them.
@@ -594,6 +594,20 @@ fn rung_tail(goal: &Expr, dts: &DtDefInventory, binders: &[Binder]) -> String {
     unfolds.extend(scan.mentioned_spec_fns.iter().cloned());
     unfolds.extend(scan.mentioned_trait_methods.iter().cloned());
     simp_tail_from_unfolds(&mut unfolds, &scan)
+}
+
+/// The goal-mentioned unfold names (non-recursive spec fns, trait
+/// methods, generated datatype defs) — sorted, deduped. Shared by the
+/// form E arm, the structural rung, and the N3-M2 script author
+/// (`UnfoldSet` / `StructuralTail`).
+pub(crate) fn goal_unfold_names(goal: &Expr, dts: &DtDefInventory, binders: &[Binder]) -> Vec<String> {
+    let scan = run_structural_scan(goal, dts, binders);
+    let mut unfolds: Vec<String> = scan.unfolds.iter().cloned().collect();
+    unfolds.extend(scan.mentioned_spec_fns.iter().cloned());
+    unfolds.extend(scan.mentioned_trait_methods.iter().cloned());
+    unfolds.sort();
+    unfolds.dedup();
+    unfolds
 }
 
 /// True when the goal's core — after peeling the leading ∀-binder /
