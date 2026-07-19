@@ -3451,14 +3451,12 @@ pub proof fn u_cse_nil(hp: HpOracle, he: HeOracle, lv: LvOracle, o: RawExp)
 // Dispatch pins first.
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all [lib.close_sem_e])")]
 pub proof fn u_cse_wrap_mode(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp)
-    requires has_plain_flet(f) == 1
-    ensures forall|st: St| #[trigger] close_sem_e(hp, he, lv, f, st, o)
+    ensures has_plain_flet(f) == 1 ==> forall|st: St| #[trigger] close_sem_e(hp, he, lv, f, st, o)
         == close_sem_e_wrap(hp, he, lv, f, st, o)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all [lib.close_sem_e])")]
 pub proof fn u_cse_hoist_mode(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp)
-    requires has_plain_flet(f) != 1
-    ensures forall|st: St| #[trigger] close_sem_e(hp, he, lv, f, st, o)
+    ensures has_plain_flet(f) != 1 ==> forall|st: St| #[trigger] close_sem_e(hp, he, lv, f, st, o)
         == close_sem_e_hoist(hp, he, lv, f, st, o)
 {}
 
@@ -3523,14 +3521,12 @@ pub proof fn u_cso_nil(hp: HpOracle, he: HeOracle, lv: LvOracle, l: RawExpList)
 // Post-N1 dispatch + per-mode cso pins (same shape as the cse family).
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all [lib.close_sem_obligs])")]
 pub proof fn u_cso_wrap_mode(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, l: RawExpList)
-    requires has_plain_flet(f) == 1
-    ensures forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, f, st, l)
+    ensures has_plain_flet(f) == 1 ==> forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, f, st, l)
         == close_sem_obligs_wrap(hp, he, lv, f, st, l)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all [lib.close_sem_obligs])")]
 pub proof fn u_cso_hoist_mode(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, l: RawExpList)
-    requires has_plain_flet(f) != 1
-    ensures forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, f, st, l)
+    ensures has_plain_flet(f) != 1 ==> forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, f, st, l)
         == close_sem_obligs_hoist(hp, he, lv, f, st, l)
 {}
 
@@ -3681,13 +3677,15 @@ pub proof fn u_gate_leth(x: u64, ty: u64, v: u64, en: u64, ep: u64, t: Box<Frame
 {}
 
 // Dispatch pins (conditional): which mode fn the dispatcher selects.
+// REQUIRES-FREE (the gate rides in the ensures as an implication):
+// requires-carrying pins called under an `if` emit branch-guarded
+// precondition VCs the Link discharge spine cannot yet compose —
+// implication-form pins keep every caller straight-line.
 pub proof fn u_ce_wrap_mode(f: FrameList, ob: RawExp)
-    requires has_plain_flet(f) == 1
-    ensures close_e(f, ob) == close_e_wrap(f, ob)
+    ensures has_plain_flet(f) == 1 ==> close_e(f, ob) == close_e_wrap(f, ob)
 {}
 pub proof fn u_ce_hoist_mode(f: FrameList, ob: RawExp)
-    requires has_plain_flet(f) != 1
-    ensures close_e(f, ob) == close_e_hoist(f, ob)
+    ensures has_plain_flet(f) != 1 ==> close_e(f, ob) == close_e_hoist(f, ob)
 {}
 
 // close_e_wrap one-step unfolds.
@@ -3885,20 +3883,17 @@ pub proof fn holds_close_e_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle, f: Fr
 // The gated dispatcher — ORIGINAL statement, so every downstream caller
 // (wp_stm_sound, holds_all_close_each_e) is untouched. Mode decided once
 // over the whole frame list, mirroring production's hoist_all.
-#[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split simp_all)")]
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> by_cases _hgate : lib.has_plain_flet f = 1 <;> simp_all)")]
 pub proof fn holds_close_e(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp)
     ensures forall|st: St|
         #[trigger] holds(hp, he, lv, close_e(f, o), st) == close_sem_e(hp, he, lv, f, st, o)
 {
-    if has_plain_flet(f) == 1 {
-        u_ce_wrap_mode(f, o);
-        u_cse_wrap_mode(hp, he, lv, f, o);
-        holds_close_e_wrap(hp, he, lv, f, o);
-    } else {
-        u_ce_hoist_mode(f, o);
-        u_cse_hoist_mode(hp, he, lv, f, o);
-        holds_close_e_hoist(hp, he, lv, f, o);
-    }
+    u_ce_wrap_mode(f, o);
+    u_cse_wrap_mode(hp, he, lv, f, o);
+    holds_close_e_wrap(hp, he, lv, f, o);
+    u_ce_hoist_mode(f, o);
+    u_cse_hoist_mode(hp, he, lv, f, o);
+    holds_close_e_hoist(hp, he, lv, f, o);
 }
 
 // ── W5 support lemma D (bootstrap-62, hand-Lean `holdsAll_append`):
@@ -3992,17 +3987,14 @@ pub proof fn cso_nil_true_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle, f: Fra
     }
 }
 
-#[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split simp_all)")]
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> by_cases _hgate : lib.has_plain_flet f = 1 <;> simp_all (config := { zetaDelta := true }))")]
 pub proof fn cso_nil_true(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList)
     ensures forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, f, st, RawExpList::Nil) == true
 {
-    if has_plain_flet(f) == 1 {
-        u_cso_wrap_mode(hp, he, lv, f, RawExpList::Nil);
-        cso_nil_true_wrap(hp, he, lv, f);
-    } else {
-        u_cso_hoist_mode(hp, he, lv, f, RawExpList::Nil);
-        cso_nil_true_hoist(hp, he, lv, f);
-    }
+    u_cso_wrap_mode(hp, he, lv, f, RawExpList::Nil);
+    cso_nil_true_wrap(hp, he, lv, f);
+    u_cso_hoist_mode(hp, he, lv, f, RawExpList::Nil);
+    cso_nil_true_hoist(hp, he, lv, f);
 }
 
 // close_sem_obligs over a Cons splits into head (close_sem_e) ∧ tail —
@@ -4093,22 +4085,19 @@ pub proof fn cso_cons_split_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle, f: F
     }
 }
 
-#[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split simp_all)")]
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> by_cases _hgate : lib.has_plain_flet f = 1 <;> simp_all (config := { zetaDelta := true }))")]
 pub proof fn cso_cons_split(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, h: Box<RawExp>, t: Box<RawExpList>)
     ensures forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, f, st, RawExpList::Cons(h, t))
         == (close_sem_e(hp, he, lv, f, st, *h) && close_sem_obligs(hp, he, lv, f, st, *t))
 {
-    if has_plain_flet(f) == 1 {
-        u_cso_wrap_mode(hp, he, lv, f, RawExpList::Cons(h, t));
-        u_cse_wrap_mode(hp, he, lv, f, *h);
-        u_cso_wrap_mode(hp, he, lv, f, *t);
-        cso_cons_split_wrap(hp, he, lv, f, h, t);
-    } else {
-        u_cso_hoist_mode(hp, he, lv, f, RawExpList::Cons(h, t));
-        u_cse_hoist_mode(hp, he, lv, f, *h);
-        u_cso_hoist_mode(hp, he, lv, f, *t);
-        cso_cons_split_hoist(hp, he, lv, f, h, t);
-    }
+    u_cso_wrap_mode(hp, he, lv, f, RawExpList::Cons(h, t));
+    u_cse_wrap_mode(hp, he, lv, f, *h);
+    u_cso_wrap_mode(hp, he, lv, f, *t);
+    cso_cons_split_wrap(hp, he, lv, f, h, t);
+    u_cso_hoist_mode(hp, he, lv, f, RawExpList::Cons(h, t));
+    u_cse_hoist_mode(hp, he, lv, f, *h);
+    u_cso_hoist_mode(hp, he, lv, f, *t);
+    cso_cons_split_hoist(hp, he, lv, f, h, t);
 }
 
 // ── W5 support lemma B/C (bootstrap-63, hand-Lean `holdsAll_close_each_e`):
