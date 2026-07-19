@@ -2,6 +2,7 @@ pub mod broadcast_collect;
 pub mod call_inlining;
 pub mod crate_defs;
 pub mod dep_order;
+pub mod driver_client;
 pub mod expr_shared;
 pub mod emit_ctx;
 pub mod generate;
@@ -36,7 +37,8 @@ pub mod typed_expr;
 
 // Re-export the main entry points
 pub use generate::{
-    check_exec_fn, check_package, check_proof_fn, emit_exec_fn, emit_proof_fn, sourcemap_path,
+    check_exec_fn, check_package, check_proof_fn, emit_exec_fn, emit_proof_fn,
+    prime_lean_driver, sourcemap_path, PrimeJob,
     CheckResult, DiagLocation, EmitOutput, PackageGateReport, TactusDiag,
 };
 pub use to_lean_fn::LeanSourceMap;

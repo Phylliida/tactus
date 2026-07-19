@@ -90,8 +90,11 @@ pub fn needs_search_import(source: &str) -> bool {
 /// forth (the "concurrent mixed-version builders" race was observed
 /// for real). Old version dirs linger (~8MB each); `rm -rf` the
 /// cache root recovers.
-pub fn prelude_cache_dir() -> PathBuf {
-    let root = if let Ok(d) = std::env::var("TACTUS_PRELUDE_CACHE") {
+/// The user-level tactus cache root (shared by the prelude olean cache
+/// and the driver script install — see `prelude_cache_dir` for the
+/// resolution rationale).
+pub fn cache_root() -> PathBuf {
+    if let Ok(d) = std::env::var("TACTUS_PRELUDE_CACHE") {
         PathBuf::from(d)
     } else if let Ok(d) = std::env::var("XDG_CACHE_HOME") {
         PathBuf::from(d).join("tactus")
@@ -99,7 +102,11 @@ pub fn prelude_cache_dir() -> PathBuf {
         PathBuf::from(h).join(".cache").join("tactus")
     } else {
         crate::generate::lean_out_root().join("_prelude_cache")
-    };
+    }
+}
+
+pub fn prelude_cache_dir() -> PathBuf {
+    let root = cache_root();
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     TACTUS_DEFS.hash(&mut h);
