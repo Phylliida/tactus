@@ -3,7 +3,15 @@
 **Date:** 2026-07-16
 **Found by:** the tactus-algebra arc (verified-CAD program) — first trait-heavy
 corpus pointed at `--lean-all-proofs`.
-**Status:** diagnosed, not fixed. Companion to `DESIGN-lean-all-proofs-bugs.md`
+**Status:** diagnosed, not fixed. **Re-verified still reproducing
+2026-07-19** on post-triple-merge main (minimal repro: 1 verified /
+1 errors, same mode-(b) shape; error text now reads "simp_all made no
+progress" under the derived closers). None of the recent arcs touched
+trait emission — b70/b71 was wp-cert serializer generics, and the
+vec_field closure (BUG-vecfield-clone-ensures.md) explicitly named
+THIS arc as where the call_ensures/trait-ensures encoding belongs.
+Two customers now waiting: tactus-algebra/cad-01 Lean discharge, and
+the general call_ensures encoding. Companion to `DESIGN-lean-all-proofs-bugs.md`
 (B1–B5 families); this is a distinct family those fixes don't cover — gt is
 nearly trait-free, so it never surfaced there.
 
