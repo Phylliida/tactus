@@ -178,3 +178,17 @@ the closer-reconciliation (eca810f) or eliminator-arm re-emit changed
 closer behavior for this shape). ANY tactus-core edit that
 invalidates them hits this. Needs main-side attention (or closer
 re-reconciliation for the ∀-upd shape) BEFORE b74 slices can gate.
+
+### CORRECTION + cache-key fix (2026-07-19, Danielle's sus instinct)
+
+The "latent main-side regression" was WRONG — my red runs had dropped
+`--lean-all-proofs`. With the flag, slice 1a gates **141/0, discharge
+69/69** — slice 1a is DONE and there is no main-side regression. The
+REAL finding: the verification-cache base hash was only
+`solver + krate` — Lean mode flags weren't keyed, so verdicts cached
+in all-proofs mode silently served non-all-proofs cache-hits (and
+vice versa). FIXED: `lean:{lean_backend}:{lean_all_proofs}` now in the
+base hash (verifier.rs). Remaining known hole (documented, not fixed):
+the emitter/closer BINARY version isn't keyed — a rebuilt binary with
+changed closer logic reuses old verdicts until the krate hash moves;
+worth a build-fingerprint tag if it ever bites.
