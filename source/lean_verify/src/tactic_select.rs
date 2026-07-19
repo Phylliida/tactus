@@ -376,6 +376,7 @@ fn rung_tail(goal: &Expr, dts: &DtDefInventory, binders: &[Binder]) -> String {
     let scan = run_structural_scan(goal, dts, binders);
     let mut unfolds: Vec<String> = scan.unfolds.iter().cloned().collect();
     unfolds.extend(scan.mentioned_spec_fns.iter().cloned());
+    unfolds.extend(scan.mentioned_trait_methods.iter().cloned());
     simp_tail_from_unfolds(&mut unfolds, &scan)
 }
 
@@ -416,6 +417,15 @@ pub(crate) struct DtDefInventory {
     /// equation-vs-equation goals, which need injectivity (and
     /// `reduceCtorEq` disjointness) to resolve under `simp_all only`.
     pub variants: std::collections::HashMap<String, Vec<String>>,
+    /// Full Lean names of the crate's TRAIT METHOD DECLS (rendered as
+    /// Lean class projections, e.g. `repro.Foo.foo_le`). A
+    /// goal-mentioned trait method joins the unfold list: impl
+    /// obligation goals are stated against the bare projection
+    /// (`⊢ Foo.foo_le a a` at the impl type), and `simp only
+    /// [Foo.foo_le]` reduces it through the registered instance to
+    /// the impl body (Lean's projection simproc — hand-validated,
+    /// instance name itself not needed). B6 mode-(b) closer half.
+    pub trait_methods: std::collections::HashSet<String>,
     /// Full Lean names of the crate's SPEC fns (defs the emitter
     /// generates). A goal-mentioned spec fn joins the structural
     /// rung's unfold list: N1 hoisting turns goal-position lets into
@@ -483,6 +493,7 @@ pub(crate) fn structural_rung(
     let mut unfolds: Vec<String> = scan.unfolds.iter().cloned().collect();
     // (constructor .injEq derivation lives in simp_tail_from_unfolds)
     unfolds.extend(scan.mentioned_spec_fns.iter().cloned());
+    unfolds.extend(scan.mentioned_trait_methods.iter().cloned());
     unfolds.sort();
     let tail = simp_tail_from_unfolds(&mut unfolds, &scan);
 
@@ -539,6 +550,7 @@ struct StructuralScan<'a> {
     dts: &'a DtDefInventory,
     mentioned_types: std::collections::HashSet<String>,
     mentioned_spec_fns: std::collections::HashSet<String>,
+    mentioned_trait_methods: std::collections::HashSet<String>,
     unfolds: std::collections::BTreeSet<String>,
     targets: Vec<String>,
     targets_seen: std::collections::HashSet<String>,
@@ -550,6 +562,7 @@ impl<'a> StructuralScan<'a> {
             dts,
             mentioned_types: Default::default(),
             mentioned_spec_fns: Default::default(),
+            mentioned_trait_methods: Default::default(),
             unfolds: Default::default(),
             targets: Vec::new(),
             targets_seen: Default::default(),
@@ -572,6 +585,9 @@ impl<'a> StructuralScan<'a> {
             }
             if self.dts.spec_fns.contains(s) {
                 self.mentioned_spec_fns.insert(s.to_string());
+            }
+            if self.dts.trait_methods.contains(s) {
+                self.mentioned_trait_methods.insert(s.to_string());
             }
         }
         e.for_each_child(&mut |c| self.collect_mentioned_types(c));

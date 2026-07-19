@@ -1378,6 +1378,9 @@ pub(crate) fn spec_world_cmds_tagged(
         });
         segs.push((cmds.len(), DefsSeg::Base));
     }
+    // One-shot flag for the drop-k subrange-tail companion (see its
+    // emission site below): first drop-head pass wins.
+    let mut subrange_tail_companion_emitted = false;
     for (pos, step) in order.iter().enumerate() {
         // Whether this step's own emission landed (vs lenient-skipped) —
         // gates dependent follow-ups (the seq measure companion).
@@ -1567,15 +1570,24 @@ pub(crate) fn spec_world_cmds_tagged(
                             {
                                 push_lenient(&mut cmds, "seq measure companion", &mut || vec![cmd.clone()]);
                             }
-                            // Drop-k companion (bootstrap-46): emit the general
-                            // `Seq.subrange_tail_len_lt` ONCE, on the drop_first
-                            // pass (not drop_last), so a raw `subrange u k (len u)`
-                            // recursion terminates. Rides drop_first's own seg, so
-                            // later parts' decreasing_by resolves it via imports.
-                            if rel == "Seq.drop_first" {
+                            // Drop-k companion (bootstrap-46, gate hoisted
+                            // 2026-07-19): emit the general
+                            // `Seq.subrange_tail_len_lt` ONCE, on the FIRST
+                            // drop-head pass — drop_first OR drop_last
+                            // (the name derivation only strips the trailing
+                            // method segment, identical for both). The old
+                            // `rel == "Seq.drop_first"` gate left a crate
+                            // that recurses on `subrange u k (len u)` but
+                            // only ever uses drop_LAST without the
+                            // companion — tactus-algebra's poly fns, the
+                            // LIMITATION note's predicted counterexample:
+                            // its whole defs module failed termination and
+                            // the crate fell back to island emission.
+                            if !subrange_tail_companion_emitted {
                                 if let Some(cmd) =
                                     seq_subrange_tail_companion_cmd(f, &all_fns, bc_lemma_funcs)
                                 {
+                                    subrange_tail_companion_emitted = true;
                                     push_lenient(&mut cmds, "seq subrange-tail companion", &mut || vec![cmd.clone()]);
                                 }
                             }
