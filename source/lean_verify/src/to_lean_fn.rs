@@ -1174,6 +1174,18 @@ pub(crate) fn datatype_simp_def_inventory(
         })
         .map(|f| crate::to_lean_type::lean_name(&f.x.name.path))
         .collect();
+    // The recursive complement: bodies WITH a nonempty decreases.
+    // Never simp-set members (loop law — see tactic_select's
+    // `recursive_spec_fns` doc); the N3-M1 UnfoldOnce arm's rw targets.
+    let recursive_spec_fns: std::collections::HashSet<String> = functions
+        .iter()
+        .filter(|f| {
+            f.x.mode == vir::ast::Mode::Spec
+                && f.x.body.is_some()
+                && !f.x.decrease.is_empty()
+        })
+        .map(|f| crate::to_lean_type::lean_name(&f.x.name.path))
+        .collect();
     for d in datatypes.iter() {
         if matches!(d.x.transparency, DatatypeTransparency::Never) {
             continue;
@@ -1214,7 +1226,7 @@ pub(crate) fn datatype_simp_def_inventory(
         .filter(|f| matches!(&f.x.kind, vir::ast::FunctionKind::TraitMethodDecl { .. }))
         .map(|f| crate::to_lean_type::lean_name(&f.x.name.path))
         .collect();
-    crate::tactic_select::DtDefInventory { by_type, variants, spec_fns, trait_methods }
+    crate::tactic_select::DtDefInventory { by_type, variants, spec_fns, recursive_spec_fns, trait_methods }
 }
 
 pub fn datatype_to_cmds(
