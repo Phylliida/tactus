@@ -262,3 +262,14 @@ cascade is fully discharged.
 
 NEXT = slice 2 (serializer): _h_hoist_i naming, FLetH classification,
 Call-post/RetBind conversion, deepener; then fixtures/certs bridge.
+
+### Slice 2 plan (2026-07-20)
+
+Full plan doc: `DESIGN-b74-slice2-serializer.md` — evidence-first
+fixture-cert regeneration (step 0, with per-family open questions —
+the loop telescope question can change scope), serializer naming/
+classification items with file+line specifics, the small model arity
+additions (AssignH, RetLetH, statement hyp-name fields), the bridge
+sweep, census-gated deferrals (shadowing, name collisions), and the
+follow-up queue (discharge Q1 provenance, b70/71 closes, b69
+decision, call-mut, loop-telescope redesign, cache fingerprint).

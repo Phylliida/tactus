@@ -16,9 +16,11 @@ converged). State:
   package gate green, discharge 102/4 (residual = §5 Q1
   Other-provenance equation hyps, emitter-side — not b74 scope).
   Architecture + closer recipes recorded on the card.
-- **Slice 2 (serializer)**: `_h_hoist_i` ordinal naming, FLetH
-  classification (type_map typ + non-Bool), Call-post + RetBind
-  conversion, goals-side deepener follow-up for hoisted shapes.
+- **Slice 2 (serializer)**: full plan in
+  `DESIGN-b74-slice2-serializer.md` — evidence-first cert regen, then
+  `_h_hoist_i` ordinal naming, FLetH/AssignH/RetLetH classification,
+  Call-post conversion, deepener; follow-up queue (discharge Q1,
+  b70/71, b69 decision, call-mut, loop-telescope) in its §7.
 - **Then**: probe9 13/13 close + mutation-kill, probe11 re-run with
   the 3 tgt certs, retire the honest-fail entries.
 
