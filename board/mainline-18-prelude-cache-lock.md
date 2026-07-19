@@ -27,3 +27,19 @@ Stale-lock cleanup (owner-pid check) if flock is unavailable portably.
 
 **Done when:** two concurrent tactus runs sharing $HOME (a gt gate +
 tutorial battery) both pass repeatedly; suite green.
+
+## Progress
+
+- (2026-07-17, kimi) Race hit TWICE more during mainline-10
+  validation: tutorial battery flaked factorial/fib_fast ONLY while a
+  gt gate or the suite ran concurrently; every solo run green. The
+  failure signature is consistent: a chapter fails with
+  missing/partial prelude or defs oleans during the other run's
+  cache rebuild, then passes clean solo. Confirms the analysis:
+  `ensure_prelude_olean`'s freshness-check → build → rename → marker
+  sequence is unsynchronized across processes, and the
+  build-in-pid-unique-subdir pattern doesn't protect the RENAME of
+  the olean into place or the marker write. The lockfile (or
+  flock-on-cache-root) design in the description is the right fix;
+  note the marker is written LAST, so a lock also needs the reader
+  side (treat marker-mismatch as "rebuild needed", not "use anyway").

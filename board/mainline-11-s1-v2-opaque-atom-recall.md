@@ -27,3 +27,18 @@ becomes a gate.
 tactic_select.rs with the aliasing argument.
 
 **Blocked by:** nothing.
+
+## Status update (2026-07-17, after S2c/B4/B6/B10)
+
+The landscape shifted under this task. S1 still selects FIRST (omega /
+peel∘omega for the linear fragment), but everything S1 rejects now
+gets the S2c derived closer (`first | rfl | decide | omega | (<explicit
+peel>; kernel) | (simp_all only [CORE: 51] <;> omega)`) — and the
+CORE normalizer already closes some opaque-atom goals via simp's
+hypothesis use (the census's DERIVABLE class was 95.6% without any
+opaque-atom-into-omega trickery). The 24→37 recall gap measured at S1
+time is therefore stale: re-measure against the current binary before
+building v2. If a gap remains, the natural home for the
+consistent-occurrence rule is inside the DERIVED branch ordering, not
+a new S1 selection — the rule budget conversation (Danielle) applies.
+Priority stays LOW; gt is opaque-heavy and already green at 3116/0.

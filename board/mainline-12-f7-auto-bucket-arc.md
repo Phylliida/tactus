@@ -36,3 +36,35 @@ recorded; pass count meaningfully above the 723/2,953 baseline with the residue
 counted and named (no silent caps).
 
 **Blocked by:** mainline-05 (and ideally -06/-07).
+
+## Status update (2026-07-17, after S2c/B4/B6/B10)
+
+Everything this arc was sequenced behind has now LANDED (mainline-05/06
+derivation + 07 peel + the AssertQuery fallback + 10 decreasing
+dispatch), so the re-taxonomy it planned is due, with better numbers
+than it expected:
+
+- **The 46% quantified/let-wrapped cluster**: B4's explicit peel +
+  the zeta-substitution fix (Let case = `intro <name>; subst <name>`)
+  is exactly this machinery. Note the let-opacity lesson: context
+  let-vars are opaque to omega; goal-lets must be substituted. Any F7
+  hand-work in this cluster should use the current binary, which
+  handles it natively.
+- **The 41% seq-op cluster**: the S2a census says the gap is NOT
+  instantiation-by-name in this pool — the `_tactus_bc` broadcast hyps
+  in context already carry the seq axioms and simp_all uses them.
+  ZERO named seq-axiom lists were needed in the 295-theorem census.
+  Expect a smaller residue than the taxonomy predicts.
+- **The 12% unfold-shaped cluster**: confirmed real via the tutorial
+  (fib unfolds needed user `unfold` texts). Per-goal mentioned-spec-fn
+  unfolding is the one derivable shape the census found NO need for in
+  gt but the tutorial needed — candidate rule #2 if the re-measure
+  shows it at scale (would need Danielle's rule-budget sign-off).
+- **Harness assets for the re-measure**: the full-pool gate
+  (per-file combined runs, ~2 min over 397 theorems) and
+  `tools/rung-attrib/squeeze_census.py` + `union_core_test.py` are
+  committed and directly reusable for the ~24k-goal taxonomy. The
+  6h-timeout legs + `-V cache` resume plan stands.
+- **Nonlinear: 10 goals** — inline proofs, ignore for machinery.
+  (The tutorial's nonlinear asserts all close via `by(nonlinear_arith)`
+  with the DERIVED fallback composed in — that path is healthy.)
