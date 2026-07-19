@@ -1,0 +1,454 @@
+# DESIGN — N3: Provenance-Driven Proof Scripts
+
+**Status:** DRAFT v0.1 (2026-07-19), for iteration with Danielle.
+**Prereqs landed:** N1 let-hoisting, N2 match-splitting, B6 emission
+phase, derived-closer completions through the eliminator arms.
+**Validated groundwork:** `probe-n3-scripts/` (three hand-validated
+probes on tactus-algebra artifacts), `probe-vecfield-clone/` (the
+ext-split hand proof), plus this doc's §10 corpus data.
+**Companion docs:** DESIGN-leaf-normal-emission.md (N1/N2, the N-ladder
+frame), DESIGN-transparent-automation.md (the squeeze program N3
+supersedes), bootstrap-73 boards (the spine/provenance substrate).
+
+---
+
+## 0. One-paragraph thesis
+
+Every failure mode of the derived closers this month had the same
+signature: a classifier re-deriving from rendered goal TEXT something
+the emitter knew directly moments earlier — which constructor arm we
+are in, which call's ensures just landed, which recursive unfold an
+assert exists to perform. N3 stops reconstructing. At emission time,
+for each obligation, the emitter — which holds the obligation's full
+causal history (its frame list with provenance, the goal's shape, the
+user's proof-body structure) — **authors the Lean proof script
+directly**. The script is plain tactic text in the artifact, each step
+citing named in-artifact hypotheses, with no proof-time search beyond
+fail-fast leaf closers. The searched `first|`-chain becomes a fallback
+whose usage is *measured and ratcheted down* (N4), not the default.
+
+The slogan, from the frontier notes: **information flows forward.**
+
+---
+
+## 1. Why now — evidence that this is the right next mountain
+
+1. **The searched closers have hit their ceiling on real math.**
+   tactus-algebra post-B6: 171 obligations elaborate cleanly and fail
+   in `simp_all + omega` — poly/ring lemmas whose proofs need
+   *structure* (one-step unfolds, if-splits, hypothesis instantiation,
+   relation chaining) that no flat simp set expresses. The gt census
+   under the always-on default (running as this doc is written) will
+   add the second corpus.
+
+2. **The central bet is validated, not hoped.** Probes (all
+   elaborate clean, see `probe-n3-scripts/README.md`):
+   * Inlined call-ensures hypotheses are COMPLETE — the user's Verus
+     proof body (a sequence of lemma calls) lands as hoisted, named
+     hypotheses containing exactly the facts the proof needs.
+   * Script form A (branch + axiom-call) closes `lemma_zpoly_empty`'s
+     failing obligation in 5 derivable lines.
+   * Script form B (one-step recursive unfold) closes
+     `lemma_pmul_empty_right`'s definitional assert in 5 derivable
+     lines.
+   * The vec_field ext-split hand proof (20 lines) was already fully
+     derivable from call-site knowledge — it prefigured this design.
+
+3. **The substrate exists.** Bootstrap-73 built `HypProvenance` for
+   the wp-cert discharge generator; N1 hoisting gives every frame a
+   stable theorem-binder name in the same emission pass. N3 is largely
+   a CONSUMER of machinery already paid for.
+
+4. **A hard law was discovered that only scripts satisfy.**
+   Recursive spec fns can NEVER ride a simp set: their `eq_1`
+   equation's RHS contains the recursive call, which re-matches —
+   observed maxRecDepth blowup, and maxRecDepth is not recoverable by
+   `first|`. One-step `rw` at a specific goal position is the only
+   sound tool, and "apply this rewrite once, here" is intrinsically a
+   script move, not a rung.
+
+---
+
+## 2. Philosophy and non-goals
+
+**Transparency = faithfulness** (the standing rule): every injected
+tactic carries its own justification at the site; no ambient context;
+the artifact reader can replay the reasoning. Scripts strengthen this:
+where a `first|`-chain says "one of these eight things worked, guess
+which," a script says "this step, because that hypothesis, from that
+call."
+
+**What N3 is NOT:**
+* Not a general ATP. Leaf goals still close with the fail-fast trio
+  (`assumption` / `omega` / `with_reducible rfl`) or a bounded
+  `simp only` — small, transparent, fail-fast alternation at LEAVES is
+  acceptable; the search being eliminated is *structural* search.
+* Not user-facing syntax. Users write Verus (or inline Lean); N3
+  changes only what the EMITTER writes for default-closer obligations.
+* Not a replacement for S1. The omega-fragment classifier already
+  emits the perfect script for arithmetic goals: `omega`. S1 is the
+  degenerate happy case of N3 and stays exactly as is.
+* Not speculative planning: every script form ships only with a
+  corpus customer and a hand-validated probe first. (This document
+  itself follows the rule — forms A/B/E below are probe-backed;
+  forms C/D carry their probes as milestone entry criteria.)
+
+---
+
+## 3. The substrate today (inventory, verified 2026-07-19)
+
+### 3.1 Provenance carried on frames
+
+`lean_ast.rs`:
+
+```rust
+pub enum HypProvenance {
+    CallFact(CallFactInfo),   // callee ensures woven by a body call
+    Branch(Option<BranchTest>),// if/match/loop condition (variant test kept)
+    HeightFact,               // recursive-call decrease fact
+    Other,                    // assumes, invariants, plain asserts, …
+}
+pub struct CallFactInfo {
+    pub callee: String,       // stable dotted Lean name
+    pub is_self: bool,        // self-recursion → this hyp is the IH
+    pub args: Vec<SpineArg>,  // rendered instantiation, callee param order
+}
+```
+
+Built for bootstrap-73's wp-cert discharge generator; carried on
+`CtxFrame::Hyp` through `walk_obligations`. Serialized per-fn in the
+`.spine.json` sidecars (tactus-core), so it survives to disk already.
+
+### 3.2 What N1/N2 already guarantee
+
+* Every frame an obligation depends on is a NAMED theorem binder
+  (`h_req{i}`, `_h_hoist_{n}`, `_h_{x}_hoist1`, ctor-equation hyps),
+  hoisted flat — no goal-side lets for default-closer fns.
+* N2 gives constructor equations (`s = Gen v`) instead of
+  discriminator opacity, with field binders.
+* The emitter runs script-authoring at the SAME point that names are
+  assigned (`ObligationEmitter::emit_*`), so name↔script consistency
+  is by construction, not by contract (see §7).
+
+### 3.3 Gaps to fill (M0)
+
+`Other` currently swallows: requires-hyps (they DO get `h_req{i}`
+names but no typed provenance), loop invariants, assume/assert
+pass-throughs, N1 hoist equations (binder name is recoverable but the
+"this is a let-equation for binder x" fact should be typed), N2 ctor
+equations. M0 splits these:
+
+```rust
+    Requires { index: usize },
+    HoistEq { binder: LeanName },          // N1 let-equation
+    CtorEq { scrutinee: LeanName, variant: String, fields: Vec<LeanName> }, // N2
+    LoopInv { index: usize, at: LoopPhase }, // entry / maintained
+    AssertFact,                            // passed user assert
+    AssumeFact,                            // assume(P) — census-critical
+```
+
+plus, on `CallFactInfo`, the callee's **ensures shape summary** (see
+§6 form D) — conjunct kinds recorded at weave time, since the emitter
+is holding the callee's ensures right then.
+
+---
+
+## 4. The script IR
+
+A script is a `Vec<Move>`; each `Move` renders to fixed Lean tactic
+text. The IR is deliberately tiny; growth requires a corpus customer
+(rule §2). Initial vocabulary, with validation status:
+
+| Move | Renders to | Derivation source | Status |
+|---|---|---|---|
+| `Intros(spine)` | `intro a b _ h …` | goal spine (existing `spine_intro_names`) | in prod (rung) |
+| `SubstHoists` | `subst h1 h2 …` (all substitutable `HoistEq` hyps) | provenance | probe A |
+| `UnfoldSet(fns)` | `simp only [f, g, …]` | goal-mentioned NON-recursive spec fns (existing inventory) | in prod (rung) |
+| `UnfoldOnce(f)` | `rw [f]` | goal is `Eq` whose LHS head is a RECURSIVE spec fn | probe B |
+| `GuardSimp(h)` | `simp only [h, if_false, if_true]` | Branch provenance names the guard hyp | probe B |
+| `SplitIf` | `split` | post-unfold goal contains `ite` | probe A |
+| `LeafClose` | `first \| assumption \| omega \| with_reducible rfl` | terminal | in prod (shape-split rfl law applies) |
+| `LeafSimpClose` | `simp_all only [CORE ∪ unfolds] <;> omega` | terminal, when LeafClose insufficient by shape | in prod (rung tail) |
+| `ExactHyp(h)` | `exact h` | provenance: the goal syntactically equals a hyp (post-normalization) | probe A |
+| `Defeq` | `rfl` | goal sides differ only by let-defeq / ctor-eta | probe B |
+| `InstForall(h, t)` | `have h' := h t` | hyp with ∀-Int spine + a script-known index term | vec_field hand proof |
+| `CasesDisj(h)` | `rcases h with h \| h` | hyp whose core is `∨` (e.g. `cloned` unfold) | vec_field hand proof |
+| `ExtSplit(ax)` | `rw [ax]; constructor` | goal is non-Prop `Eq` at a type with a recorded ext axiom | vec_field hand proof |
+| `ApplyLemma(L, orient)` | `apply L` / `apply Eq.symm; apply L` | signature-derived eliminator (subsumes today's eliminator arms) | in prod |
+
+Rendering rules:
+* Every referenced name must be a binder/have introduced earlier in
+  the same theorem — checked at render time (a script citing an
+  unknown name is an EMITTER bug and must panic in debug, not emit).
+* No `Raw` escape hatch in the IR. If a shape needs a move we don't
+  have, it falls back (§8) and the N4 census names it.
+* Determinism: no iteration over hash-ordered containers may reach
+  move order (mainline-20's law applies to scripts doubly).
+
+---
+
+## 5. The authoring algorithm
+
+Per obligation, at `emit_with_extras` time (same place the derived
+closer is chosen today), with inputs: goal `Expr`, binder list with
+provenance, the fn's classification (S1 verdict), and the inventories
+(DtDefInventory + recursive-fn set + ext-axiom table):
+
+```
+author(goal, frames) -> Option<Script>:
+  1. if S1 says omega-fragment        -> Some([omega])          (S1 unchanged)
+  2. normalize:  moves += SubstHoists (substitutable hoist-eqs only:
+                 binder occurs nowhere in its own RHS, RHS well-scoped)
+  3. unfold:     G := goal after mental substitution
+                 if G is Eq/Iff and lhs-head ∈ recursive-fns:
+                     moves += UnfoldOnce(head)
+                     if a Branch hyp matches the unfolded guard:
+                         moves += GuardSimp(that hyp)
+                 mentioned := goal+binder mentioned non-rec spec fns
+                 if mentioned nonempty: moves += UnfoldSet(mentioned)
+  4. structure:  if ite reachable in G:  moves += SplitIf
+                 (legs get the same close layer via <;>)
+  5. close:      pick by final shape:
+                 - Defeq        when Eq with let/eta-only difference
+                 - ExactHyp(h)  when a hyp (post-normalization) matches
+                                the goal syntactically  [cheap check at
+                                emission — we HOLD both texts]
+                 - ExtSplit+legs when Eq at ext-registered type and a
+                                CallFact's shape summary provides the
+                                pointwise+len conjuncts (form D)
+                 - else LeafClose then LeafSimpClose as <;>-tail
+  6. confidence: if every move's precondition was established from
+                 typed provenance/goal facts -> HIGH (script emitted
+                 as primary). If any step used a fallback guess ->
+                 return None (derived closer path, censused).
+```
+
+Two crucial properties:
+* **The author can check its own preconditions cheaply** because at
+  emission time it holds all the texts — e.g. `ExactHyp` is emitted
+  only when the emitter literally compared goal text to hyp text. No
+  "hope simp finds it."
+* **Authoring is total but Option-valued.** Returning `None` is not
+  failure, it is honesty; N4 counts it.
+
+### 5.1 What "body as script skeleton" means operationally
+
+We do NOT walk the user's Verus body separately to build scripts. The
+insight from the probes is that N1's frame list, in order, IS the
+body's trace: each user call contributed a `CallFact` frame, each
+branch a `Branch` frame, each let a `HoistEq`. The author consumes
+frames, not the AST — one source of truth, already provenance-typed.
+(The vec_field "call site knows the callee's ensures shape" story is
+the same statement about `CallFactInfo`.)
+
+---
+
+## 6. Script forms, per corpus family
+
+**Form A — branch + woven fact** (probe `zpoly_probe.lean`):
+`SubstHoists; UnfoldSet; SplitIf <;> [guard-omega | ExactHyp]`.
+Customer: assert-forall-by obligations whose by-block called axioms;
+the tail of tactus-algebra; scattered gt shapes.
+
+**Form B — definitional step of a recursive fn** (probe
+`pmul_conv.lean`): `Intros; UnfoldOnce; GuardSimp; Defeq/LeafClose`.
+Customer: the definitional asserts throughout the pmul family (the
+single biggest block of the 171). LAW: this is the ONLY sanctioned
+contact between recursive spec fns and tactics — never simp sets.
+
+**Form C — equivalence chaining** (NOT yet probe-backed — M4 entry
+criterion): goals `eqv X Z` where the user's calls produced `eqv`
+facts and the trait's congruence/transitivity axioms are class Prop
+fields. Expected script: `ExactHyp` in most cases (the user called
+trans explicitly, so the final fact IS a hyp — validate on corpus);
+where not, `InstForall` on axiom fields + `ExactHyp`. Open question
+§11.2.
+
+**Form D — callee-ensures elimination** (hand proof
+`probe-vecfield-clone/repro_hand_proof.lean`): when a `CallFact`'s
+shape summary records `len-eq ∧ ∀-pointwise ∧ trigger ∧ …`, and the
+goal is Eq at an ext-registered type: `ExtSplit; [len-leg via
+UnfoldSet+LeafClose | pointwise-leg via Intros; InstForall;
+UnfoldSet(cloned); CasesDisj <;> close]`. Customer: vec_field-class
+view-equality postconditions; subsumes and retires the vstd
+`vec_clone_view_eq_u8` special-case ONLY when the general
+`call_ensures` encoding lands (separate arc; not blocked on it —
+form D works off the shape summary regardless).
+
+**Form E — the interim, provenance-free harvest** (probe
+`zpoly_generic.lean`): a `split <;> simp_all <;> omega` arm appended
+to today's structural rung. Not a script at all — ships in M1 as a
+plain rung extension because it is validated and cheap, and its
+harvest shrinks the corpus the script forms must explain.
+
+---
+
+## 7. The naming contract
+
+Scripts cite binder names (`h_req0`, `_h_hoist_3`, `_h_x_hoist1`).
+These are positional and WILL churn across emitter changes. This is
+sound because:
+
+* Script and names are produced in the same emission pass from the
+  same frame list — they cannot disagree within an artifact.
+* Cross-run churn affects only cache/diff hygiene, identical to
+  today's theorem-text churn. (Cache key is content-hashed anyway.)
+
+M0 nicety (optional, not load-bearing): provenance-flavored names
+(`h_call_lemma_zpoly_empty_1`, `h_ih_2`, `h_if_neg_1`) — better
+artifact readability and N4 census greppability, at the cost of one
+round of pinned-test churn. Decision: Danielle's call; the author
+works either way.
+
+---
+
+## 8. Fallback architecture and N4 (the ratchet)
+
+Rollout stance: **script primary, rung fallback, everything counted.**
+
+```
+by
+  <haves block (unchanged)>
+  first
+  | (<script>)          -- when author returned Some + HIGH
+  | (<derived closer>)  -- today's chain, verbatim
+```
+
+with an artifact-visible census marker (a fixed-format comment per
+theorem: `-- tactus-closer: script:formB` / `script-fallback:rung` /
+`rung-only`) so N4 metrics are computable from artifacts alone by
+grep — same census philosophy as the no-search gate.
+
+**Known hazard (must be handled, not hoped away):** the
+first-chain phantom-diagnostics bug (BUG-first-chain-phantom-
+diagnostics.md) — backtracked arm errors persisting in
+Mathlib-importing files. Scripts make this WORSE if the script arm
+fails messily. Mitigations, in order of preference:
+1. HIGH-confidence scripts skip the `first|` entirely (no fallback,
+   no phantom surface) once their form's corpus pass-rate clears a
+   bar (M5 ratchet);
+2. else the script arm's leaf moves stay fail-fast (no simp_all
+   inside script arms that precede a fallback).
+
+**N4 report**: per crate run, one summary line
+`closers: N script (A:x B:y D:z) / M rung-fallback / K rung-only /
+E failed` + the suite/gates asserting "script share never decreases"
+(a ratchet test, exactly like the no-search claim).
+
+---
+
+## 9. Relationship to existing machinery (what changes, what dies)
+
+| Machinery | Fate under N3 |
+|---|---|
+| S1 omega classifier | unchanged; becomes "form 0" |
+| Structural rung | becomes fallback; gains form E split-arm in M1 |
+| Eliminator arms | subsumed by `ApplyLemma` move + form D; retire after M3 |
+| trait-method/spec-fn unfold inventories | reused as-is by `UnfoldSet` |
+| Non-recursive unfold filter | KEPT permanently (the loop law) — recursion is `UnfoldOnce` script territory |
+| decreasing_by dispatch | untouched (termination is its own channel); Ladder kind stays |
+| Broadcast haves | unchanged (scripts may cite `_tactus_bc_*` via `ApplyLemma`/`InstForall`) |
+| wp-cert discharge generator (bootstrap) | sibling consumer of the same provenance; watch for shared-enum needs, don't couple release trains |
+
+---
+
+## 10. Corpus data (2026-07-19)
+
+tactus-algebra, post-B6, all elaboration-clean; 171 failing
+obligations by family:
+
+| Family | ~Count | Form |
+|---|---|---|
+| pmul definitional asserts + branches | ~100+ | B, A |
+| pmul/padd eqv-chain postconditions | inside above | C (investigate) |
+| Rational recip/mul nonlinear | ~16 | OUT OF SCOPE for scripts — genuine `ring`/`field_simp`-class power; own story, censused separately |
+| divmod | 9 | B + C likely |
+| misc tail | rest | E harvest |
+
+gt census under the always-on default: RUNNING (first cold all-proofs
+run); its taxonomy slots in here when it lands and becomes the second
+acceptance corpus. Expectation from the 16%-era taxonomy: heavy
+translator-reject tail (assert-forall-by, choose, fuel/reveal shapes)
+that N3 does NOT address — those are WP-translator gaps, censused as
+`rung-only`/`failed`, and become their own backlog.
+
+---
+
+## 11. Open questions (each with its probe)
+
+1. **Substitutability of hoist-eqs**: `SubstHoists` needs binder-not-
+   in-RHS and no shadowing. Probe: count non-substitutable hoists
+   across algebra artifacts (script author must fall back to
+   `simp only [h]` rewriting for those — cheap alternative move).
+2. **Form C reality check**: sample 5 eqv-goal failures; determine
+   whether `ExactHyp` post-normalization suffices (bet: mostly yes)
+   or axiom-field instantiation is needed. Blocks M4 only.
+3. **`split` vs `by_cases` stability**: `split` on nested ites
+   produces goal orders we must treat as canonical; pin with a probe
+   + a unit test on move rendering.
+4. **Leaf `simp_all` budget**: does any validated form NEED simp_all
+   in a leg (vs `simp only` + omega)? Prefer bounded `simp only`
+   everywhere inside script arms (phantom hazard, §8).
+5. **Loop obligations**: invariants are `Other` today; loop-heavy gt
+   exec fns are the customer. M0 types them; which script form do
+   maintenance obligations take? (Likely A-shaped with LoopInv hyps.)
+   Needs its own probe before any loop-specific move ships.
+6. **Name flavor** (§7): positional vs provenance-flavored — decide
+   at M0 with Danielle.
+
+---
+
+## 12. Milestones
+
+* **M0 — provenance completion + census harness.** Split `Other`
+  (§3.3); record CallFact ensures-shape summaries; emit the
+  closer-census comment; N4 summary line + ratchet test. No behavior
+  change to proofs. Gate: suite 551/0 unchanged, census visible.
+* **M1 — form E harvest (rung split-arm) + `UnfoldOnce` rung-arm
+  experiment.** Pure derived-closer extensions, no script IR yet;
+  measures how much falls before scripts do. Gate: suite green +
+  algebra number moves + census shows the delta.
+* **M2 — script IR + author v1 (forms A, B).** Primary-with-fallback
+  emission for proof-fn assert/postcondition obligations. Gate:
+  algebra ≥ baseline+form-A/B families; zero suite regressions;
+  phantom-audit on Mathlib-importing artifacts.
+* **M3 — form D + ApplyLemma migration.** Retire eliminator arms.
+  Gate: vec_field-class closes via script (censused), suite green.
+* **M4 — form C** (entry: Q11.2 probe). Gate: pmul eqv family delta.
+* **M5 — ratchet.** Per-form: when a form's fallback-rate over the
+  acceptance corpora is 0 for N consecutive full runs, drop the
+  fallback arm for that form (phantom surface shrinks; artifacts get
+  cleaner). Never ratchet a form with nonzero fallback.
+
+Each milestone lands with its probes committed under
+`probe-n3-scripts/` — the probe IS the spec of the move's rendering.
+
+---
+
+## 13. Risks
+
+| Risk | Mitigation |
+|---|---|
+| Phantom diagnostics via failing script arms | §8: fail-fast leaves in script arms; ratchet to no-fallback |
+| maxRecDepth (uncatchable) re-entering via script moves | LAW: no bare `rfl` except `Defeq` (shape-proven); no recursive fns in any simp set; `UnfoldOnce` only |
+| Script size blowup on huge obligations | moves are O(frames); cap + census `rung-only` above threshold |
+| Emission nondeterminism reaching scripts | mainline-20 law; unit test: same SST → byte-identical script |
+| Author bugs producing wrong-name citations | debug-panic at render (names checked against binder list) |
+| Memory (the 25GB emission peak) | scripts add per-obligation text only; the peak is routing-volume, tracked separately (Nonempty cache landed; profile after gt census) |
+| Lean version sensitivity (`split`, `rw` behavior) | probes are pinned per toolchain bump, same as closer text today |
+
+---
+
+## 14. Glossary
+
+* **Frame / CtxFrame**: one hypothesis-or-binder an obligation
+  depends on, pushed during the Wp walk; N1 hoists frames to theorem
+  binders.
+* **Provenance**: the typed record on a frame of WHY it exists
+  (`HypProvenance`).
+* **Spine**: bootstrap-73's serialized per-fn record of frames +
+  instantiations (`.spine.json`).
+* **Move / Script**: §4. **Author**: §5.
+* **Rung / derived closer**: today's searched `first|` machinery
+  (DESIGN-transparent-automation.md).
+* **Ratchet**: monotone script-share enforcement, §8/M5.
