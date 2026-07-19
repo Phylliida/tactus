@@ -242,7 +242,15 @@ pub(crate) const DERIVED_MARKER: &str = "tactus_derived_marker__";
 ///   omega tail, then the STRUCTURAL rung (`structural_rung` below):
 ///   named intros + `cases` on the goal's own datatype scrutinees +
 ///   `simp_all +zetaDelta` over CORE plus the goal-mentioned
-///   generated datatype defs.
+///   generated datatype defs. N3-M1 then appends, before the
+///   eliminator arms: the UnfoldOnce arm (form B — one measured
+///   `rw [f]` step when the goal core's LHS head is a RECURSIVE spec
+///   fn, which can never ride a simp set — the loop law; probe
+///   `probe-n3-scripts/pmul_conv.lean`) and the two-phase form E arm
+///   (targeted unfold of the goal-mentioned fns, then a guarded
+///   `split`; the phases must be ONE arm — bare split chain-arms
+///   never see the ite guards hidden inside unfolded spec fns; probe
+///   `probe-n3-scripts/zpoly_generic.lean`).
 ///
 /// Every branch is a decision procedure, a generated structural prefix,
 /// or a FIXED, site-invariant rewrite set — or, for the structural
@@ -264,6 +272,7 @@ pub(crate) fn derived_closer(
     binders: &[Binder],
     user_prefix: bool,
     eliminators: &[String],
+    broadcast_count: usize,
 ) -> String {
     // Which `rfl` the kernel ladder gets is DERIVED from the goal's
     // core shape (after peeling the ∀/let/→ spine):
@@ -286,6 +295,87 @@ pub(crate) fn derived_closer(
     let rfl_form = if goal_core_is_equation(goal) { "rfl" } else { "with_reducible rfl" };
     let kernel = format!("first | {} | decide | omega", rfl_form);
     let rung = structural_rung(goal, dts, binders, user_prefix);
+    // N3-M1 arms (probes: probe-n3-scripts/, 2026-07-19). All ADDITIVE
+    // — they run only where every pre-existing arm already failed.
+    //
+    // UnfoldOnce (form B): the goal's Eq/Iff core has a RECURSIVE spec
+    // fn as its LHS head. Recursive fns can never ride a simp set
+    // (loop law), so the arm takes exactly one measured step:
+    // `rw [f]` (first-match instantiation — the RHS's differently-
+    // instantiated recursive call is left alone, no conv needed),
+    // then a guard simp — `simp_all only` so the branch hypothesis
+    // (¬(len = 0) etc.) is used as a rewrite WITHOUT provenance —
+    // then kernel close, with the structural simp ladder as the tail
+    // for sides that differ by further non-recursive unfolds.
+    //
+    // The spine walk resolves N1's trailing equation wrapper
+    // (`let tmp := <eq>; tmp`): the wrapper must NOT be intro'd (the
+    // goal would collapse to an opaque var that `rw` cannot search),
+    // and the Eq core hides behind it (probe pmul_conv.lean). Earlier
+    // lets ARE intro'd AND subst'd (the render_peel pattern): the
+    // branch/fact hypotheses ride in as let-bound antecedents
+    // (`let tmp := <fact>; tmp → …`), and only subst turns them into
+    // rewrites the guard simp can use.
+    let (uo_steps, uo_core) = unfold_once_spine(goal);
+    let intro_step = if user_prefix {
+        "intros;".to_string()
+    } else if uo_steps.is_empty() {
+        String::new()
+    } else {
+        format!("{};", uo_steps.join("; "))
+    };
+    // Guard-simp lemma set: if-collapse + Nat-literal/constructor
+    // collapses for the `len _ + 1 = 0` / `1 = 0` shapes that follow
+    // broadcast-free rewrites — and, critically, EXCLUSIONS for every
+    // broadcast have (`-_tactus_bc_<i>`): left in, the Prop-valued
+    // extensionality axioms among them rewrite the goal's own Seq
+    // equality into len∧pointwise form and the one-step close
+    // degenerates into the structural rung's known failure. The goal's
+    // OWN hyps (branch conditions, call facts) stay usable. Validated
+    // on lemma_pmul_push's base-case assert (probe_169 lineage).
+    let bc_exclusions: String = (0..broadcast_count)
+        .map(|i| format!(", -_tactus_bc_{}", i))
+        .collect();
+    let guard_simp_set = format!(
+        "if_true, if_false, reduceIte, reduceCtorEq, Nat.succ_ne_zero, Nat.add_one, Nat.zero_add, Nat.add_zero{}",
+        bc_exclusions
+    );
+    let unfold_once_arm: String = match recursive_lhs_head(uo_core, dts) {
+        None => String::new(),
+        Some(f) => format!(
+            " | ({} rw [{}]; simp_all only [{}]; first | rfl | ({}))",
+            intro_step,
+            f,
+            guard_simp_set,
+            rung_tail(goal, dts, binders),
+        ),
+    };
+    // Form E (the provenance-free harvest, probe zpoly_generic.lean):
+    // a TARGETED unfold of the goal-mentioned spec fns / trait methods
+    // / datatype defs as phase 1, then a guarded split phase. Two
+    // shape constraints, both probe-validated: (1) the phase-1 set is
+    // the scan's unfolds ONLY — adding CORE leaves a residual the
+    // split can't close (observed on lemma_zpoly_empty's obligation);
+    // (2) the two phases are ONE arm — as a bare chain arm `split`
+    // never sees the ite guards hidden inside unfolded spec fns.
+    // (Phase 1 closing the goal outright is fine: the `first|`
+    // succeeds vacuously on zero goals.)
+    let form_e_arm: String = {
+        let scan = run_structural_scan(goal, dts, binders);
+        let mut unfolds: Vec<String> = scan.unfolds.iter().cloned().collect();
+        unfolds.extend(scan.mentioned_spec_fns.iter().cloned());
+        unfolds.extend(scan.mentioned_trait_methods.iter().cloned());
+        unfolds.sort();
+        unfolds.dedup();
+        if unfolds.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " | (simp_all only [{}]; first | omega | (split <;> simp_all <;> omega) | (split <;> simp_all))",
+                unfolds.join(", ")
+            )
+        }
+    };
     // Equation-eliminator arms, LAST in the chain: for each broadcast
     // lemma whose conclusion is a non-Prop equation (derived from
     // signatures at emit time — see the emitter's `eliminators`
@@ -313,13 +403,111 @@ pub(crate) fn derived_closer(
             .collect()
     };
     format!(
-        "first | {} | decide | omega | ({}) | ({}) | ({}){}",
+        "first | {} | decide | omega | ({}) | ({}) | ({}){}{}{}",
         rfl_form,
         render_peel(goal, &kernel),
         core_simp(),
         rung,
+        unfold_once_arm,
+        form_e_arm,
         elim_arms
     )
+}
+
+/// N3 form B spine walk: peel the leading ∀-binder / goal-let /
+/// implication spine, emitting intro steps — but do NOT peel (or
+/// step) N1's trailing equation wrapper `let tmp := v; tmp`, whose
+/// value becomes the returned core. The wrapper must survive into the
+/// emitted tactic as a goal-position let: `rw` searches through it,
+/// whereas intro'ing `tmp` would leave an opaque context let-var that
+/// `rw` cannot search (probe pmul_conv.lean). All EARLIER lets are
+/// intro'd AND subst'd (the render_peel pattern) so let-bound fact
+/// antecedents become usable rewrites.
+fn unfold_once_spine(goal: &Expr) -> (Vec<String>, &Expr) {
+    fn peel_spans(mut e: &Expr) -> &Expr {
+        while let ExprNode::SpanMark { inner, .. } = &e.node {
+            e = inner;
+        }
+        e
+    }
+    let mut steps: Vec<String> = Vec::new();
+    let mut cur = goal;
+    loop {
+        match &cur.node {
+            ExprNode::SpanMark { inner, .. } => cur = inner,
+            ExprNode::Forall { binders, body } => {
+                let names: Vec<String> = binders
+                    .iter()
+                    .map(|b| match &b.name {
+                        Some(n) => n.as_str().to_string(),
+                        None => "_".to_string(),
+                    })
+                    .collect();
+                steps.push(format!("intro {}", names.join(" ")));
+                cur = body;
+            }
+            ExprNode::BinOp { op: BinOp::Implies, rhs, .. } => {
+                steps.push("intro _".to_string());
+                cur = rhs;
+            }
+            ExprNode::Let { name, value, body } => {
+                // The wrapper's body var is SpanMark-wrapped on real
+                // (rust-annotated) goals — unwrap before comparing.
+                let b = peel_spans(body);
+                if matches!(&b.node, ExprNode::Var(n) if n.as_str() == name.as_str()) {
+                    // Trailing wrapper: look through to the value.
+                    cur = value;
+                } else {
+                    steps.push(format!("intro {0}; subst {0}", name.as_str()));
+                    cur = body;
+                }
+            }
+            _ => break,
+        }
+    }
+    (steps, cur)
+}
+
+/// N3 form B target detection: the goal core is an `Eq`/`Iff` whose
+/// LHS is an application of a RECURSIVE spec fn; return its full Lean
+/// name. Only the LHS head qualifies: that is the position `rw [f]`'s
+/// first-match instantiation hits (probe `pmul_conv.lean`), keeping
+/// the rewrite exactly one measured step.
+fn recursive_lhs_head<'a>(core: &'a Expr, dts: &DtDefInventory) -> Option<&'a str> {
+    // Real goals arrive annotated: `(eq : Prop)` around the whole
+    // obligation, SpanMarks from the source mapping. Both are
+    // transparent at the Lean level; look through them.
+    fn peel_transparent(mut e: &Expr) -> &Expr {
+        loop {
+            match &e.node {
+                ExprNode::SpanMark { inner, .. } => e = inner,
+                ExprNode::TypeAnnot { expr, .. } => e = expr,
+                _ => return e,
+            }
+        }
+    }
+    match &peel_transparent(core).node {
+        ExprNode::BinOp { op: BinOp::Eq | BinOp::Iff, lhs, .. } => {
+            match &peel_transparent(lhs).node {
+                ExprNode::App { head, .. } => {
+                    // The head may be a nested curried App or an
+                    // annotated/wrapped Var — walk to the root.
+                    let mut h = peel_transparent(head);
+                    while let ExprNode::App { head: inner, .. } = &h.node {
+                        h = peel_transparent(inner);
+                    }
+                    match &h.node {
+                        ExprNode::Var(n) if dts.recursive_spec_fns.contains(n.as_str()) => {
+                            Some(n.as_str())
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Pass-1/2 scan shared by `structural_rung` and `rung_tail`.
@@ -353,7 +541,12 @@ fn run_structural_scan<'a>(
 /// equation-eliminator arms — no intros, no cases: leg goals have
 /// their own spines and the repro-validated leg form is the bare
 /// simp ladder).
-fn simp_tail_from_unfolds(unfolds: &mut Vec<String>, scan: &StructuralScan) -> String {
+/// The merged simp LIST from an already-collected unfold set plus the
+/// scan's injEq derivation: CORE + structural extras + unfolds, sorted
+/// and deduped. Shared by `simp_tail_from_unfolds` (the structural
+/// `… <;> omega` tail) and the N3-M1 form E arm (the same normalizer
+/// as a phase-1 for the guarded split).
+fn simp_list_from_unfolds(unfolds: &mut Vec<String>, scan: &StructuralScan) -> String {
     for t in &scan.mentioned_types {
         if let Some(vs) = scan.dts.variants.get(t) {
             for v in vs {
@@ -363,12 +556,21 @@ fn simp_tail_from_unfolds(unfolds: &mut Vec<String>, scan: &StructuralScan) -> S
     }
     unfolds.sort();
     unfolds.dedup();
-    let simp_list = if unfolds.is_empty() {
+    if unfolds.is_empty() {
         format!("{}, {}", CORE_LEMMAS, STRUCTURAL_EXTRA_LEMMAS)
     } else {
         format!("{}, {}, {}", CORE_LEMMAS, STRUCTURAL_EXTRA_LEMMAS, unfolds.join(", "))
-    };
-    format!("simp_all +zetaDelta only [{}] <;> omega", simp_list)
+    }
+}
+
+/// The `simp_all … <;> omega` tail from an already-sorted unfold
+/// list plus the scan's injEq derivation. Shared by
+/// `structural_rung` (full rung) and `rung_tail` (legs of the
+/// equation-eliminator arms — no intros, no cases: leg goals have
+/// their own spines and the repro-validated leg form is the bare
+/// simp ladder).
+fn simp_tail_from_unfolds(unfolds: &mut Vec<String>, scan: &StructuralScan) -> String {
+    format!("simp_all +zetaDelta only [{}] <;> omega", simp_list_from_unfolds(unfolds, scan))
 }
 
 /// Leg ladder for eliminator arms: the structural simp tail alone.
@@ -434,6 +636,16 @@ pub(crate) struct DtDefInventory {
     /// by defeq; `(h : r = {a := 0}) ⊢ sview r = 0` needs `sview`
     /// unfolded by simp). Derived: only goal-mentioned names enter.
     pub spec_fns: std::collections::HashSet<String>,
+    /// Full Lean names of the crate's RECURSIVE spec fns (bodies with
+    /// a nonempty `decreases`). These can NEVER ride a simp set — the
+    /// equation lemma's RHS contains the recursive call, which
+    /// re-matches to an uncatchable maxRecDepth (the N3 loop law;
+    /// probe `probe-n3-scripts/pmul_conv.lean`). They are the
+    /// `UnfoldOnce` rung-arm's `rw` targets instead: a goal whose Eq
+    /// core has one of these as its LHS head gets one measured
+    /// rewrite step (form B). They are deliberately NOT in `spec_fns`
+    /// (the non-recursive filter, kept permanently).
+    pub recursive_spec_fns: std::collections::HashSet<String>,
 }
 
 /// The STRUCTURAL rung (2026-07-17, the squeeze-regression fix): the

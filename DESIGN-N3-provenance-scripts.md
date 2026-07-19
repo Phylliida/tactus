@@ -1,6 +1,19 @@
 # DESIGN — N3: Provenance-Driven Proof Scripts
 
 **Status:** DRAFT v0.1 (2026-07-19), for iteration with Danielle.
+**M1 LANDED (2026-07-19):** form E (two-phase) + UnfoldOnce (form B)
+rung arms — tactus-algebra 205 → 177 failing obligations, 85 → 87
+verified fns, zero fn-level regressions; rust_verify_test 138/140
+(the 2 state_machines example failures are pre-existing, Z3-path).
+Details in the commit message. Key implementation lessons: (1) the
+form-E phases must be ONE arm (bare `split` chain-arms never see the
+ite guards hidden inside unfolded spec fns); (2) form-E phase-1 set =
+goal-mentioned unfolds ONLY (adding CORE leaves residuals the split
+can't close); (3) the guard simp must EXCLUDE the broadcast haves by
+name or the ext axioms explode the goal's own Seq equality;
+(4) fact-hyps whose bounds need arithmetic normalization
+(`↑(len x)` vs `↑1`) are out of M1's provenance-free reach — that is
+exactly form-B-script (M2) territory.
 **Prereqs landed:** N1 let-hoisting, N2 match-splitting, B6 emission
 phase, derived-closer completions through the eliminator arms.
 **Validated groundwork:** `probe-n3-scripts/` (three hand-validated

@@ -1061,6 +1061,7 @@ fn mk_test_emitter() -> ObligationEmitter {
         base_binders: Vec::new(),
         baseline_prefix_len: 0,
         eliminators: Vec::new(),
+        broadcast_count: 0,
         heartbeats: None,
         counter: 0,
         out: Vec::new(),

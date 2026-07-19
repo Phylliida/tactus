@@ -1377,6 +1377,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
         goal_shapes: Vec::new(),
         tactic_prefix,
         eliminators,
+        broadcast_count: broadcast_lemmas.len(),
         baseline_prefix_len,
         default_closer,
         heartbeats: fn_sst.x.attrs.tactus_heartbeats,
@@ -2208,6 +2209,14 @@ struct ObligationEmitter {
     /// lemma signatures at construction). The derived closer appends
     /// last-resort `apply`-arms for these.
     eliminators: Vec<String>,
+    /// Number of broadcast-lemma haves seeded into `tactic_prefix`
+    /// (`have _tactus_bc_<i> := …` for i < n). The UnfoldOnce arm's
+    /// guard simp EXCLUDES them by name (`-_tactus_bc_<i>`): left in,
+    /// the Prop-valued extensionality axioms (`axiom_seq_ext_equal`)
+    /// rewrite the goal's own Seq equality into len∧pointwise form and
+    /// blow up the one-step-unfold close. Same-pass naming contract —
+    /// the haves are seeded by this same construction site.
+    broadcast_count: usize,
     /// `tactic_prefix.len()` at construction — the broadcast-lemma
     /// `have` block only. Entries beyond this are USER prefixes
     /// (walk-pushed `proof { tac }` scopes), which reshape goals;
@@ -2457,6 +2466,7 @@ impl ObligationEmitter {
                         &binders,
                         self.tactic_prefix.len() > self.baseline_prefix_len,
                         &self.eliminators,
+                        self.broadcast_count,
                     )),
                 }
             }
@@ -2473,6 +2483,7 @@ impl ObligationEmitter {
                         &goal, &self.dt_inventory, &binders,
                         self.tactic_prefix.len() > self.baseline_prefix_len,
                         &self.eliminators,
+                        self.broadcast_count,
                     ),
                 ));
             }
@@ -4866,6 +4877,7 @@ pub(crate) fn cert_call_leaves<'a>(
         goal_shapes: Vec::new(),
         tactic_prefix: Vec::new(),
         eliminators: Vec::new(),
+        broadcast_count: 0,
         baseline_prefix_len: 0,
         default_closer: Tactic::Named("tactus_auto".to_string()),
         heartbeats: None,
