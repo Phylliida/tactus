@@ -192,3 +192,37 @@ base hash (verifier.rs). Remaining known hole (documented, not fixed):
 the emitter/closer BINARY version isn't keyed — a rebuilt binary with
 changed closer logic reuses old verdicts until the krate hash moves;
 worth a build-fingerprint tag if it ever bites.
+
+### Slice 1b WIP state (2026-07-19 end-of-session — spec layer DONE, proof layer mapped)
+
+COMMITTED as WIP (gate red at proof layer, spec layer complete):
+FLetH variant, has_plain_flet, close_e/close_sem_e/close_sem_obligs
+split into _wrap/_hoist + non-recursive gated dispatchers (callers
+unchanged), FLetH arms in frame_len/frame_append/close/havoc_lets/
+has_let/strip_hyps.
+
+REMAINING (precise map, in order):
+1. Three non-exhaustive proof matches: holds_close_e (~3639),
+   cso_nil_true (~3703), cso_cons_split (~3733). Restructure each as
+   TWO mode lemmas (_wrap = today's proof + FLetH arm mirroring FLet;
+   _hoist = FHyp arm via u_holds_all_binder against the ∀-upd sem,
+   FLetH arm via TWO nested u_holds_all_binder) + a dispatcher proof
+   with the ORIGINAL signature (`if has_plain_flet(f) { wrap } else
+   { hoist }` — dispatchers are non-recursive open specs, Z3 inlines).
+2. u_cse_hyp / u_cso_hyp as stated are now TRUE ONLY IN WRAP MODE
+   (hoist-mode FHyp is the ∀-reading). Either add `requires
+   has_plain_flet(t)`-style gates or split into _wrap/_hoist variants;
+   fix the three concrete callers (prophecy proofs + prop_v sites
+   ~3864/3957/3989).
+3. prophecy_sound / prophecy_swapped_sound: their frames (FBind +
+   hyps, NO lets) now dispatch to HOIST mode — their hand-computed
+   ensures describe the wrap reading and must be restated in ∀-form.
+   ⚠ 0-sentinel hyp names COLLIDE in hoist mode (upd(st, 0, n) hits
+   binder id 0) — give model-internal fixture frames DISTINCT name ids
+   (e.g. 90+), and note: serializer slice 2 must NEVER emit 0 names
+   for frames that can reach hoist mode.
+4. Any fixture expected-goal literals with let-free frames flip to
+   hoisted shapes (cd19 keeps wrap — its Assign FLet gates it).
+5. Then slice 2 (serializer): _h_hoist_i naming, FLetH classification
+   (type_map + non-Bool), Call-post/RetBind conversion, deepener
+   follow-up. Gate ALWAYS with --lean-all-proofs.
