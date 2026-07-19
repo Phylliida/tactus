@@ -235,8 +235,8 @@ fn dec_classifies_let_bound_drop_first() {
             vec![dec_var("data"), dec_var("rest"), dec_bin(BinOp::Add, dec_var("base"), dec_var("1"))],
         )),
     });
-    assert_eq!(
-        decreasing_kind(&dec_app(dec_var("lib.seq.Seq.len"), vec![dec_var("T"), dec_var("w")])),
+    assert_eq!(decreasing_kind(
+        &dec_app(dec_var("lib.seq.Seq.len"), vec![dec_var("T"), dec_var("w")]),
         "test_crate.f",
         &body,
         false
