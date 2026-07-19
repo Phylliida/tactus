@@ -1206,7 +1206,15 @@ pub(crate) fn datatype_simp_def_inventory(
         }
         by_type.insert(path, defs);
     }
-    crate::tactic_select::DtDefInventory { by_type, variants, spec_fns }
+    // Trait method DECLS: rendered as class projections; goal-mentioned
+    // ones join the simp set so impl obligations reduce through the
+    // registered instance (B6 mode-(b)).
+    let trait_methods: std::collections::HashSet<String> = functions
+        .iter()
+        .filter(|f| matches!(&f.x.kind, vir::ast::FunctionKind::TraitMethodDecl { .. }))
+        .map(|f| crate::to_lean_type::lean_name(&f.x.name.path))
+        .collect();
+    crate::tactic_select::DtDefInventory { by_type, variants, spec_fns, trait_methods }
 }
 
 pub fn datatype_to_cmds(

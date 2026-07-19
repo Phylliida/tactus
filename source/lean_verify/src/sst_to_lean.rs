@@ -1214,6 +1214,98 @@ pub fn exec_fn_theorems_to_ast<'a>(
     )?;
 
     let mut binders = build_param_binders(fn_sst);
+    // Trait-bound INSTANCE binders (`[Equivalence T]`), inserted after
+    // the typ params (build_param_binders puts those first) and before
+    // value params would need them — same rendering as proof-fn
+    // signatures (`fn_binders` → `trait_bounds_to_ast`). Without
+    // these, a trait-generic fn's obligation theorems bind `(T : Type)`
+    // bare and every trait-method application in the goal fails
+    // instance synthesis (B6: tactus-algebra's 182-lemma corpus, every
+    // generic lemma). Insert position: after the leading typ-param run.
+    {
+        let unemittable = crate::expr_shared::unemittable_traits(krate, &fn_map);
+        // OUTPARAM-FREE bounds only, for now: a trait with associated
+        // types renders as `class Tr (Self) (Assoc : outParam Type)`,
+        // and the bare bound `[Tr T]` is under-applied ("type
+        // expected") — threading the assoc args needs impl_subst's
+        // standalone-fn augmentation (the proof-fn path's
+        // maybe_augment_standalone_fn), a follow-on. Assoc-typed
+        // bounds keep their prior no-binder rendering, which the
+        // suite's assoc probes exercise green.
+        let trait_map: HashMap<vir::ast::Path, &vir::ast::TraitX> = krate
+            .traits
+            .iter()
+            .map(|t| (t.x.name.clone(), &t.x))
+            .collect();
+        let outparams =
+            crate::trait_emit::compute_trait_outparams(&trait_map, &unemittable);
+        let outparam_free: vir::ast::GenericBounds = std::sync::Arc::new(
+            fn_sst
+                .x
+                .typ_bounds
+                .iter()
+                .filter(|b| match &***b {
+                    vir::ast::GenericBoundX::Trait(vir::ast::TraitId::Path(p), _) => {
+                        outparams.get(p).map_or(true, |v| v.is_empty())
+                    }
+                    _ => true,
+                })
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let mut bound_binders = crate::trait_emit::trait_bounds_to_ast(
+            &outparam_free,
+            &unemittable,
+        );
+        // `[Nonempty T]` brackets (B4 seeds): the defs pipeline adds
+        // these to FunctionX copies (`add_fn_nonempty_bounds`), but the
+        // SST obligation path renders from fn_sst and never saw them —
+        // first surfaced by tactus-algebra's generic-T-with-Seq lemmas
+        // (stmt defs citing `Seq.empty T` with no `Nonempty T` in
+        // scope). Computed lazily: only generic fns pay for the
+        // crate-wide propagation map (obligation fns are overwhelmingly
+        // monomorphic elsewhere). Param-indexed needs only — the
+        // projection-typed needs ride assoc-typ traits, which the
+        // outparam filter above already defers.
+        if !fn_sst.x.typ_params.is_empty() {
+            let all_fns: Vec<&vir::ast::FunctionX> =
+                krate.functions.iter().map(|f| &f.x).collect();
+            let multi_variant: std::collections::HashSet<&vir::ast::Path> = krate
+                .datatypes
+                .iter()
+                .filter(|d| d.x.variants.len() > 1)
+                .filter_map(|d| match &d.x.name {
+                    vir::ast::Dt::Path(p) => Some(p),
+                    vir::ast::Dt::Tuple(_) => None,
+                })
+                .collect();
+            let needs = crate::nonempty::compute_nonempty_needs(
+                &all_fns,
+                &|p| multi_variant.contains(p),
+            );
+            if let Some(need) = needs.get(&fn_sst.x.name) {
+                for &i in need.params.iter() {
+                    if let Some(tp) = fn_sst.x.typ_params.get(i) {
+                        bound_binders.push(LBinder::instance(LExpr::app(
+                            LExpr::var_lit("Nonempty"),
+                            vec![LExpr::var_lit(tp.as_str())],
+                        )));
+                    }
+                }
+            }
+        }
+        let is_typ_param = |b: &LBinder| -> bool {
+            matches!(&b.ty.node,
+                crate::lean_ast::ExprNode::Var(n) if n.as_str() == "Type")
+        };
+        let insert_at = binders
+            .iter()
+            .position(|b| !is_typ_param(b))
+            .unwrap_or(binders.len());
+        for (i, b) in bound_binders.into_iter().enumerate() {
+            binders.insert(insert_at + i, b);
+        }
+    }
     binders.extend(build_borrow_mut_binders(check));
     binders.extend(build_req_binders(fn_sst, check, &mut_param_names, &fn_map));
 
