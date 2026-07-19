@@ -1946,10 +1946,14 @@ impl Verifier {
                         // above) through the Lean WP path. `#[verifier::z3]`
                         // remains the per-fn opt-out for shapes the WP
                         // translator can't handle yet.
+                        // Under --lean-backend, exec AND plain proof fns
+                        // route through Lean (always, since 2026-07-19 —
+                        // "--lean-backend" means "verify with Lean"; the
+                        // former --lean-all-proofs flag is gone). Per-fn
+                        // opt-out: #[verifier::z3].
                         let route_to_lean = if self.args.lean_backend {
                             (function.x.mode == vir::ast::Mode::Exec
-                                || (self.args.lean_all_proofs
-                                    && function.x.mode == vir::ast::Mode::Proof))
+                                || function.x.mode == vir::ast::Mode::Proof)
                                 && !function.x.attrs.tactus_z3
                         } else {
                             function.x.attrs.tactus_auto

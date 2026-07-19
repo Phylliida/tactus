@@ -130,13 +130,7 @@ pub struct ArgsX {
     /// no-ops, which is sound for Z3 but wrong for Lean's distinct
     /// `Int`/`Nat`). vstd builds without this flag (Z3 path unchanged).
     pub lean_backend: bool,
-    /// Tactus (experimental): under `--lean-backend`, also route plain `proof`
-    /// fns (no tactic block) through the Lean WP path instead of Z3, so the
-    /// whole crate is Lean-verified. Off by default because the WP translator
-    /// rejects some proof-fn SST shapes (assert-forall-by, choose, fuel/reveal)
-    /// and can hit perf cliffs Z3 handles fine; opt out per-fn with
-    /// `#[verifier::z3]`. See DESIGN.md "Exec-fn routing".
-    pub lean_all_proofs: bool,
+
     pub time: bool,
     pub time_expanded: bool,
     pub output_json: bool,
@@ -193,7 +187,6 @@ impl ArgsX {
             tactus_emit_cert: Default::default(),
             tactus_bridge: Default::default(),
             lean_backend: Default::default(),
-            lean_all_proofs: Default::default(),
             time: Default::default(),
             time_expanded: Default::default(),
             output_json: Default::default(),
@@ -389,7 +382,7 @@ pub fn parse_args_with_imports(
                 && !matches.opt_present(OPT_TACTUS_ISLANDS))
     }
     const OPT_LEAN_BACKEND: &str = "lean-backend";
-    const OPT_LEAN_ALL_PROOFS: &str = "lean-all-proofs";
+
     const OPT_TIME: &str = "time";
     const OPT_TIME_EXPANDED: &str = "time-expanded";
     const OPT_OUTPUT_JSON: &str = "output-json";
@@ -595,11 +588,6 @@ pub fn parse_args_with_imports(
         "",
         OPT_LEAN_BACKEND,
         "Tactus: target the Lean backend (emit Lean-friendly VIR shapes, e.g. keep uN->nat casts as Clip)",
-    );
-    opts.optflag(
-        "",
-        OPT_LEAN_ALL_PROOFS,
-        "Tactus (experimental): under --lean-backend, also route plain proof fns through Lean (opt out per-fn with #[verifier::z3])",
     );
     opts.optflag(
         "",
@@ -828,7 +816,6 @@ pub fn parse_args_with_imports(
             || matches.opt_present(OPT_TACTUS_BRIDGE),
         tactus_bridge: matches.opt_present(OPT_TACTUS_BRIDGE),
         lean_backend: matches.opt_present(OPT_LEAN_BACKEND),
-        lean_all_proofs: matches.opt_present(OPT_LEAN_ALL_PROOFS),
         time: matches.opt_present(OPT_TIME) || matches.opt_present(OPT_TIME_EXPANDED),
         time_expanded: matches.opt_present(OPT_TIME_EXPANDED),
         output_json: matches.opt_present(OPT_OUTPUT_JSON),

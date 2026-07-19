@@ -908,8 +908,27 @@ fn render_class_method_call(
     // case, where args already pin Self and a param annotation adds
     // nothing.
     if args.is_empty() {
+        // Pin `Self` via named argument when the instantiation is
+        // known (annotation alone only pins Self-returning methods —
+        // `picked : Int` leaves ?Self stuck; see the to_lean_expr
+        // twin).
+        let pinned = match typs.first() {
+            // Skip the pin for the trait's own Self param (inside the
+            // class decl the reference is a sibling field — see the
+            // to_lean_expr twin).
+            Some(self_typ)
+                if !matches!(&**self_typ, vir::ast::TypX::TypParam(n)
+                    if n.as_str() == "Self%" || n.as_str() == "Self") =>
+            {
+                LExpr::app(head, vec![LExpr::var_lit(&format!(
+                    "(Self := ({}))",
+                    crate::lean_pp::pp_expr(&typ_to_expr(self_typ)),
+                ))])
+            }
+            _ => head,
+        };
         return Ok(ExprNode::TypeAnnot {
-            expr: Box::new(head),
+            expr: Box::new(pinned),
             ty: Box::new(typ_to_expr(e_typ)),
         });
     }
