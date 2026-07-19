@@ -1,6 +1,6 @@
 ---
 title: "serializer arm — call-generic (vec_read/vec_push7/fill_zeros; the whole remaining fixture gap)"
-status: todo
+status: in_progress
 claimed_by:
 created: 2026-07-16T17:15:00Z
 updated: 2026-07-16T17:15:00Z
@@ -28,3 +28,35 @@ runner extended), or the genuinely-out-of-scope residue is re-tagged with a
 written reason; suite green.
 
 **Blocked by:** nothing.
+
+## Progress
+
+- (2026-07-18, fable-b74) **Generic gate lifted — vec_read certifies,
+  precondition goal decide-closes byte-for-byte, mutation-killed.**
+  The plumbing already existed: `build_call_substitutions` takes
+  `typ_args` → `typ_subst`; requires substitute it (Phase D), ensures
+  get it via `build_ens_post_render_subst`. The one real gap: `ret.typ`
+  sites saw a bare `TypParam` — fixed by computing `ret_typ_subst` at
+  the VIR level (`vir::sst_util::subst_typ`, mirroring production's
+  dest-let binder typ site) and using it for `type_bound_predicate`
+  (both paths), `coerce_lexpr` (ret-eq), and `typ_to_expr` (∀-path).
+- **Validation** (pre-b74-reconciliation scope): full-goals bridge is
+  blocked by the N1-hoist divergence (bootstrap-74, ALL fixtures
+  affected) — so validated the head goal alone: `goal_eq` on the Call
+  PRECONDITION goal decide-closes against production, and perturbing
+  the transcribed req atom (Var 16 → 15) flips it to disproven.
+  Goal 2's divergence is exactly the known b74 pattern (dest-lets →
+  witness/eq-hyp binder pairs), nothing call-specific.
+- **Re-tags:** vec_push7 → `call-mut` (prophecy/rebind machinery,
+  genuinely out of restricted scope — the card's sanctioned re-tag);
+  fill_zeros → `call-forall-path` — it is bootstrap-71's fixture
+  customer for free (Vec::new ensures has no `r == E` conjunct).
+  Fixture: 14 certs (+vec_read).
+- Remaining for done: full vec_read bridge-close after b74 lands; tgt
+  re-census (in flight); suite green (in flight).
+- (2026-07-18, fable-b74) **tgt payoff confirmed: exec wp-cert corpus
+  1 → 3** — runtime.apply_hom_gen + runtime.apply_hom_inv certify
+  (b70 generic gate + b71 ∀-path together took them through); census
+  267/1649, call-generic AND call-forall-path both zero, one call-mut
+  (copy_word) left in runtime. Full bridge-close of the new certs
+  pends bootstrap-74.
