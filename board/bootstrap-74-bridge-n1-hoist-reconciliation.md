@@ -1,6 +1,6 @@
 ---
 title: "bridge ↔ N1-hoist reconciliation — leaf-normal emission reshaped production goals; ALL fixture bridges honest-fail post-merge"
-status: todo
+status: in_progress
 claimed_by:
 created: 2026-07-18T09:30:00Z
 updated: 2026-07-18T09:30:00Z
@@ -64,3 +64,42 @@ documented caveats, probe11 re-run, suite green.
 
 **Blocked by:** possibly the main-side N1 flicker fix (Danielle's
 call).
+
+## Design (2026-07-19, settled after reading `hoist_all`)
+
+Production (`OblCtx::hoist_all`, sst_to_lean ~1865): per goal,
+ALL-OR-NOTHING — if ANY `Let` frame is Bool-typed or typ-less, return
+None → whole goal renders old-style (wrap: Let goals, Imp hyps).
+Otherwise EVERY frame hoists: `Let(x,v,T)` → `(x:T)` +
+`(_h_x_hoist1 : x = v)`; `Hyp(P)` → `(_h_hoist_i : P)` (1-based
+counter over frames in order); `Binder` → itself. Shadowed let names
+freshen (`x_hoist1`) with downstream references renamed; first binding
+keeps the source name.
+
+**Mirror plan — naming lives in the serializer, rendering in the
+model:**
+- `FrameList::FHyp` gains a NAME id: `FHyp(name, prop, rest)` —
+  serializer interns production's deterministic hyp name
+  (position-derived counter; freshening collisions = documented
+  honest-fail).
+- `FrameList::FLet(x, v, rest)` → `FLetH(x, typ, v, eq_name, eq_prop,
+  rest)` for HOISTABLE lets (serializer classifies: typ known +
+  non-Bool; eq_prop = interned render of `x = v`); plain `FLet`
+  REMAINS for non-hoistable lets.
+- `close_e` gate mirrors production exactly: any plain `FLet` in
+  frames → old rendering (FHyp→Imp ignoring name, FLetH→Let via its
+  v id); else hoisted rendering (FBind→All, FHyp→All(name,prop),
+  FLetH→All(x,typ)∘All(eq_name,eq_prop)).
+- `GoalData` UNCHANGED (hoisted chain = existing nested All).
+- Semantics: FHyp name is rendering-only — `holds`/`exec_safe_f` read
+  the prop; soundness untouched in meaning, arms updated mechanically
+  (discharge auto-absorbs, proven twice).
+- Ret-position let (`RetBind`) and Call-post FLets get the same
+  treatment at their serializer assembly sites.
+- Residual: goals-side deep-leaf transcription bails to atom on
+  hoisted shapes (vec_read goal 2) — deepener follows the new shape,
+  serializer-side, after the frame work.
+
+Order: (1) tactus-core FrameList/close_e/arms + gate; (2) serializer
+naming + classification + assembly sites; (3) fixtures bridge-close
+iteratively + mutation-kill; (4) tgt 3 certs + probe11; suite.
