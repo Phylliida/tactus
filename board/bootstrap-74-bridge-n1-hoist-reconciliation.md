@@ -160,3 +160,21 @@ already named; Assign classification (type_map typ, non-Bool →
 FLetH); Call-post FLet → FLetH; RetBind let likewise; shadow
 freshening = documented honest-fail initially (no-shadow common case
 first).
+
+### Slice 1a status + LATENT MAIN-SIDE FINDING (2026-07-19)
+
+Slice 1a (FHyp arity migration, name field + 0-sentinels, pass-through
+preservation, 4 u_-lemma signatures + 9 callers) is mechanically
+complete and compile-clean. Gate shows 134/7 — but the 7 reds are
+**PROVEN LATENT, not caused by the migration**: on main's UNTOUCHED
+code, hash-invalidating u_holds_all_binder alone (body `{ assert(true); }`
+touch) reproduces the failures. The post-merge gates were green via
+CACHE HITS from the main-side re-emit; the current pipeline cannot
+RE-prove these quantifier lemmas cold:
+  u_holds_all_binder, u_cse_bind, u_cso_bind, holds_close_e,
+  cso_cons_split, prophecy_sound, prophecy_swapped_sound
+(all tactus_tactic-attributed, all `∀ n, upd(st,x,n)` shapes — likely
+the closer-reconciliation (eca810f) or eliminator-arm re-emit changed
+closer behavior for this shape). ANY tactus-core edit that
+invalidates them hits this. Needs main-side attention (or closer
+re-reconciliation for the ∀-upd shape) BEFORE b74 slices can gate.
