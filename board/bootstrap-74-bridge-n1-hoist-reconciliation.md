@@ -103,3 +103,28 @@ model:**
 Order: (1) tactus-core FrameList/close_e/arms + gate; (2) serializer
 naming + classification + assembly sites; (3) fixtures bridge-close
 iteratively + mutation-kill; (4) tgt 3 certs + probe11; suite.
+
+### Design correction (2026-07-19, after reading holds/close_e)
+
+`holds(All(x, _ty, t)) = ∀ n, holds(t, upd(st,x,n))` — the typ slot is
+semantically IGNORED. Encoding named hyp-binders as `All(name, prop)`
+(what the goals transcriber currently does, and what my first sketch
+assumed refWp could emit) would make soundness read a hypothesis as a
+spurious quantifier. Corrected plan:
+
+- **GoalData gains `ImpN(name, prop, t)`** — holds = `hp(prop, st) ==>
+  holds(t, st)`, name inert (rendering only). The goals TRANSCRIBER
+  switches to ImpN for hyp-provenance binders (production's
+  `(LBinder, Option<HypProvenance>)` pairs distinguish them: Some =
+  hyp, None = value binder) — serializer-side, both sides of the
+  bridge agree by construction.
+- Hoisted let pair = `All(x, typ) ∘ ImpN(eq_name, eq_prop)`; its
+  semantic reading is the ∀+eq form. The frame-telescope semantic fn
+  (close_sem) gets the SAME `has_plain_flet` gate as close_e, so each
+  mode's rendering and semantics stay structurally parallel and
+  wp_stm_sound remains a mechanical weave.
+- The `let x := v ↔ ∀ x, x = v → …` equivalence is NOT needed in the
+  oracle-parametric layer — it belongs to the adequacy spine ONCE,
+  where oracles are real (probe37 territory).
+- "Semantics untouched" in the earlier sketch was WRONG — semantics
+  gains ImpN + gated close_sem, both mechanical.
