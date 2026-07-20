@@ -1219,6 +1219,41 @@ pub(crate) fn datatype_simp_def_inventory(
         });
         spec_fn_body_refs.insert(crate::to_lean_type::lean_name(&f.x.name.path), refs);
     }
+    // Trait method IMPL bodies: the instance emission renders impl
+    // method bodies INLINE as the instance's field values
+    // (`zero := lib.rational.impl__0.from_int_spec 0`), so when simp's
+    // projection unfolding reduces a goal-mentioned class projection,
+    // the impl body's callees surface as fresh opaque atoms
+    // (`AdditiveCommutativeMonoid.zero` → `from_int_spec`, which then
+    // can't unfold — the den-small obligations died there). Map each
+    // trait method DECL (the class projection name goals mention) to
+    // the union of its impls' non-recursive spec-fn callees so the
+    // `goal_unfold_names` closure reaches through the projection.
+    for f in functions.iter() {
+        let vir::ast::FunctionKind::TraitMethodImpl { method, .. } = &f.x.kind else { continue };
+        let Some(body) = &f.x.body else { continue };
+        let mut new_refs: Vec<String> = Vec::new();
+        vir::ast_visitor::expr_visitor_walk(body, &mut |e: &vir::ast::Expr| {
+            if let vir::ast::ExprX::Call(vir::ast::CallTarget::Fun(_, fun, _, _, _, _), _, _) = &e.x {
+                let name = crate::to_lean_type::lean_name(&fun.path);
+                if name != crate::to_lean_type::lean_name(&f.x.name.path)
+                    && spec_fns.contains(&name)
+                    && !new_refs.contains(&name)
+                {
+                    new_refs.push(name);
+                }
+            }
+            vir::visitor::VisitorControlFlow::Recurse
+        });
+        let entry = spec_fn_body_refs
+            .entry(crate::to_lean_type::lean_name(&method.path))
+            .or_default();
+        for r in new_refs {
+            if !entry.contains(&r) {
+                entry.push(r);
+            }
+        }
+    }
     for d in datatypes.iter() {
         if matches!(d.x.transparency, DatatypeTransparency::Never) {
             continue;

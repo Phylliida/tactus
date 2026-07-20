@@ -190,6 +190,7 @@ fn goal_list_skips_none_and_pairs_names() {
         name: n.to_string(),
         binders: Vec::new(),
         goal: LExpr::var(LeanName::synthetic("g")),
+        closer_census: None,
         tactic: crate::lean_ast::Tactic::Named("tactus_auto".to_string()),
         requires_preamble: Vec::new(),
         heartbeats: None,
