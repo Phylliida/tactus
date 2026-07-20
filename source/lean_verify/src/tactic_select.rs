@@ -590,9 +590,7 @@ fn simp_tail_from_unfolds(unfolds: &mut Vec<String>, scan: &StructuralScan) -> S
 /// Leg ladder for eliminator arms: the structural simp tail alone.
 fn rung_tail(goal: &Expr, dts: &DtDefInventory, binders: &[Binder]) -> String {
     let scan = run_structural_scan(goal, dts, binders);
-    let mut unfolds: Vec<String> = scan.unfolds.iter().cloned().collect();
-    unfolds.extend(scan.mentioned_spec_fns.iter().cloned());
-    unfolds.extend(scan.mentioned_trait_methods.iter().cloned());
+    let mut unfolds: Vec<String> = goal_unfold_names(goal, dts, binders);
     simp_tail_from_unfolds(&mut unfolds, &scan)
 }
 
@@ -753,10 +751,8 @@ pub(crate) fn structural_rung(
     steps.push("intros".to_string());
     let prefix = steps.join("; ");
 
-    let mut unfolds: Vec<String> = scan.unfolds.iter().cloned().collect();
+    let mut unfolds: Vec<String> = goal_unfold_names(goal, dts, binders);
     // (constructor .injEq derivation lives in simp_tail_from_unfolds)
-    unfolds.extend(scan.mentioned_spec_fns.iter().cloned());
-    unfolds.extend(scan.mentioned_trait_methods.iter().cloned());
     unfolds.sort();
     let tail = simp_tail_from_unfolds(&mut unfolds, &scan);
 
