@@ -1189,6 +1189,36 @@ pub(crate) fn datatype_simp_def_inventory(
         })
         .map(|f| crate::to_lean_type::lean_name(&f.x.name.path))
         .collect();
+    // N3 recursive-unfold law for NON-recursive fns: each non-recursive
+    // spec fn's body can mention further non-recursive spec fns, and a
+    // one-level unfold leaves those as fresh opaque atoms
+    // (`denom` → `denom_nat` → omega still blind). Map each spec fn to
+    // the non-recursive spec fns its body references; `goal_unfold_names`
+    // closes over it (bounded) so the unfold reaches a form the closer
+    // can finish. Recursive fns are never targets (the loop law) and
+    // never walked for refs (their bodies can't clean-unfold anyway).
+    let mut spec_fn_body_refs: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for f in functions.iter() {
+        if !(f.x.mode == vir::ast::Mode::Spec && f.x.decrease.is_empty()) {
+            continue;
+        }
+        let Some(body) = &f.x.body else { continue };
+        let mut refs: Vec<String> = Vec::new();
+        vir::ast_visitor::expr_visitor_walk(body, &mut |e: &vir::ast::Expr| {
+            if let vir::ast::ExprX::Call(vir::ast::CallTarget::Fun(_, fun, _, _, _, _), _, _) = &e.x {
+                let name = crate::to_lean_type::lean_name(&fun.path);
+                if name != crate::to_lean_type::lean_name(&f.x.name.path)
+                    && spec_fns.contains(&name)
+                    && !refs.contains(&name)
+                {
+                    refs.push(name);
+                }
+            }
+            vir::visitor::VisitorControlFlow::Recurse
+        });
+        spec_fn_body_refs.insert(crate::to_lean_type::lean_name(&f.x.name.path), refs);
+    }
     for d in datatypes.iter() {
         if matches!(d.x.transparency, DatatypeTransparency::Never) {
             continue;
@@ -1229,7 +1259,7 @@ pub(crate) fn datatype_simp_def_inventory(
         .filter(|f| matches!(&f.x.kind, vir::ast::FunctionKind::TraitMethodDecl { .. }))
         .map(|f| crate::to_lean_type::lean_name(&f.x.name.path))
         .collect();
-    crate::tactic_select::DtDefInventory { by_type, variants, spec_fns, recursive_spec_fns, trait_methods }
+    crate::tactic_select::DtDefInventory { by_type, variants, spec_fns, recursive_spec_fns, spec_fn_body_refs, trait_methods }
 }
 
 pub fn datatype_to_cmds(

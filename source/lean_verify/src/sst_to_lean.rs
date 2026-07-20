@@ -2581,8 +2581,15 @@ impl ObligationEmitter {
         // known (once per scope, many theorems); the marker they plant
         // is expanded to the per-goal derived closer here.
         if let Tactic::Raw(text) = &closer {
+            let mut text = text.clone();
+            if text.contains(crate::tactic_select::NONLIN_MARKER) {
+                text = text.replace(
+                    crate::tactic_select::NONLIN_MARKER,
+                    &crate::tactic_select::nonlin_ladder(&goal, &binders),
+                );
+            }
             if text.contains(crate::tactic_select::DERIVED_MARKER) {
-                closer = Tactic::Raw(text.replace(
+                text = text.replace(
                     crate::tactic_select::DERIVED_MARKER,
                     &crate::tactic_select::derived_closer(
                         &goal, &self.dt_inventory, &binders,
@@ -2591,8 +2598,9 @@ impl ObligationEmitter {
                         self.broadcast_count,
                         Some(&mut census),
                     ),
-                ));
+                );
             }
+            closer = Tactic::Raw(text);
         }
         crate::generate::census_bump(census);
         let tactic = self.compose_tactic(closer);
@@ -2873,7 +2881,15 @@ fn walk_obligations<'a>(
                 }
                 other => tactic_as_str(other),
             };
-            let primary_str = tactic_as_str(primary);
+            let primary_str = match primary {
+                Tactic::Named(n) if n == "nlinarith" => {
+                    // The per-goal nonlinear ladder (R2): marker
+                    // expanded by `emit_with_extras` into the
+                    // multiplier-pool nlinarith ladder per theorem.
+                    crate::tactic_select::NONLIN_MARKER.to_string()
+                }
+                other => tactic_as_str(other),
+            };
             let composed = Tactic::Raw(format!(
                 "first | (intros; {}) | ({}) | \
                  fail \"{} scope: could not close — \

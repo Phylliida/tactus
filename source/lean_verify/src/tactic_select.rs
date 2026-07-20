@@ -605,6 +605,23 @@ pub(crate) fn goal_unfold_names(goal: &Expr, dts: &DtDefInventory, binders: &[Bi
     let mut unfolds: Vec<String> = scan.unfolds.iter().cloned().collect();
     unfolds.extend(scan.mentioned_spec_fns.iter().cloned());
     unfolds.extend(scan.mentioned_trait_methods.iter().cloned());
+    // N3 recursive-unfold law for NON-recursive fns: close over body
+    // references so a one-level unfold never strands the goal one def
+    // short of a finishable form (denom → denom_nat). Recursive fns
+    // are never targets (they're not in the map's values by
+    // construction — the loop law). Bounded by the map's size.
+    let mut seen: std::collections::HashSet<String> = unfolds.iter().cloned().collect();
+    let mut work: Vec<String> = unfolds.clone();
+    while let Some(f) = work.pop() {
+        if let Some(refs) = dts.spec_fn_body_refs.get(&f) {
+            for r in refs {
+                if seen.insert(r.clone()) {
+                    unfolds.push(r.clone());
+                    work.push(r.clone());
+                }
+            }
+        }
+    }
     unfolds.sort();
     unfolds.dedup();
     unfolds
@@ -674,6 +691,12 @@ pub(crate) struct DtDefInventory {
     /// rewrite step (form B). They are deliberately NOT in `spec_fns`
     /// (the non-recursive filter, kept permanently).
     pub recursive_spec_fns: std::collections::HashSet<String>,
+    /// Non-recursive spec fn → the non-recursive spec fns its body
+    /// references. `goal_unfold_names` closes over this so the unfold
+    /// reaches a finishable form (denom → denom_nat; N3's
+    /// recursive-unfold law for NON-recursive fns — recursive fns are
+    /// never targets, see `recursive_spec_fns`).
+    pub spec_fn_body_refs: std::collections::HashMap<String, Vec<String>>,
 }
 
 /// The STRUCTURAL rung (2026-07-17, the squeeze-regression fix): the
@@ -1274,3 +1297,254 @@ fn is_lit(e: &Expr) -> bool {
 #[cfg(test)]
 #[path = "tests/tactic_select.rs"]
 mod tests;
+
+// ────────────────────────────────────────────────────────────────────
+// The nonlinear ladder (the Rational story, R2)
+// ────────────────────────────────────────────────────────────────────
+
+/// Marker text planted in the PRIMARY slot of a `by(nonlinear_arith)`
+/// AssertQuery scope's composed closer (sst_to_lean.rs's AssertQuery
+/// walker). `emit_with_extras` substitutes `nonlin_ladder(goal,
+/// binders)` per theorem — the scope composes once but the multiplier
+/// pool is goal-specific. If it ever leaks into an artifact it fails
+/// LOUD (unknown identifier) — substitution is total.
+pub(crate) const NONLIN_MARKER: &str = "tactus_nonlin_marker__";
+
+/// The `by(nonlinear_arith)` primary, per-goal form. Bare `nlinarith`
+/// cannot multiply hypotheses by atoms (empirically pinned
+/// 2026-07-19: it closes single-step identities and pure inequality
+/// chains, and fails every equality chain/congruence in the Rational
+/// instance). The ladder:
+///
+/// 1. `nlinarith [pool]` where pool = the context's arithmetic hyps
+///    PLUS each Int-Eq hyp congrArg-multiplied by each goal-mentioned
+///    Int atom (binder-typed Int vars + `Rational.denom` applications
+///    — the only structurally Int-known terms). The transitivity /
+///    congruence certificates live in that pool.
+/// 2. For Eq goals with a denominator positivity hyp in context: the
+///    `mul_eq_zero` cancel — `D * (lhs - rhs) = 0` by nlinarith over
+///    the same pool, then `resolve_left (by omega : D ≠ 0)`.
+/// 3. For denominator-positivity goals themselves: unfold
+///    `Rational.denom`/`denom_nat` (den = den+1, positive by
+///    construction) and omega.
+///
+/// Everything is derived from the goal text + binder types — no
+/// ambient-scope reads, deterministic, and each branch fails fast.
+pub(crate) fn nonlin_ladder(goal: &Expr, binders: &[Binder]) -> String {
+    let hyps = arith_hyps(binders);
+    let mut multipliers = int_atoms(goal, binders);
+    multipliers.sort();
+    multipliers.dedup();
+    multipliers.truncate(6);
+    // congrArg-multiply each Int-Eq hyp by each multiplier (capped),
+    // rendering the have's TYPE as the beta-reduced multiplied form
+    // (a bare congrArg leaves the lambda unreduced — nlinarith then
+    // treats the fact as an opaque application and misses the proof).
+    let mut pool: Vec<String> = hyps.iter().map(|h| h.name.clone()).collect();
+    let mut pre: Vec<String> = Vec::new();
+    let mut count = 0usize;
+    for h in &hyps {
+        if !h.is_eq {
+            continue;
+        }
+        for d in &multipliers {
+            if count >= 12 {
+                break;
+            }
+            let ml = crate::lean_pp::pp_expr(&h.lhs);
+            let mr = crate::lean_pp::pp_expr(&h.rhs);
+            pre.push(format!(
+                "have _m{count} : {ml} * {d} = {mr} * {d} := congrArg (fun t : Int => t * {d}) {h}",
+                count = count,
+                ml = ml,
+                mr = mr,
+                d = d,
+                h = h.name
+            ));
+            pool.push(format!("_m{}", count));
+            count += 1;
+        }
+    }
+    let pool_text = if pool.is_empty() { "[]".to_string() } else { format!("[{}]", pool.join(", ")) };
+    let pre_text = if pre.is_empty() { String::new() } else { format!("{}; ", pre.join("; ")) };
+    let mut branches: Vec<String> = vec![format!("({}nlinarith {})", pre_text, pool_text)];
+    // Cancel branch for equality goals with a positivity hyp.
+    if let Some((d, lhs, rhs)) = cancel_target(goal, binders) {
+        branches.push(format!(
+            "({}have _e : ({d} : Int) ≠ 0 := by omega; \
+             have _z : {d} * (({lhs}) - ({rhs})) = 0 := by nlinarith {pool}; \
+             have _r := (mul_eq_zero.mp _z).resolve_left _e; \
+             nlinarith [_r])",
+            pre_text,
+            d = d,
+            lhs = crate::lean_pp::pp_expr(lhs),
+            rhs = crate::lean_pp::pp_expr(rhs),
+            pool = pool_text
+        ));
+    }
+    // Denominator-positivity branch.
+    if is_denom_positivity_goal(goal) {
+        branches.push(
+            "(simp only [lib.Rational.denom, lib.Rational.denom_nat]; omega)".to_string(),
+        );
+    }
+    format!("first | {}", branches.join(" | "))
+}
+
+/// One arithmetic hypothesis from the theorem binders: a binder whose
+/// type is an Int-typed comparison/equation. Carries the sides for
+/// the congrArg-multiply rendering (the have's explicit type must be
+/// the beta-reduced multiplied form — a bare `congrArg (fun t => t*d)
+/// h` leaves the lambda unreduced and nlinarith can't see through it).
+struct ArithHyp {
+    name: String,
+    is_eq: bool,
+    lhs: Expr,
+    rhs: Expr,
+}
+
+fn arith_hyps(binders: &[Binder]) -> Vec<ArithHyp> {
+    let mut out = Vec::new();
+    for b in binders {
+        let Some(name) = &b.name else { continue };
+        let mut t = &b.ty;
+        while let ExprNode::SpanMark { inner, .. } = &t.node {
+            t = inner;
+        }
+        if let ExprNode::BinOp { op, lhs, rhs } = &t.node {
+            use crate::lean_ast::BinOp::*;
+            let is_eq = matches!(op, Eq | Ne);
+            if is_eq || matches!(op, Le | Lt | Ge | Gt) {
+                out.push(ArithHyp {
+                    name: name.as_str().to_string(),
+                    is_eq,
+                    lhs: lhs.as_ref().clone(),
+                    rhs: rhs.as_ref().clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Type-safe Int-atom multipliers: binder names whose declared type is
+/// `Int`, plus `lib.Rational.denom …` applications mentioned anywhere
+/// in the goal (denom returns Int structurally). Anything else (Nat
+/// vars, Seq terms) would make `congrArg (fun t : Int => t * d) h`
+/// ill-typed — an ELABORATION error, not a catchable failure.
+fn int_atoms(goal: &Expr, binders: &[Binder]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for b in binders {
+        if let (Some(n), ExprNode::Var(t)) = (&b.name, &b.ty.node) {
+            if t.as_str() == "Int" {
+                out.push(n.as_str().to_string());
+            }
+        }
+    }
+    fn walk(e: &Expr, out: &mut Vec<String>) {
+        match &e.node {
+            ExprNode::App { head, args } => {
+                if let ExprNode::Var(n) = &head.node {
+                    if n.as_str() == "lib.Rational.denom" {
+                        out.push(crate::lean_pp::pp_expr(e));
+                    }
+                }
+                for a in args {
+                    walk(a, out);
+                }
+            }
+            _ => e.for_each_child(|c| walk(c, out)),
+        }
+    }
+    walk(goal, &mut out);
+    out
+}
+
+/// For an Eq goal with a denominator positivity hyp in context:
+/// (positivity atom D as pp text, lhs, rhs).
+fn cancel_target<'a>(goal: &'a Expr, binders: &[Binder]) -> Option<(String, &'a Expr, &'a Expr)> {
+    let mut cur = goal;
+    loop {
+        match &cur.node {
+            ExprNode::SpanMark { inner, .. } => cur = inner,
+            ExprNode::TypeAnnot { expr, .. } => cur = expr,
+            ExprNode::Forall { body, .. } => cur = body,
+            ExprNode::BinOp { op: crate::lean_ast::BinOp::Implies, rhs, .. } => cur = rhs,
+            ExprNode::BinOp { op: crate::lean_ast::BinOp::Eq, lhs, rhs } => {
+                // Find a `D > 0` hyp where D is a denom application
+                // mentioned in the goal.
+                for b in binders {
+                    if let ExprNode::BinOp { op: crate::lean_ast::BinOp::Gt, lhs: dl, rhs: zr } =
+                        &b.ty.node
+                    {
+                        if matches!(&zr.node, ExprNode::Lit(n) if n == "0") {
+                            if let ExprNode::App { head, .. } = &dl.node {
+                                if let ExprNode::Var(n) = &head.node {
+                                    if n.as_str() == "lib.Rational.denom"
+                                        && contains_app_head(goal, "lib.Rational.denom")
+                                    {
+                                        return Some((
+                                            crate::lean_pp::pp_expr(dl),
+                                            lhs,
+                                            rhs,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                return None;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn contains_app_head(e: &Expr, name: &str) -> bool {
+    match &e.node {
+        ExprNode::App { head, args } => {
+            if let ExprNode::Var(n) = &head.node {
+                if n.as_str() == name {
+                    return true;
+                }
+            }
+            args.iter().any(|a| contains_app_head(a, name))
+        }
+        _ => {
+            let mut found = false;
+            e.for_each_child(|c| {
+                found = found || contains_app_head(c, name);
+            });
+            found
+        }
+    }
+}
+
+/// Is the goal literally `lib.Rational.denom x > 0` (or `0 < denom x`)?
+fn is_denom_positivity_goal(goal: &Expr) -> bool {
+    fn is_denom_app(e: &Expr) -> bool {
+        match &e.node {
+            ExprNode::App { head, .. } => {
+                matches!(&head.node, ExprNode::Var(n) if n.as_str() == "lib.Rational.denom")
+            }
+            _ => false,
+        }
+    }
+    let mut cur = goal;
+    loop {
+        match &cur.node {
+            ExprNode::SpanMark { inner, .. } => cur = inner,
+            ExprNode::TypeAnnot { expr, .. } => cur = expr,
+            ExprNode::Forall { body, .. } => cur = body,
+            ExprNode::BinOp { op: crate::lean_ast::BinOp::Implies, rhs, .. } => cur = rhs,
+            ExprNode::BinOp { op: crate::lean_ast::BinOp::Gt, lhs, .. } => {
+                return is_denom_app(lhs);
+            }
+            ExprNode::BinOp { op: crate::lean_ast::BinOp::Lt, lhs, rhs } => {
+                return is_denom_app(rhs);
+            }
+            _ => return false,
+        }
+    }
+}
