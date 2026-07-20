@@ -1356,7 +1356,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
     // (vec_clone_view_eq_u8 closing view-equality from a vec clone's
     // pointwise ensures is the motivating case — the final e2e
     // residue; see BUG-vecfield-clone-ensures.md).
-    let eliminators: Vec<String> = broadcast_lemmas
+    let eliminators: Vec<(String, Option<String>)> = broadcast_lemmas
         .iter()
         .filter_map(|fun| {
             let fx = krate.functions.iter().find(|f| &f.x.name == *fun)?;
@@ -1367,7 +1367,25 @@ pub fn exec_fn_theorems_to_ast<'a>(
                 vir::ast::ExprX::Binary(vir::ast::BinaryOp::Eq(_), l, _)
                     if !matches!(&*vir::ast_util::undecorate_typ(&l.typ), vir::ast::TypX::Bool) =>
                 {
-                    Some(crate::to_lean_type::lean_name(&fun.path))
+                    // Conclusion LHS head symbol (App head of the
+                    // equation's LHS) for the derived closer's
+                    // apply-guard: an eliminator arm only emits when the
+                    // goal's own equation LHS head textually matches —
+                    // otherwise the `apply` can never unify and the arm
+                    // only wastes heartbeats and masks the real closer
+                    // failure (`lib.seq.lemma_seq_two_subranges_index`
+                    // reported against every Rational equation goal).
+                    // `None` = head not statically known (non-Call LHS)
+                    // → the arm is kept (conservative).
+                    let head = match &l.x {
+                        vir::ast::ExprX::Call(
+                            vir::ast::CallTarget::Fun(_, f, _, _, _, _),
+                            _,
+                            _,
+                        ) => Some(crate::to_lean_type::lean_name(&f.path)),
+                        _ => None,
+                    };
+                    Some((crate::to_lean_type::lean_name(&fun.path), head))
                 }
                 _ => None,
             }
@@ -2246,9 +2264,11 @@ struct ObligationEmitter {
     tactic_prefix: Vec<String>,
     /// Lean names of equation-eliminator broadcast lemmas in scope
     /// (single-ensure, non-Prop equation conclusion — computed from
-    /// lemma signatures at construction). The derived closer appends
-    /// last-resort `apply`-arms for these.
-    eliminators: Vec<String>,
+    /// lemma signatures at construction), paired with the conclusion's
+    /// LHS head symbol when statically known (the derived closer's
+    /// apply-guard skips arms whose head cannot unify with the goal's).
+    /// The derived closer appends last-resort `apply`-arms for these.
+    eliminators: Vec<(String, Option<String>)>,
     /// Number of broadcast-lemma haves seeded into `tactic_prefix`
     /// (`have _tactus_bc_<i> := …` for i < n). The UnfoldOnce arm's
     /// guard simp EXCLUDES them by name (`-_tactus_bc_<i>`): left in,
@@ -2397,11 +2417,21 @@ impl ObligationEmitter {
         // pairs, so the goal reaches the closers with no goal-position
         // lets (no `+zetaDelta`, no opaque let-fvar omega atoms) and
         // flat arithmetic goals classify into S1's omega fragment.
-        // User closers (`tactus_tactic` overrides, AssertQuery scopes)
-        // keep the goal-position wrap — their tactic bodies were
-        // written against that shape. Falls back to the wrap when a
-        // Let frame lacks its typ (see `hoist_all`).
-        let is_default = matches!(&obl.closer, Tactic::Named(n) if n == "tactus_auto");
+        // User closers (`tactus_tactic` overrides) keep the goal-position
+        // wrap — their tactic bodies were written against that shape.
+        // Falls back to the wrap when a Let frame lacks its typ (see
+        // `hoist_all`).
+        //
+        // `by (nonlinear_arith)` AssertQuery scopes hoist TOO: their
+        // closer is our own composed ladder (NONLIN_MARKER in the
+        // primary slot), not a user tactic — and the ladder's
+        // congrArg/rewrite steps reference the requires-hyps BY NAME,
+        // which only hoisted (`_h_hoist_N`) binders provide. On the
+        // wrap path the requires arrive as anonymous `→` antecedents
+        // and the ladder degenerates to `nlinarith []` (the congruence
+        // family starved there, 2026-07-20).
+        let is_default = matches!(&obl.closer, Tactic::Named(n) if n == "tactus_auto")
+            || matches!(&obl.closer, Tactic::Raw(s) if s.contains(crate::tactic_select::NONLIN_MARKER));
         if is_default {
             let taken: std::collections::HashSet<String> = self
                 .base_binders

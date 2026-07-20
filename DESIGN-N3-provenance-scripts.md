@@ -1,6 +1,42 @@
 # DESIGN — N3: Provenance-Driven Proof Scripts
 
 **Status:** DRAFT v0.1 (2026-07-19), for iteration with Danielle.
+**Congruence arc LANDED (2026-07-20):** eliminator apply-guard +
+trait-impl body-refs closure + form G (goal-only collapse) + the
+NONLIN-scope hoist with the rewrite-ladder (commits in tactus).
+Algebra: 98 → 107 verified fns, 102 → 86 failing obligations;
+rust_verify_test 138/140 (2 pre-existing); lean_verify unit 407/0.
+GREEN newly: axiom_add_zero_right / mul_one_right / mul_zero_right /
+add_inverse_right / one_ne_zero / div_is_mul_recip / neg_congruence /
+sub_is_add_neg / add_congruence_left (full fn), recip_congruence 5→4.
+Lessons: (13) eliminator arms need an apply-guard — conclusion-LHS-head
+must textually match the goal's LHS head (same `lean_name` contract on
+both sides) or the blind `apply` misfire's "could not unify" masks the
+real failure on EVERY equation goal; unknown head → keep the arm.
+(14) simp's projection unfolding strands impl-body callees: a class
+projection reduces to the instance's INLINE field value (`zero :=
+from_int_spec 0`), so `spec_fn_body_refs` must map trait method DECLS
+to their impls' spec-fn callees or the unfold closure stops one def
+short. (15) form G for trait-projection-headed goals: the simp_all
+rung maxRecDepth-loops when let-wrapped equation antecedents become
+rewrites, but those goals need NO hyps — `intros; simp +zetaDelta only
+[COLLAPSES, unfolds] at ⊢; first | omega | done`; the collapse set
+needs SUB-distribution (`Int.sub_mul`/`Int.mul_sub` — `neg_spec` emits
+`0 - self.num`), and the terminator is omega-only because nlinarith is
+NOT import-safe (per-obligation artifacts import
+`Mathlib.Tactic.Linarith` only when the fn has a `by(nonlinear_arith)`
+scope — the 32/275 "unknown tactic" regression). (16)
+`by(nonlinear_arith)` scopes must HOIST (emit_split matches
+NONLIN_MARKER): the ladder's congrArg/rw steps reference requires-hyps
+BY NAME and anonymous `→` antecedents starve the pool; surfacing it
+exposed two latent pool bugs — congrArg is a TYPE CHECK (Rational-Eq
+hyps must be excluded by a structural Int-side check) and the have's
+multiplied type needs PARENTHESIZED sides (`(X + Y) * d` vs `X + Y *
+d` is not defeq → elaboration kills the primary). (17) the
+cross-multiply rw-ladder: fold definition hyps INTO the goal with `rw`
+first, then congrArg-multiply the kernel hyp by a denom MONOMIAL
+(squares first — `dc * dc`); nlinarith's hyp×hyp products can never
+build atom-monomial certificates.
 **M2 + the Rational story LANDED (2026-07-19):** script IR +
 author v1 (forms A, B) + form C (M4) + the R1/R2 Rational arc
 (commits `733546a`, `d5706f2`, `4f166a8`). Algebra: 205 → 139
