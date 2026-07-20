@@ -1,6 +1,41 @@
 # DESIGN — N3: Provenance-Driven Proof Scripts
 
 **Status:** DRAFT v0.1 (2026-07-19), for iteration with Danielle.
+**Certificate-computation arc LANDED (2026-07-20):** quotient
+derivation + partial hoist + R3/R4 le-multipliers + denom-injectivity.
+Algebra: 107 → 112 verified, 86 → 76 errors. All 24 Rational impls
+green except the recip sign-split trio (mul_recip_right,
+recip_congruence ×2). Lessons: (18) the transparency/predictability
+law (Danielle): COMPUTE certificates, never menu for them — a capped
+menu is luck-bounded search and silently cuts winners; failures that
+fall outside the statable rules go loud to `proof {}`, and that is a
+feature. The quotient derivation replaces the menu: multiset-diff of
+the (definition-folded) goal's and kernel's monomials — `dc * dc`
+falls out of `{a.num, dc, db, dc} − {a.num, db}` structurally.
+(19) `have x : T := by tac;` inside a `;`-separated single-line chain
+SWALLOWS the rest of the sequence into the by-block — the by's goal
+closes, then "No goals to be solved" kills the arm invisibly. Every
+by-have in an emitted chain must be `(by tac)`. Latent in the cancel
+branch since R2 (masked by the pool arm); the R4 chain-have tripped
+it. (20) application-precedence: bare pp-atoms spliced as function
+ARGS need parens — `mul_self_nonneg lib.Rational.denom c` parses as
+`(mul_self_nonneg lib.Rational.denom) c` (the FUNCTION squared). Same
+class as the congrArg pool's `(X + Y) * d` bug. (21) the trailing
+equation wrapper (`let tmp := v; tmp`) hides the goal core from any
+gate that peels `Let → body` — look through to the VALUE when the
+body is the same var (N1's spine rule); it had gated the
+denom-injectivity arm off. (22) partial hoist: Bool-lets become
+goal-position residue lets, everything else hoists — Prop EQUATIONS
+in the telescope are the simp-loop hazard N1 avoided (nested_if), but
+bailing the whole hoist stranded every requires-hyp anonymous
+(mul_distributes). Bail only when a hoisted binder would mention a
+residue name. (23) denom-injectivity: `.den` equalities follow from
+`denom` equations (`denom x = ↑(x.den + 1)`) — targeted
+`simp only [denom, denom_nat] at ⊢ <names>; omega`, gated on an Eq
+core with a FieldProj LHS plus a denom-mentioning binder (never bare
+`at *`). R4 (two-sided congruence): each fact multiplied by the
+denominators it does NOT mention; the inequality's own denominators
+are the cancel factor (`mul_le_mul_iff_left₀`).
 **Congruence arc LANDED (2026-07-20):** eliminator apply-guard +
 trait-impl body-refs closure + form G (goal-only collapse) + the
 NONLIN-scope hoist with the rewrite-ladder (commits in tactus).

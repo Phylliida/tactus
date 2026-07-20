@@ -1780,6 +1780,21 @@ fn rename_frame_vars(
     }
 }
 
+/// Does `e` mention `name` as a `Var` node? Used by the partial
+/// hoist's bail check: a theorem-level binder may not refer to a
+/// goal-position residue let. No shadow tracking — a shadowed
+/// coincidence bails conservatively (the pre-partial-hoist behavior).
+fn lexpr_mentions_var(e: &LExpr, name: &str) -> bool {
+    match &e.node {
+        crate::lean_ast::ExprNode::Var(n) => n.as_str() == name,
+        _ => {
+            let mut found = false;
+            e.for_each_child(|c| found = found || lexpr_mentions_var(c, name));
+            found
+        }
+    }
+}
+
 /// One frame of accumulated context as the obligation walker descends
 /// into a Wp tree. Pushed at scope-introducing points (let bindings,
 /// branch hypotheses, assert hypotheses, assume hypotheses); popped
@@ -2021,7 +2036,24 @@ impl OblCtx {
     /// Returns `None` — caller falls back to goal-position `wrap` —
     /// when any `Let` frame lacks its typ (the N1 coverage meter:
     /// `LetRaw`, ensures-leaf let peels, and mut-ref shadows don't
-    /// carry one yet).
+    /// carry one yet), or when a hoisted binder would have to mention
+    /// a residue let (see below).
+    ///
+    /// Bool-typed lets are the WP's if-condition temps (`let tmp__1 :=
+    /// x < 50`) and comparison results kept for later antecedents
+    /// (`let tmp__10 := r.num = da * l.num` in mul_distributes_left).
+    /// Hoisting THEM as binders + propositional equations loops simp
+    /// (CORE's `eq_iff_iff` family — the nested_if maxRecDepth
+    /// regression, 2026-07-17). But bailing the WHOLE hoist on one
+    /// incidental Bool-let strands every other frame's requires-hyps
+    /// anonymous on the wrap path (mul_distributes_left starved
+    /// there, 2026-07-20). So: Bool-lets become GOAL-POSITION lets
+    /// around the otherwise-flat leaf (the "residue"), everything else
+    /// hoists — no Prop equations enter the telescope, and textual
+    /// order preserves shadowing semantics. If any hoisted binder's
+    /// type or let-equation would have to MENTION a residue name
+    /// (impossible for a theorem-level binder — the residue let is
+    /// inner), the whole hoist bails as before.
     fn hoist_all(
         &self,
         leaf: &LExpr,
@@ -2031,25 +2063,11 @@ impl OblCtx {
         for f in self.frames.iter() {
             match f {
                 CtxFrame::Let(_, _, None) => return None,
-                // Bool-typed lets are the WP's if-condition temps
-                // (`let tmp__1 := x < 50`). Hoisted, they become
-                // Prop-typed binders with PROPOSITIONAL equations
-                // (`tmp__1 = (x < 50)`) — omega cannot consume a
-                // Prop equation, `decide` cannot touch the free
-                // binder, and CORE's `eq_iff_iff` family loops simp
-                // on them (nested_if maxRecDepth regression,
-                // 2026-07-17). Keep those obligations on the
-                // goal-position wrap until N2 splits the conditions
-                // properly.
-                CtxFrame::Let(_, _, Some(t))
-                    if matches!(&**t, vir::ast::TypX::Bool) =>
-                {
-                    return None;
-                }
                 _ => {}
             }
         }
         let mut out: Vec<(LBinder, Option<HypProvenance>)> = Vec::new();
+        let mut residue: Vec<(LeanName, LExpr)> = Vec::new();
         let mut env: HashMap<String, LeanName> = HashMap::new();
         let mut bound: std::collections::HashSet<String> = taken_names.clone();
         let mut fresh = |base: &str, bound: &mut std::collections::HashSet<String>| -> LeanName {
@@ -2066,6 +2084,17 @@ impl OblCtx {
         let mut hyp_counter = 0usize;
         for frame in self.frames.iter() {
             match frame {
+                CtxFrame::Let(name, v, Some(t)) if matches!(&**t, vir::ast::TypX::Bool) => {
+                    // Bool-let → goal-position residue let (see the fn
+                    // doc). `bound` takes the source name so a LATER
+                    // frame reusing it freshens (shadowing discipline
+                    // matches the hoist's); the residue let itself
+                    // keeps its source name — goal-position lets shadow
+                    // textually, which matches source order.
+                    let v2 = rename_frame_vars(v, &env);
+                    bound.insert(name.as_str().to_string());
+                    residue.push((name.clone(), v2));
+                }
                 CtxFrame::Let(name, v, typ) => {
                     let typ = typ.as_ref().expect("checked above");
                     let v2 = rename_frame_vars(v, &env);
@@ -2132,7 +2161,25 @@ impl OblCtx {
                 }
             }
         }
-        Some((out, rename_frame_vars(leaf, &env)))
+        // Bail check: no hoisted binder's TYPE (including the hoisted
+        // let-equations, which are types) may mention a residue name —
+        // theorem binders can't refer to the inner goal-lets. Residue
+        // names never enter `env`, so references stay source-named and
+        // detectable here.
+        for (b, _) in out.iter() {
+            for (n, _) in residue.iter() {
+                if lexpr_mentions_var(&b.ty, n.as_str()) {
+                    return None;
+                }
+            }
+        }
+        // Fold the residue lets around the renamed leaf, frame order
+        // (the earliest residue let is outermost).
+        let mut flat = rename_frame_vars(leaf, &env);
+        for (n, v) in residue.into_iter().rev() {
+            flat = LExpr::let_bind(n, v, flat);
+        }
+        Some((out, flat))
     }
 
     /// Build an explicit-named `intro` list for any frames that did
