@@ -38,8 +38,15 @@ pub enum Move {
     IntroSubst(String),
     /// `subst h1 h2 …` — substitute the named N1 hoist-equations.
     SubstHoists(Vec<String>),
-    /// `simp only [f, g, …]` — unfold the named NON-recursive spec fns.
+    /// `simp only [f, g, …] at ⊢` — unfold the named NON-recursive
+    /// spec fns, goal-only (the default — no context blowup).
     UnfoldSet(Vec<String>),
+    /// `simp only [f, g, …] at ⊢ <targets>` — unfold in the goal and
+    /// the NAMED hyps whose text mentions an unfold name (the
+    /// den-equality class: the hyps carry the `denom` forms). Bare
+    /// `at *` over a large context whnf-times-out and burns the
+    /// theorem's whole heartbeat budget (divmod regression).
+    UnfoldSetTargeted(Vec<String>, Vec<String>),
     /// `rw [f]` — ONE measured unfold of a recursive spec fn (the loop
     /// law: recursive fns never ride simp sets).
     UnfoldOnce(String),
@@ -120,9 +127,17 @@ fn render_move(m: &Move) -> String {
         Move::SubstHoists(names) => format!("subst {}", names.join(" ")),
         Move::UnfoldSet(fns) => {
             if fns.is_empty() {
-                "simp only []".to_string()
+                "simp only [] at ⊢".to_string()
             } else {
-                format!("simp only [{}]", fns.join(", "))
+                format!("simp only [{}] at ⊢", fns.join(", "))
+            }
+        }
+        Move::UnfoldSetTargeted(fns, targets) => {
+            let base = format!("simp only [{}] at ⊢", fns.join(", "));
+            if targets.is_empty() {
+                base
+            } else {
+                format!("{} {}", base, targets.join(" "))
             }
         }
         Move::UnfoldOnce(f) => format!("rw [{}]", f),
@@ -367,12 +382,27 @@ pub fn author_v1(
     if let Some(moves) = author_form_c(goal, core, &spine_moves, &hyps, &ant_props, &let_substs, shape, dts) {
         return Some((moves, ScriptForm::C));
     }
+    // ── Defeq bridge (R1, the Rational story): a raw comparison goal
+    // (`a.num * denom b = b.num * denom a`) with a class-projection
+    // hyp over the same atoms (`eqv a b`). `exact h` closes it by
+    // defeq through the inlined instance — sound, and the derived
+    // chain catches any miss.
+    if let Some(h) = find_defeq_bridge(core, &hyps, dts) {
+        let mut moves = spine_moves;
+        moves.push(Move::ExactHyp(h));
+        debug_assert!(script_names_resolve(&moves, shape, dts));
+        return Some((moves, ScriptForm::C));
+    }
     // ── Form A: branch + woven fact (N1-hoisted flat path). ──
     let unfolds = goal_unfold_names(goal, dts, &shape_binders(shape));
     if unfolds.is_empty() {
         return None;
     }
-    let has_call_fact = hyps.iter().any(|h| matches!(h.prov, HypProvenance::CallFact(_)));
+    let has_call_fact = hyps.iter().any(|h| matches!(h.prov, HypProvenance::CallFact(_)))
+        || shape
+            .spine
+            .iter()
+            .any(|n| matches!(n, GoalSpine::Imp(_, HypProvenance::CallFact(_))));
     // ExactHyp justification: a shape hyp whose proposition, after the
     // hoist substs, textually equals the goal core.
     let exact = find_exact_hyp(&hyps, core);
@@ -384,16 +414,23 @@ pub fn author_v1(
     if !hoists.is_empty() {
         moves.push(Move::SubstHoists(hoists));
     }
-    moves.push(Move::UnfoldSet(unfolds));
-    // Legs: omega (arithmetic contradictions), the form-E leg
-    // (simp_all; omega — broadcast haves rewrite guard facts), then
-    // the matching hyp when the author computed one.
+    // Targeted unfold: the goal, plus exactly the hyps whose text
+    // mentions an unfold name (the den-equality class's `denom`
+    // facts). Bare `at *` would whnf-time-out on divmod-sized
+    // contexts and burn the theorem's heartbeat budget before the
+    // fallback ever runs.
+    let mentioning = hyps_mentioning_any_unfold(&hyps, &ant_props, &unfolds);
+    moves.push(Move::UnfoldSetTargeted(unfolds, mentioning));
+    // Close: the leaf ladder first (omega-direct goals like
+    // denominator positivity), then the split legs for ite-shaped
+    // residuals — `split` alone as the close fails on goals with
+    // nothing to split (2026-07-19, denom-positivity conjuncts).
     let mut legs = vec![Move::LeafClose, Move::LeafSimpAllOmega];
     if let Some(h) = exact {
         legs.push(Move::ExactHyp(h));
     }
     legs.push(Move::Done);
-    moves.push(Move::SplitIf(legs));
+    moves.push(Move::FirstOf(vec![Move::LeafClose, Move::SplitIf(legs)]));
     debug_assert!(script_names_resolve(&moves, shape, dts));
     Some((moves, ScriptForm::A))
 }
@@ -509,6 +546,59 @@ fn author_form_c(
     Some(moves)
 }
 
+/// Does the expression mention any of the unfold names as an
+/// application head or a bare reference?
+fn mentions_any_unfold(goal: &Expr, unfolds: &[String]) -> bool {
+    fn go(e: &Expr, unfolds: &[String], found: &mut bool) {
+        if *found {
+            return;
+        }
+        match &e.node {
+            ExprNode::App { head, args } => {
+                if let ExprNode::Var(n) = &head.node {
+                    if unfolds.iter().any(|u| u == n.as_str()) {
+                        *found = true;
+                        return;
+                    }
+                }
+                for a in args {
+                    go(a, unfolds, found);
+                }
+            }
+            ExprNode::Var(n) => {
+                if unfolds.iter().any(|u| u == n.as_str()) {
+                    *found = true;
+                }
+            }
+            _ => e.for_each_child(|c| go(c, unfolds, found)),
+        }
+    }
+    let mut found = false;
+    go(goal, unfolds, &mut found);
+    found
+}
+
+/// The hyps (shape hyps + script-named antecedents) whose proposition
+/// mentions an unfold name — the `simp … at ⊢ <targets>` list.
+fn hyps_mentioning_any_unfold(
+    hyps: &[ShapeHyp],
+    ant_props: &[(String, Expr)],
+    unfolds: &[String],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (n, p) in ant_props {
+        if mentions_any_unfold(p, unfolds) {
+            out.push(n.clone());
+        }
+    }
+    for h in hyps {
+        if mentions_any_unfold(&h.prop, unfolds) {
+            out.push(h.name.clone());
+        }
+    }
+    out
+}
+
 /// The goal shape's binders as a `Binder` slice (for the unfold scan).
 fn shape_binders(shape: &GoalShape) -> Vec<Binder> {
     shape
@@ -574,6 +664,7 @@ fn script_names_resolve(moves: &[Move], shape: &GoalShape, dts: &DtDefInventory)
             Move::ExactHyp(h) => vec![h.as_str()],
             Move::RefineExact(hs) => hs.iter().map(|s| s.as_str()).collect(),
             Move::UnfoldSet(fs) => fs.iter().map(|s| s.as_str()).collect(),
+            Move::UnfoldSetTargeted(fs, _) => fs.iter().map(|s| s.as_str()).collect(),
             Move::StructuralTail(fs, _) => fs.iter().map(|s| s.as_str()).collect(),
             Move::UnfoldOnce(f) => vec![f.as_str()],
             Move::Intros(_) | Move::IntroSubst(_) | Move::Defeq | Move::Done | Move::LeafClose | Move::LeafSimpAllOmega => {
@@ -604,3 +695,61 @@ fn script_names_resolve(moves: &[Move], shape: &GoalShape, dts: &DtDefInventory)
 #[cfg(test)]
 #[path = "tests/script.rs"]
 mod tests;
+
+/// R1 defeq bridge: the goal core is a raw comparison (Eq/Le/Lt/Ne)
+/// and some shape hyp is a two-arg class-projection application
+/// (`eqv a b`, `le a b`, `lt a b`) whose both argument atoms occur in
+/// the goal. For concrete instances with inlined bodies (Rational's
+/// cross-multiplied eqv/le/lt), `exact h` closes by defeq through the
+/// instance projection; for abstract instances the goal could never
+/// be a raw comparison, so the check can't misfire. A miss is caught
+/// by the derived chain.
+fn find_defeq_bridge(core: &Expr, hyps: &[ShapeHyp], dts: &DtDefInventory) -> Option<String> {
+    use crate::lean_ast::BinOp;
+    if !matches!(&core.node, ExprNode::BinOp {
+        op: BinOp::Eq | BinOp::Le | BinOp::Lt | BinOp::Ge | BinOp::Gt | BinOp::Ne, ..
+    }) {
+        return None;
+    }
+    let goal_vars = collect_var_names(core);
+    for h in hyps {
+        let prop = peel_annots(&h.prop);
+        if let ExprNode::App { head, args } = &prop.node {
+            if let ExprNode::Var(n) = &head.node {
+                if dts.trait_methods.contains(n.as_str()) && args.len() == 2 {
+                    let a = peel_annots(&args[0]);
+                    let b = peel_annots(&args[1]);
+                    if let (ExprNode::Var(x), ExprNode::Var(y)) = (&a.node, &b.node) {
+                        if goal_vars.contains(x.as_str()) && goal_vars.contains(y.as_str()) {
+                            return Some(h.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn peel_annots(mut e: &Expr) -> &Expr {
+    loop {
+        match &e.node {
+            ExprNode::SpanMark { inner, .. } => e = inner,
+            ExprNode::TypeAnnot { expr, .. } => e = expr,
+            _ => return e,
+        }
+    }
+}
+
+fn collect_var_names(e: &Expr) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    match &e.node {
+        ExprNode::Var(n) => {
+            out.insert(n.as_str().to_string());
+        }
+        _ => e.for_each_child(|c| {
+            out.extend(collect_var_names(c));
+        }),
+    }
+    out
+}

@@ -90,7 +90,7 @@ fn form_a_script_with_call_fact_and_hoists() {
     assert_eq!(form, ScriptForm::A);
     let text = render_script(&moves);
     assert!(text.contains("subst _h_tmp__1_hoist1"), "{text}");
-    assert!(text.contains("simp only [lib.poly.coeff]"), "{text}");
+    assert!(text.contains("simp only [lib.poly.coeff] at ⊢"), "{text}");
     assert!(text.contains("split <;> (first |"), "{text}");
     assert_eq!(form.census().as_str(), "script:formA");
 }
