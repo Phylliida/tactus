@@ -479,12 +479,79 @@ pub(crate) fn derived_closer(
             })
             .collect()
     };
+    // Denom-injectivity arm (probes t45/t46, 2026-07-20): the goal
+    // core is an equality on field projections (`l.den = r.den`), and
+    // at least one binder's type mentions `lib.Rational.denom`. Since
+    // `denom x = ↑(x.den + 1)`, a denominator equation in context
+    // decides the `.den` equation — after the unfold, omega finishes
+    // the cast. Targeted `at ⊢ <names>` (never bare `at *` — the
+    // divmod lesson). Runs after the rung: its gate is narrow enough
+    // that it only ever sees goals the rung couldn't take, and the
+    // hoisted associativity asserts drown the rung's full-context
+    // simp_all but fall to this in one step.
+    let denom_inj_arm: String = {
+        let is_proj_eq = {
+            let mut cur = goal;
+            loop {
+                match &cur.node {
+                    ExprNode::SpanMark { inner, .. } => cur = inner,
+                    ExprNode::Forall { body, .. } => cur = body,
+                    ExprNode::Let { name, value, body } => {
+                        // Trailing equation wrapper (`let tmp := v;
+                        // tmp`): look through to the VALUE — the Eq
+                        // core hides behind it (the residue-let shape,
+                        // N1's wrapper rule; 233's `let tmp__3 :=
+                        // l.den = r.den; tmp__3` gated the arm off
+                        // entirely).
+                        let mut b = body.as_ref();
+                        while let ExprNode::SpanMark { inner, .. } = &b.node {
+                            b = inner;
+                        }
+                        if matches!(&b.node, ExprNode::Var(n) if n.as_str() == name.as_str()) {
+                            cur = value;
+                        } else {
+                            cur = body;
+                        }
+                    }
+                    ExprNode::BinOp { op: BinOp::Implies, rhs, .. } => cur = rhs,
+                    ExprNode::BinOp { op: BinOp::Eq, lhs, .. } => {
+                        let mut l = lhs.as_ref();
+                        while let ExprNode::SpanMark { inner, .. } = &l.node {
+                            l = inner;
+                        }
+                        break matches!(l.node, ExprNode::FieldProj { .. });
+                    }
+                    _ => break false,
+                }
+            }
+        };
+        let names: Vec<String> = binders
+            .iter()
+            .filter_map(|b| {
+                let n = b.name.as_ref()?;
+                if contains_app_head(&b.ty, "lib.Rational.denom") {
+                    Some(n.as_str().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if is_proj_eq && !names.is_empty() {
+            format!(
+                " | (intros; simp only [lib.Rational.denom, lib.Rational.denom_nat] at ⊢ {}; first | omega | done)",
+                names.join(" ")
+            )
+        } else {
+            String::new()
+        }
+    };
     format!(
-        "first | {} | decide | omega | ({}) | ({}) | ({}){}{}{}{}",
+        "first | {} | decide | omega | ({}) | ({}) | ({}){}{}{}{}{}",
         rfl_form,
         render_peel(goal, &kernel),
         core_simp(),
         rung,
+        denom_inj_arm,
         unfold_once_arm,
         form_e_arm,
         form_g_arm,
@@ -1529,8 +1596,8 @@ pub(crate) fn nonlin_ladder(goal: &Expr, binders: &[Binder]) -> String {
     // Cancel branch for equality goals with a positivity hyp.
     if let Some((d, lhs, rhs)) = cancel_target(goal, binders) {
         branches.push(format!(
-            "({}have _e : ({d} : Int) ≠ 0 := by omega; \
-             have _z : {d} * (({lhs}) - ({rhs})) = 0 := by nlinarith {pool}; \
+            "({}have _e : ({d} : Int) ≠ 0 := (by omega); \
+             have _z : {d} * (({lhs}) - ({rhs})) = 0 := (by nlinarith {pool}); \
              have _r := (mul_eq_zero.mp _z).resolve_left _e; \
              nlinarith [_r])",
             pre_text,
@@ -1540,73 +1607,283 @@ pub(crate) fn nonlin_ladder(goal: &Expr, binders: &[Binder]) -> String {
             pool = pool_text
         ));
     }
-    // Rewrite-ladder (the cross-multiply family, probe t12 2026-07-20):
-    // `assert(… by (nonlinear_arith) requires …)` goals whose requires
-    // split into DEFINITION hyps (an atom — field projection or spec
-    // application — equal to a polynomial, e.g. `ac.num = a.num * dc +
-    // c.num * da`) and a KERNEL hyp (`a.num * db = b.num * da`). The
-    // certificate needs the kernel multiplied by a DENOM MONOMIAL
-    // (`dc * dc`), which nlinarith's hyp×hyp products can never build
-    // (no hyp is a bare atom). Folding the definition hyps INTO the
-    // goal with `rw` first turns the goal into a pure polynomial
-    // identity in the base atoms; then one congrArg-multiplied kernel
-    // closes it linearly. Needs NAMED hyps — the NONLIN-scope hoist
-    // (emit_split) provides them; anonymous requires leave both pools
-    // empty and no branch is emitted.
-    let eq_hyps: Vec<&ArithHyp> = hyps.iter().filter(|h| h.is_eq).collect();
-    let mut rewrites: Vec<String> = Vec::new();
-    let mut kernels: Vec<&ArithHyp> = Vec::new();
-    for h in &eq_hyps {
-        let lhs_pp = crate::lean_pp::pp_expr(&h.lhs);
-        let rhs_pp = crate::lean_pp::pp_expr(&h.rhs);
-        let is_atom_lhs = match &h.lhs.node {
-            ExprNode::FieldProj { .. } => true,
-            ExprNode::App { head, .. } => matches!(&head.node, ExprNode::Var(_)),
-            _ => false,
-        };
-        if is_atom_lhs && !rhs_pp.contains(&*lhs_pp) && goal_mentions_pp(goal, &lhs_pp) {
-            rewrites.push(h.name.clone());
-        } else if matches!(&h.lhs.node, ExprNode::BinOp { .. }) {
-            kernels.push(h);
+    // Certificate computation (the cross-multiply family; probes
+    // t12/t21–t24, 2026-07-20). NO search: every branch is a computed
+    // certificate or is not emitted at all (the transparency /
+    // predictability law — statable rules, loud failure otherwise;
+    // the monomial MENU this replaces was luck-bounded search).
+    //
+    // The comparison hyps partition into:
+    //   DEFINITION hyps — an atom (projection or spec application)
+    //     equal to anything, occurring in the goal → `rw` material.
+    //   KERNEL hyps — equations/inequalities between products →
+    //     certificate seeds.
+    //   positivity (`D > 0`) / nonneg (`x ≥ 0`) hyps → sign proofs
+    //     for inequality multipliers.
+    //
+    // R1 (base): with ≥1 definition hyp, `rw` them into the goal and
+    // try `nlinarith []` — a hyp-free ring identity needs no kernel
+    // (mul_distributes_left).
+    //
+    // R2 (eq quotient): for an eq kernel K, the certificate is the
+    // UNIQUE monomial M making K's left side divide the (rewritten)
+    // goal's left side, requiring the same M on the right
+    // (`quotient_monomial` — multiset difference, not enumeration);
+    // `congrArg (· * M) K`, then nlinarith.
+    //
+    // R3 (le quotient): the same M for a ≤ kernel against a ≤ goal,
+    // via `mul_le_mul_of_nonneg_right` with the nonneg proof read off
+    // M's shape (`nonneg_proof`: a square, or atoms carrying hyps).
+    //
+    // R4 (two-sided congruence): a ≤ goal, ≥1 eq kernel and ≥1 ≤
+    // kernel, all over positivity-covered atoms. Each fact is
+    // multiplied by the denominators it does NOT mention; the
+    // inequality's own denominators are the cancel factor K
+    // (`mul_le_mul_iff_left₀`). le_congruence is the shape.
+    let mut rewrites: Vec<&ArithHyp> = Vec::new();
+    let mut eq_kernels: Vec<&ArithHyp> = Vec::new();
+    let mut le_kernels: Vec<(String, Expr, Expr)> = Vec::new(); // normalized ≤
+    let mut pos_atoms: Vec<(String, String)> = Vec::new(); // (atom pp, hyp name)
+    let mut ge0_atoms: Vec<(String, String)> = Vec::new();
+    for h in &hyps {
+        match h.op {
+            crate::lean_ast::BinOp::Eq => {
+                let lhs_pp = crate::lean_pp::pp_expr(&h.lhs);
+                let rhs_pp = crate::lean_pp::pp_expr(&h.rhs);
+                let is_atom_lhs = match &h.lhs.node {
+                    ExprNode::FieldProj { .. } => true,
+                    ExprNode::App { head, .. } => matches!(&head.node, ExprNode::Var(_)),
+                    _ => false,
+                };
+                if is_atom_lhs && !rhs_pp.contains(&*lhs_pp) && goal_mentions_pp(goal, &lhs_pp) {
+                    rewrites.push(h);
+                } else if matches!(&h.lhs.node, ExprNode::BinOp { .. }) {
+                    eq_kernels.push(h);
+                }
+            }
+            crate::lean_ast::BinOp::Le => {
+                le_kernels.push((h.name.clone(), h.lhs.clone(), h.rhs.clone()))
+            }
+            crate::lean_ast::BinOp::Ge => {
+                if is_zero_lit(&h.rhs) {
+                    ge0_atoms.push((crate::lean_pp::pp_expr(&h.lhs), h.name.clone()));
+                } else {
+                    le_kernels.push((h.name.clone(), h.rhs.clone(), h.lhs.clone()));
+                }
+            }
+            crate::lean_ast::BinOp::Gt if is_zero_lit(&h.rhs) => {
+                pos_atoms.push((crate::lean_pp::pp_expr(&h.lhs), h.name.clone()))
+            }
+            crate::lean_ast::BinOp::Lt if is_zero_lit(&h.lhs) => {
+                pos_atoms.push((crate::lean_pp::pp_expr(&h.rhs), h.name.clone()))
+            }
+            _ => {}
         }
     }
-    if !rewrites.is_empty() && !kernels.is_empty() {
-        // Monomial menu: ALL squares first (the add-congruence `dc *
-        // dc` shape — interleaving pairs before the squares pushed it
-        // past the branch cap), then pairs — one branch per (kernel,
-        // monomial), hard cap 8: each failing branch is one nlinarith
-        // over the context, and the menu only ever runs where every
-        // cheaper arm failed.
-        let mut monos: Vec<String> = Vec::new();
-        for d1 in &multipliers {
-            monos.push(format!("{d1} * {d1}"));
-        }
-        for (i, d1) in multipliers.iter().enumerate() {
-            for d2 in multipliers.iter().skip(i + 1) {
-                monos.push(format!("{d1} * {d2}"));
+    let rw_list = rewrites.iter().map(|h| h.name.clone()).collect::<Vec<_>>().join(", ");
+    let rw_prefix = if rw_list.is_empty() {
+        String::new()
+    } else {
+        format!("rw [{}]; ", rw_list)
+    };
+    // R1 (base): rewrite-and-ring.
+    if !rewrites.is_empty() {
+        branches.push(format!("(rw [{}]; nlinarith [])", rw_list));
+    }
+    // The goal's comparison core, normalized to ≤ for inequality work.
+    let core = comparison_core(goal);
+    // Substituted (definition-folded) goal sides for quotient
+    // computation — mirrors the tactic's `rw`, so certificates are
+    // computed against the goal the closer actually sees.
+    let subst_pairs: Vec<(String, &Expr)> = rewrites
+        .iter()
+        .map(|h| (crate::lean_pp::pp_expr(&h.lhs), &h.rhs))
+        .collect();
+    if let Some((gop, glhs, grhs)) = core {
+        let (ngl, ngr): (&Expr, &Expr) = match gop {
+            crate::lean_ast::BinOp::Ge => (grhs, glhs),
+            _ => (glhs, grhs),
+        };
+        let (sl, sr) = if subst_pairs.is_empty() {
+            (ngl.clone(), ngr.clone())
+        } else {
+            (subst_atoms(ngl, &subst_pairs), subst_atoms(ngr, &subst_pairs))
+        };
+        let gl = monomials(&sl);
+        let gr = monomials(&sr);
+        // R2 (eq quotient).
+        if matches!(gop, crate::lean_ast::BinOp::Eq) {
+            for k in &eq_kernels {
+                let kl = monomials(&k.lhs);
+                let kr = monomials(&k.rhs);
+                if let Some(m) = quotient_monomial(&gl, &gr, &kl, &kr) {
+                    let m_pp = m.join(" * ");
+                    branches.push(format!(
+                        "({}have _k : ({}) * ({}) = ({}) * ({}) := \
+                           congrArg (fun t : Int => t * ({})) {}; \
+                         nlinarith [_k])",
+                        rw_prefix,
+                        crate::lean_pp::pp_expr(&k.lhs),
+                        m_pp,
+                        crate::lean_pp::pp_expr(&k.rhs),
+                        m_pp,
+                        m_pp,
+                        k.name,
+                    ));
+                }
             }
         }
-        let rw_list = rewrites.join(", ");
-        let mut made = 0usize;
-        'menu: for k in kernels {
-            let kl = crate::lean_pp::pp_expr(&k.lhs);
-            let kr = crate::lean_pp::pp_expr(&k.rhs);
-            for m in &monos {
-                if made >= 8 {
-                    break 'menu;
+        // R3 (le quotient).
+        if matches!(gop, crate::lean_ast::BinOp::Le | crate::lean_ast::BinOp::Ge) {
+            for (kn, klhs, krhs) in &le_kernels {
+                let kl = monomials(klhs);
+                let kr = monomials(krhs);
+                if let Some(m) = quotient_monomial(&gl, &gr, &kl, &kr) {
+                    if let Some(proof) = nonneg_proof(&m, &pos_atoms, &ge0_atoms) {
+                        let m_pp = m.join(" * ");
+                        branches.push(format!(
+                            "({}have _p : ({}) * ({}) ≤ ({}) * ({}) := \
+                               mul_le_mul_of_nonneg_right {} {}; \
+                             nlinarith [_p])",
+                            rw_prefix,
+                            crate::lean_pp::pp_expr(klhs),
+                            m_pp,
+                            crate::lean_pp::pp_expr(krhs),
+                            m_pp,
+                            kn,
+                            proof,
+                        ));
+                    }
                 }
-                branches.push(format!(
-                    "(rw [{}]; \
-                     have _k : ({kl}) * ({m}) = ({kr}) * ({m}) := \
-                       congrArg (fun t : Int => t * ({m})) {kn}; \
-                     nlinarith [_k])",
-                    rw_list,
-                    kl = kl,
-                    kr = kr,
-                    m = m,
-                    kn = k.name,
-                ));
-                made += 1;
+            }
+        }
+        // R4 (two-sided congruence): disjoint-atom chains.
+        if matches!(gop, crate::lean_ast::BinOp::Le | crate::lean_ast::BinOp::Ge)
+            && !le_kernels.is_empty()
+            && !eq_kernels.is_empty()
+            && !pos_atoms.is_empty()
+        {
+            let atom_set = |e1: &Expr, e2: &Expr| -> std::collections::BTreeSet<String> {
+                monomials(e1).into_iter().chain(monomials(e2)).flatten().collect()
+            };
+            let denom_set = |e1: &Expr, e2: &Expr| -> std::collections::BTreeSet<String> {
+                atom_set(e1, e2)
+                    .into_iter()
+                    .filter(|a| a.starts_with("lib.Rational.denom "))
+                    .collect()
+            };
+            let pos_set: std::collections::BTreeSet<String> =
+                pos_atoms.iter().map(|(a, _)| a.clone()).collect();
+            // Coverage asks about DENOMINATOR atoms only: the nums are
+            // exchanged between the eq kernels (they never cancel), so
+            // they need no positivity hyps. The complement computation
+            // subtracts from pos_set, so it already yields denoms only.
+            let covered = eq_kernels.iter().all(|k| denom_set(&k.lhs, &k.rhs).is_subset(&pos_set))
+                && le_kernels.iter().all(|(_, l, r)| denom_set(l, r).is_subset(&pos_set));
+            if covered {
+                let mut certs: Vec<String> = Vec::new();
+                let mut cert_names: Vec<String> = Vec::new();
+                let mut idx = 0usize;
+                let mut ok = true;
+                for k in &eq_kernels {
+                    let comp: Vec<String> =
+                        pos_set.difference(&atom_set(&k.lhs, &k.rhs)).cloned().collect();
+                    if comp.is_empty() {
+                        continue; // the bare kernel is already in context
+                    }
+                    let m_pp = comp.join(" * ");
+                    certs.push(format!(
+                        "have _c{} : ({}) * ({}) = ({}) * ({}) := \
+                           congrArg (fun t : Int => t * ({})) {}",
+                        idx,
+                        crate::lean_pp::pp_expr(&k.lhs),
+                        m_pp,
+                        crate::lean_pp::pp_expr(&k.rhs),
+                        m_pp,
+                        m_pp,
+                        k.name,
+                    ));
+                    cert_names.push(format!("_c{}", idx));
+                    idx += 1;
+                }
+                for (kn, klhs, krhs) in &le_kernels {
+                    let comp: Vec<String> =
+                        pos_set.difference(&atom_set(klhs, krhs)).cloned().collect();
+                    if comp.is_empty() {
+                        continue;
+                    }
+                    match nonneg_proof(&comp, &pos_atoms, &ge0_atoms) {
+                        Some(proof) => {
+                            let m_pp = comp.join(" * ");
+                            certs.push(format!(
+                                "have _c{} : ({}) * ({}) ≤ ({}) * ({}) := \
+                                   mul_le_mul_of_nonneg_right {} {}",
+                                idx,
+                                crate::lean_pp::pp_expr(klhs),
+                                m_pp,
+                                crate::lean_pp::pp_expr(krhs),
+                                m_pp,
+                                kn,
+                                proof,
+                            ));
+                            cert_names.push(format!("_c{}", idx));
+                            idx += 1;
+                        }
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    // K: the le kernel's own DENOMINATOR atoms (the
+                    // nums are what the eq kernels exchange). One
+                    // branch per le kernel as the K choice.
+                    for (_, klhs, krhs) in &le_kernels {
+                        let k_atoms: Vec<String> = atom_set(klhs, krhs)
+                            .into_iter()
+                            .filter(|a| a.starts_with("lib.Rational.denom "))
+                            .collect();
+                        if k_atoms.is_empty() {
+                            continue;
+                        }
+                        let mut kp: Option<String> = None;
+                        let mut k_ok = true;
+                        for a in &k_atoms {
+                            match pos_atoms.iter().find(|(pa, _)| pa == a) {
+                                Some((_, h)) => {
+                                    kp = Some(match kp {
+                                        None => h.clone(),
+                                        Some(p) => format!("(mul_pos {} {})", p, h),
+                                    });
+                                }
+                                None => {
+                                    k_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !k_ok {
+                            continue;
+                        }
+                        let k_pp = k_atoms.join(" * ");
+                        branches.push(format!(
+                            "({}; \
+                             have _chain : ({}) * ({}) ≤ ({}) * ({}) := \
+                               (by nlinarith [{}]); \
+                             have _K : (0 : Int) < {} := {}; \
+                             exact (mul_le_mul_iff_left₀ _K).mp _chain)",
+                            certs.join("; "),
+                            crate::lean_pp::pp_expr(&sl),
+                            k_pp,
+                            crate::lean_pp::pp_expr(&sr),
+                            k_pp,
+                            cert_names.join(", "),
+                            k_pp,
+                            kp.unwrap(),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -1630,6 +1907,7 @@ pub(crate) fn nonlin_ladder(goal: &Expr, binders: &[Binder]) -> String {
 struct ArithHyp {
     name: String,
     is_eq: bool,
+    op: crate::lean_ast::BinOp,
     lhs: Expr,
     rhs: Expr,
 }
@@ -1659,6 +1937,7 @@ fn arith_hyps(binders: &[Binder]) -> Vec<ArithHyp> {
                 out.push(ArithHyp {
                     name: name.as_str().to_string(),
                     is_eq,
+                    op: *op,
                     lhs: lhs.as_ref().clone(),
                     rhs: rhs.as_ref().clone(),
                 });
@@ -1682,6 +1961,168 @@ fn goal_mentions_pp(goal: &Expr, needle_pp: &str) -> bool {
     let mut found = false;
     goal.for_each_child(|c| found = found || goal_mentions_pp(c, needle_pp));
     found
+}
+
+/// The goal's comparison core (`Eq` / `Le` / `Ge`), peeling the
+/// ∀/let/implication spine and annotations — the same peel
+/// `goal_core_is_equation` uses, returning the sides.
+fn comparison_core(goal: &Expr) -> Option<(crate::lean_ast::BinOp, &Expr, &Expr)> {
+    let mut cur = goal;
+    loop {
+        match &cur.node {
+            ExprNode::SpanMark { inner, .. } => cur = inner,
+            ExprNode::TypeAnnot { expr, .. } => cur = expr,
+            ExprNode::Forall { body, .. } => cur = body,
+            ExprNode::Let { body, .. } => cur = body,
+            ExprNode::BinOp { op: BinOp::Implies, rhs, .. } => cur = rhs,
+            ExprNode::BinOp { op: op @ (BinOp::Eq | BinOp::Le | BinOp::Ge), lhs, rhs } => {
+                return Some((*op, lhs, rhs));
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Is `e` the literal `0` (through SpanMarks)? The `D > 0` / `x ≥ 0`
+/// positivity-hyp shape.
+fn is_zero_lit(e: &Expr) -> bool {
+    match &e.node {
+        ExprNode::Lit(n) => n == "0",
+        ExprNode::SpanMark { inner, .. } => is_zero_lit(inner),
+        _ => false,
+    }
+}
+
+/// Replace every subterm of `e` that pp-matches a rewrite lhs with the
+/// corresponding rhs (the emitter-side mirror of the tactic's `rw`,
+/// used to compute certificates against the goal the closer actually
+/// sees). Literal whole-node replacement: a match drops the node's
+/// own SpanMarks, which is harmless for certificate computation.
+fn subst_atoms(e: &Expr, rewrites: &[(String, &Expr)]) -> Expr {
+    let pp = crate::lean_pp::pp_expr(e);
+    for (lhs_pp, rhs) in rewrites {
+        if pp == *lhs_pp {
+            return (*rhs).clone();
+        }
+    }
+    Expr::new(crate::lean_ast::map_children(&e.node, |c| subst_atoms(c, rewrites)))
+}
+
+/// Distribute an Int arithmetic expression into its monomials: a list
+/// of sorted atom multisets (pp strings). Signs are flattened away
+/// (Sub unions like Add; the certificate's ring check verifies the
+/// signed whole), literal factors contribute the unit monomial, and
+/// anything non-arithmetic is one opaque atom.
+fn monomials(e: &Expr) -> Vec<Vec<String>> {
+    match &e.node {
+        ExprNode::SpanMark { inner, .. } => monomials(inner),
+        ExprNode::TypeAnnot { expr, .. } => monomials(expr),
+        ExprNode::BinOp { op: BinOp::Add | BinOp::Sub, lhs, rhs } => {
+            let mut out = monomials(lhs);
+            out.extend(monomials(rhs));
+            out
+        }
+        ExprNode::BinOp { op: BinOp::Mul, lhs, rhs } => {
+            let l = monomials(lhs);
+            let r = monomials(rhs);
+            let mut out = Vec::new();
+            for m1 in &l {
+                for m2 in &r {
+                    let mut m = m1.clone();
+                    m.extend(m2.iter().cloned());
+                    m.sort();
+                    out.push(m);
+                }
+            }
+            out
+        }
+        ExprNode::UnOp { arg, .. } => monomials(arg),
+        ExprNode::Lit(_) => vec![Vec::new()],
+        _ => vec![vec![crate::lean_pp::pp_expr(e)]],
+    }
+}
+
+/// Multiset difference: `big − small` when `small ⊆ big` (both sorted
+/// or not — position-wise removal), else `None`.
+fn multiset_diff(big: &[String], small: &[String]) -> Option<Vec<String>> {
+    let mut rest = big.to_vec();
+    for s in small {
+        let pos = rest.iter().position(|x| x == s)?;
+        rest.remove(pos);
+    }
+    rest.sort();
+    Some(rest)
+}
+
+/// The certificate monomial for a kernel against goal monomials:
+/// the unique M such that a kernel-lhs monomial divides some goal-lhs
+/// monomial with quotient M AND a kernel-rhs monomial divides some
+/// goal-rhs monomial with the SAME quotient M. `None` when no such M
+/// exists (or M is trivial — the bare kernel is already in context).
+/// This is a quotient, not an enumeration: dc² falls out of
+/// `{a.num, dc, db, dc} − {a.num, db}`.
+fn quotient_monomial(
+    gl: &[Vec<String>],
+    gr: &[Vec<String>],
+    kl: &[Vec<String>],
+    kr: &[Vec<String>],
+) -> Option<Vec<String>> {
+    for gm in gl {
+        for km in kl {
+            if let Some(q) = multiset_diff(gm, km) {
+                if q.is_empty() {
+                    continue;
+                }
+                for gm2 in gr {
+                    for km2 in kr {
+                        if multiset_diff(gm2, km2).as_ref() == Some(&q) {
+                            return Some(q);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The nonneg proof for a multiplier monomial, read off its shape:
+/// a single atom needs a positivity (`D > 0`) or nonneg (`x ≥ 0`)
+/// hyp; a square is `mul_self_nonneg`; a pair multiplies per-atom
+/// proofs; an atom times a square nests. Anything else: no proof, no
+/// branch (loud).
+fn nonneg_proof(
+    m: &[String],
+    pos: &[(String, String)],
+    ge0: &[(String, String)],
+) -> Option<String> {
+    let atom_proof = |a: &str| -> Option<String> {
+        if let Some((_, h)) = pos.iter().find(|(pa, _)| pa == a) {
+            Some(format!("(le_of_lt {})", h))
+        } else if let Some((_, h)) = ge0.iter().find(|(ga, _)| ga == a) {
+            Some(h.clone())
+        } else {
+            None
+        }
+    };
+    match m.len() {
+        1 => atom_proof(&m[0]),
+        2 if m[0] == m[1] => Some(format!("(mul_self_nonneg ({}))", m[0])),
+        2 => {
+            let p1 = atom_proof(&m[0])?;
+            let p2 = atom_proof(&m[1])?;
+            Some(format!("(mul_nonneg {} {})", p1, p2))
+        }
+        3 if m[0] == m[1] => {
+            let p = atom_proof(&m[2])?;
+            Some(format!("(mul_nonneg (mul_self_nonneg ({})) {})", m[0], p))
+        }
+        3 if m[1] == m[2] => {
+            let p = atom_proof(&m[0])?;
+            Some(format!("(mul_nonneg {} (mul_self_nonneg ({})))", p, m[1]))
+        }
+        _ => None,
+    }
 }
 
 /// Structural Int-side check for congrArg eligibility (see the caller):
