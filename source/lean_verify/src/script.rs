@@ -60,6 +60,9 @@ pub enum Move {
     /// (post-normalization — the author compared the texts at
     /// emission; cheap because the emitter HOLDS both).
     ExactHyp(String),
+    /// `refine ⟨exact h1, exact h2⟩` — a 2-conjunct goal where each
+    /// side matched a hyp (form C).
+    RefineExact(Vec<String>),
     /// `rfl` — the sides differ only by let-defeq / ctor-eta after the
     /// unfold.
     Defeq,
@@ -94,6 +97,9 @@ pub enum ScriptForm {
     /// Form B — definitional step of a recursive spec fn (probe
     /// pmul_conv.lean).
     B,
+    /// Form C — equivalence chaining (§11.2): the goal's spine is the
+    /// user's proof trace; the final fact IS a hyp post-substitution.
+    C,
 }
 
 impl ScriptForm {
@@ -101,6 +107,7 @@ impl ScriptForm {
         match self {
             ScriptForm::A => CloserCensus::ScriptFormA,
             ScriptForm::B => CloserCensus::ScriptFormB,
+            ScriptForm::C => CloserCensus::ScriptFormC,
         }
     }
 }
@@ -144,6 +151,10 @@ fn render_move(m: &Move) -> String {
             format!("split <;> (first | {})", alts)
         }
         Move::ExactHyp(h) => format!("exact {}", h),
+        Move::RefineExact(hs) => {
+            let parts: Vec<String> = hs.iter().map(|h| format!("exact {}", h)).collect();
+            format!("refine ⟨{}⟩", parts.join(", "))
+        }
         Move::Defeq => "rfl".to_string(),
         Move::Done => "done".to_string(),
         Move::LeafClose => "first | assumption | omega | with_reducible rfl".to_string(),
@@ -282,8 +293,13 @@ pub fn author_v1(
     // script-chosen hyp name (cited in GuardSimp); Let → intro+subst,
     // EXCEPT N1's trailing equation wrapper (`let tmp := v; tmp`),
     // which must stay a goal-position let for `rw` to search through.
+    // Antecedent propositions and let-bindings are recorded too: the
+    // form C normalized-match check applies the let-substs to both the
+    // candidate facts and the goal (the emitter HOLDS all the texts).
     let mut spine_moves: Vec<Move> = Vec::new();
     let mut ant_names: Vec<String> = Vec::new();
+    let mut ant_props: Vec<(String, Expr)> = Vec::new();
+    let mut let_substs: Vec<(String, Expr)> = Vec::new();
     let mut cur = goal;
     loop {
         match &cur.node {
@@ -300,9 +316,10 @@ pub fn author_v1(
                 spine_moves.push(Move::Intros(names));
                 cur = body;
             }
-            ExprNode::BinOp { op: crate::lean_ast::BinOp::Implies, rhs, .. } => {
+            ExprNode::BinOp { op: crate::lean_ast::BinOp::Implies, lhs, rhs } => {
                 let n = format!("h_scr_{}", ant_names.len());
                 ant_names.push(n.clone());
+                ant_props.push((n.clone(), lhs.as_ref().clone()));
                 spine_moves.push(Move::Intros(vec![n]));
                 cur = rhs;
             }
@@ -312,6 +329,7 @@ pub fn author_v1(
                     // Trailing wrapper: look through to the value.
                     cur = value;
                 } else {
+                    let_substs.push((name.as_str().to_string(), value.as_ref().clone()));
                     spine_moves.push(Move::IntroSubst(name.as_str().to_string()));
                     cur = body;
                 }
@@ -339,6 +357,15 @@ pub fn author_v1(
         ]));
         debug_assert!(script_names_resolve(&moves, shape, dts));
         return Some((moves, ScriptForm::B));
+    }
+    // ── Form C: equivalence chaining (probe criterion §11.2). The
+    // goal's own spine IS the user's proof trace: the last antecedents
+    // (CallFact ensures from the user's explicit trans/cong calls)
+    // textually equal the goal once the tmp lets are substituted. The
+    // author applies the let-substs to every candidate and compares
+    // pp texts — ExactHyp only when the match is exact.
+    if let Some(moves) = author_form_c(goal, core, &spine_moves, &hyps, &ant_props, &let_substs, shape, dts) {
+        return Some((moves, ScriptForm::C));
     }
     // ── Form A: branch + woven fact (N1-hoisted flat path). ──
     let unfolds = goal_unfold_names(goal, dts, &shape_binders(shape));
@@ -369,6 +396,117 @@ pub fn author_v1(
     moves.push(Move::SplitIf(legs));
     debug_assert!(script_names_resolve(&moves, shape, dts));
     Some((moves, ScriptForm::A))
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Form C: equivalence chaining
+// ────────────────────────────────────────────────────────────────────
+
+/// Apply a list of let-substitutions (in spine order) to an expression.
+fn apply_let_substs(e: &Expr, substs: &[(String, Expr)]) -> Expr {
+    let mut out = e.clone();
+    for (name, val) in substs {
+        out = subst_var(&out, name, val);
+    }
+    out
+}
+
+/// Form C (§11.2): the goal core, after applying the goal's own
+/// let-substitutions, textually equals one of the candidate facts (the
+/// antecedent hyps from the goal's implication spine — the user's own
+/// trans/cong calls' ensures — or a shape hyp). Single goal →
+/// `exact h`; a 2-conjunct goal → `refine ⟨exact h1, exact h2⟩`.
+/// Anything else declines (the derived chain gets it).
+fn author_form_c(
+    goal: &Expr,
+    core: &Expr,
+    spine_moves: &[Move],
+    hyps: &[ShapeHyp],
+    ant_props: &[(String, Expr)],
+    let_substs: &[(String, Expr)],
+    shape: &GoalShape,
+    dts: &DtDefInventory,
+) -> Option<Vec<Move>> {
+    if spine_moves.is_empty() && hyps.is_empty() {
+        return None;
+    }
+    // Normalization substs: the goal's own lets (wrap path) PLUS the
+    // N1 hoist-equations (hoisted path — the tmp binders are binder
+    // equations there, applied by the script's SubstHoists move).
+    let mut substs: Vec<(String, Expr)> = let_substs.to_vec();
+    let mut hoist_names: Vec<String> = Vec::new();
+    for h in hyps {
+        if let HypProvenance::HoistEq { binder } = &h.prov {
+            if let ExprNode::BinOp { op: crate::lean_ast::BinOp::Eq, lhs, rhs } = &h.prop.node {
+                if matches!(&lhs.node, ExprNode::Var(n) if n.as_str() == binder.as_str()) {
+                    substs.push((binder.as_str().to_string(), rhs.as_ref().clone()));
+                    hoist_names.push(h.name.clone());
+                }
+            }
+        }
+    }
+    // Candidates: (name, normalized proposition pp). Antecedent hyps
+    // first (the freshest facts — the user's own calls), then shape
+    // hyps. Normalization = the substs the script applies at proof
+    // time (IntroSubst on the wrap path, SubstHoists on the hoisted
+    // path) — the author compares against exactly those forms.
+    let mut cands: Vec<(String, String)> = Vec::new();
+    for (n, p) in ant_props {
+        cands.push((n.clone(), crate::lean_pp::pp_expr(&apply_let_substs(p, &substs))));
+    }
+    for h in hyps {
+        cands.push((
+            h.name.clone(),
+            crate::lean_pp::pp_expr(&apply_let_substs(&h.prop, &substs)),
+        ));
+    }
+    let norm_core = crate::lean_pp::pp_expr(&apply_let_substs(core, &substs));
+    // Split the goal into top-level conjuncts (right-nested ∧).
+    let mut conjuncts: Vec<&Expr> = Vec::new();
+    let mut c = core;
+    loop {
+        match &c.node {
+            ExprNode::BinOp { op: crate::lean_ast::BinOp::And, lhs, rhs } => {
+                conjuncts.push(lhs.as_ref());
+                c = rhs;
+            }
+            _ => {
+                conjuncts.push(c);
+                break;
+            }
+        }
+    }
+    let norm_conj: Vec<String> =
+        conjuncts.iter().map(|e| crate::lean_pp::pp_expr(&apply_let_substs(e, &substs))).collect();
+    // Every conjunct must have an exact candidate — partial matches
+    // are no script (the derived chain gets the whole thing).
+    let mut exacts: Vec<String> = Vec::new();
+    for nc in &norm_conj {
+        let mut found: Option<String> = None;
+        for (n, cp) in &cands {
+            if cp == nc {
+                found = Some(n.clone());
+                break;
+            }
+        }
+        exacts.push(found?);
+    }
+    let _ = norm_core;
+    let mut moves: Vec<Move> = spine_moves.to_vec();
+    // On the hoisted path the tmp binders are binder equations: apply
+    // them before the exact close, or the goal still has tmps.
+    if !hoist_names.is_empty() {
+        moves.push(Move::SubstHoists(hoist_names));
+    }
+    let close = match exacts.as_slice() {
+        [h] => Move::ExactHyp(h.clone()),
+        [h1, h2] => Move::RefineExact(vec![h1.clone(), h2.clone()]),
+        _ => return None,
+    };
+    moves.push(close);
+    debug_assert!(script_names_resolve(&moves, shape, dts));
+    let _ = goal;
+    Some(moves)
 }
 
 /// The goal shape's binders as a `Binder` slice (for the unfold scan).
@@ -411,12 +549,30 @@ fn script_names_resolve(moves: &[Move], shape: &GoalShape, dts: &DtDefInventory)
             }
         }
     }
+    // Names the script itself introduces (spine intros / let substs)
+    // are visible after their intro move.
+    for m in moves {
+        match m {
+            Move::Intros(ns) => {
+                for n in ns {
+                    if n != "_" {
+                        visible.insert(n.clone());
+                    }
+                }
+            }
+            Move::IntroSubst(n) => {
+                visible.insert(n.clone());
+            }
+            _ => {}
+        }
+    }
     for m in moves {
         let cited: Vec<&str> = match m {
             Move::SubstHoists(ns) | Move::GuardSimp(ns) | Move::GuardSimpStar(ns) => {
                 ns.iter().map(|s| s.as_str()).collect()
             }
             Move::ExactHyp(h) => vec![h.as_str()],
+            Move::RefineExact(hs) => hs.iter().map(|s| s.as_str()).collect(),
             Move::UnfoldSet(fs) => fs.iter().map(|s| s.as_str()).collect(),
             Move::StructuralTail(fs, _) => fs.iter().map(|s| s.as_str()).collect(),
             Move::UnfoldOnce(f) => vec![f.as_str()],

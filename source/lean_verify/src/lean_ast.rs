@@ -189,6 +189,9 @@ pub enum CloserCensus {
     /// N3-M2: an authored script (form B — definitional step of a
     /// recursive spec fn) is primary, the derived chain rides fallback.
     ScriptFormB,
+    /// N3-M2: an authored script (form C — equivalence chaining) is
+    /// primary, the derived chain rides fallback.
+    ScriptFormC,
 }
 
 impl CloserCensus {
@@ -204,6 +207,7 @@ impl CloserCensus {
             CloserCensus::User => "user",
             CloserCensus::ScriptFormA => "script:formA",
             CloserCensus::ScriptFormB => "script:formB",
+            CloserCensus::ScriptFormC => "script:formC",
         }
     }
 }
