@@ -1,6 +1,22 @@
 # DESIGN — N3: Provenance-Driven Proof Scripts
 
 **Status:** DRAFT v0.1 (2026-07-19), for iteration with Danielle.
+**M2 + the Rational story LANDED (2026-07-19):** script IR +
+author v1 (forms A, B) + form C (M4) + the R1/R2 Rational arc
+(commits `733546a`, `d5706f2`, `4f166a8`). Algebra: 205 → 139
+failing obligations, 85 → 91 verified fns; 627/874 theorems (72%)
+script-authored. axiom_eqv_transitive / le_transitive /
+add_associative / mul_associative fully green. Additional lessons:
+(9) `exact h` by defeq bridges projection-vs-raw-form (Rational's
+inlined instances make requires-reestablishment free); (10) bare
+`nlinarith` can't multiply hyps by atoms — the congrArg-multiplier
+pool (beta-reduced types) + `mul_eq_zero` cancel is the shape for
+equality chains, while single-step identities and pure inequality
+chains close plain; (11) the transitive non-recursive unfold closure
+(`denom` → `denom_nat`) — one-level unfolds strand the closer one
+def short; (12) NEVER bare `at *` on large contexts — it
+whnf-times-out and burns the theorem's heartbeat budget before the
+fallback runs; unfold targeted (`at ⊢ <mentioning hyps>`).
 **M2 LANDED (2026-07-19):** script IR (`script.rs`: 14-move
 vocabulary + render + render-time name discipline) + author v1
 (forms A, B) + primary-with-fallback emission. Census:
