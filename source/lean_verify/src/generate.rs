@@ -2872,6 +2872,8 @@ static CENSUS_SCRIPT_A: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static CENSUS_SCRIPT_B: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+static CENSUS_SCRIPT_C: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Increment the census counter for one emitted theorem.
 pub fn census_bump(c: crate::lean_ast::CloserCensus) {
@@ -2885,6 +2887,7 @@ pub fn census_bump(c: crate::lean_ast::CloserCensus) {
         crate::lean_ast::CloserCensus::User => CENSUS_USER.fetch_add(1, Relaxed),
         crate::lean_ast::CloserCensus::ScriptFormA => CENSUS_SCRIPT_A.fetch_add(1, Relaxed),
         crate::lean_ast::CloserCensus::ScriptFormB => CENSUS_SCRIPT_B.fetch_add(1, Relaxed),
+        crate::lean_ast::CloserCensus::ScriptFormC => CENSUS_SCRIPT_C.fetch_add(1, Relaxed),
     };
 }
 
@@ -2902,12 +2905,13 @@ pub fn closer_census_report() -> String {
     let u = CENSUS_USER.load(Relaxed);
     let sa = CENSUS_SCRIPT_A.load(Relaxed);
     let sb = CENSUS_SCRIPT_B.load(Relaxed);
-    if s1 + rung + b + e + be + u + sa + sb == 0 {
+    let sc = CENSUS_SCRIPT_C.load(Relaxed);
+    if s1 + rung + b + e + be + u + sa + sb + sc == 0 {
         return String::new();
     }
     format!(
-        "tactus: closers: {} script (A:{} B:{}) / {} s1-omega / {} rung:formB / {} rung:formE / {} rung:formB+formE / {} rung-only / {} user-supplied",
-        sa + sb, sa, sb, s1, b, e, be, rung, u
+        "tactus: closers: {} script (A:{} B:{} C:{}) / {} s1-omega / {} rung:formB / {} rung:formE / {} rung:formB+formE / {} rung-only / {} user-supplied",
+        sa + sb + sc, sa, sb, sc, s1, b, e, be, rung, u
     )
 }
 
