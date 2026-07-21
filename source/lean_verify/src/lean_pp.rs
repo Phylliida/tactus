@@ -379,6 +379,10 @@ fn write_theorem(out: &mut String, t: &Theorem, lm: &mut Landmarks) {
     if let Some(n) = t.heartbeats {
         out.push_str(&format!("set_option maxHeartbeats {} in\n", n));
     }
+    // N3-M0 census marker (fixed format; the N4 ratchet greps it).
+    if let Some(c) = t.closer_census {
+        out.push_str(&format!("-- tactus-closer: {}\n", c.as_str()));
+    }
     out.push_str("theorem ");
     out.push_str(&t.name);
     write_binders(out, &t.binders, lm);

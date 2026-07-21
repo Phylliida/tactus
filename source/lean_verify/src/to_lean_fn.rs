@@ -495,27 +495,37 @@ fn decreasing_by_tactic(measure: &LExpr, self_name: &str, body: &LExpr) -> Strin
             let monos = SUFFIX_MONO_NAMES.with(|s| s.borrow().clone());
             let applies: String = monos.iter().map(|m| format!("apply {} | ", m)).collect();
             format!(
-                "all_goals (apply Nat.lt_of_le_of_lt <;> (first | {applies}(apply {df} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all))))",
+                "all_goals (apply Nat.lt_of_le_of_lt <;> (first | {applies}(apply {df} <;> (first | assumption | omega | (simp_all only [{ts}] <;> omega) | simp_all only [{ts}]))))",
                 df = q("Seq.drop_first_len_lt"),
+                ts = crate::tactic_select::TERM_SIMP_LEMMAS,
             )
         }
         DecreasingKind::SeqSubrange => format!(
-            "all_goals (apply {} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all))",
-            q("Seq.subrange_tail_len_lt")
+            "all_goals (apply {} <;> (first | assumption | omega | (simp_all only [{}] <;> omega) | simp_all only [{}]))",
+            q("Seq.subrange_tail_len_lt"),
+            crate::tactic_select::TERM_SIMP_LEMMAS,
+            crate::tactic_select::TERM_SIMP_LEMMAS,
         ),
         DecreasingKind::SeqDropFirst => format!(
-            "all_goals (apply {} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all))",
-            q("Seq.drop_first_len_lt")
+            "all_goals (apply {} <;> (first | assumption | omega | (simp_all only [{}] <;> omega) | simp_all only [{}]))",
+            q("Seq.drop_first_len_lt"),
+            crate::tactic_select::TERM_SIMP_LEMMAS,
+            crate::tactic_select::TERM_SIMP_LEMMAS,
         ),
         DecreasingKind::SeqDropLast => format!(
-            "all_goals (apply {} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all))",
-            q("Seq.drop_last_len_lt")
+            "all_goals (apply {} <;> (first | assumption | omega | (simp_all only [{}] <;> omega) | simp_all only [{}]))",
+            q("Seq.drop_last_len_lt"),
+            crate::tactic_select::TERM_SIMP_LEMMAS,
+            crate::tactic_select::TERM_SIMP_LEMMAS,
         ),
         DecreasingKind::Modular => "all_goals (apply Nat.mod_lt <;> omega)".to_string(),
         // Inner 2-ladder: the Prop-ite guard case (bootstrap-44) is
         // guard-shape dependent, which the measure can't predict.
         DecreasingKind::Div => {
-            "all_goals (apply Nat.div_lt_self <;> (first | omega | (simp_all <;> omega)))".to_string()
+            format!(
+                "all_goals (apply Nat.div_lt_self <;> (first | omega | (simp_all only [{}] <;> omega)))",
+                crate::tactic_select::TERM_SIMP_LEMMAS,
+            )
         }
         DecreasingKind::Split => "all_goals ((repeat split) <;> omega)".to_string(),
         DecreasingKind::Structural => "all_goals decreasing_tactic".to_string(),
@@ -533,13 +543,15 @@ fn decreasing_by_tactic(measure: &LExpr, self_name: &str, body: &LExpr) -> Strin
                         .map(|m| format!("apply {} | ", m))
                         .collect();
                     format!(
-                        " | (apply Nat.lt_of_le_of_lt <;> (first | {applies}(apply {df} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all))))",
+                        " | (apply Nat.lt_of_le_of_lt <;> (first | {applies}(apply {df} <;> (first | assumption | omega | (simp_all only [{ts}] <;> omega) | simp_all only [{ts}]))))",
                         df = q("Seq.drop_first_len_lt"),
+                        ts = crate::tactic_select::TERM_SIMP_LEMMAS,
                     )
                 }
             });
             format!(
-                "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Nat.div_lt_self <;> (simp_all <;> omega)) | (apply {ds} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | (apply {df} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | (apply {dl} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | ((repeat split) <;> omega){chain_rung} | decreasing_tactic)",
+                "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Nat.div_lt_self <;> (simp_all only [{ts}] <;> omega)) | (apply {ds} <;> (first | assumption | omega | (simp_all only [{ts}] <;> omega) | simp_all only [{ts}])) | (apply {df} <;> (first | assumption | omega | (simp_all only [{ts}] <;> omega) | simp_all only [{ts}])) | (apply {dl} <;> (first | assumption | omega | (simp_all only [{ts}] <;> omega) | simp_all only [{ts}])) | ((repeat split) <;> omega){chain_rung} | decreasing_tactic)",
+                ts = crate::tactic_select::TERM_SIMP_LEMMAS,
                 ds = q("Seq.subrange_tail_len_lt"),
                 df = q("Seq.drop_first_len_lt"),
                 dl = q("Seq.drop_last_len_lt"),
@@ -1095,6 +1107,9 @@ pub fn proof_fn_to_ast(
         binders,
         goal,
         tactic: Tactic::Raw(tactic_body.to_string()),
+        // User-supplied tactic body (the `#[verifier::tactus_tactic]`
+        // path) — the census class is `User`.
+        closer_census: Some(crate::lean_ast::CloserCensus::User),
         requires_preamble: Vec::new(),
         heartbeats: f.attrs.tactus_heartbeats,
         termination_by,
@@ -1174,6 +1189,83 @@ pub(crate) fn datatype_simp_def_inventory(
         })
         .map(|f| crate::to_lean_type::lean_name(&f.x.name.path))
         .collect();
+    // The recursive complement: bodies WITH a nonempty decreases.
+    // Never simp-set members (loop law — see tactic_select's
+    // `recursive_spec_fns` doc); the N3-M1 UnfoldOnce arm's rw targets.
+    let recursive_spec_fns: std::collections::HashSet<String> = functions
+        .iter()
+        .filter(|f| {
+            f.x.mode == vir::ast::Mode::Spec
+                && f.x.body.is_some()
+                && !f.x.decrease.is_empty()
+        })
+        .map(|f| crate::to_lean_type::lean_name(&f.x.name.path))
+        .collect();
+    // N3 recursive-unfold law for NON-recursive fns: each non-recursive
+    // spec fn's body can mention further non-recursive spec fns, and a
+    // one-level unfold leaves those as fresh opaque atoms
+    // (`denom` → `denom_nat` → omega still blind). Map each spec fn to
+    // the non-recursive spec fns its body references; `goal_unfold_names`
+    // closes over it (bounded) so the unfold reaches a form the closer
+    // can finish. Recursive fns are never targets (the loop law) and
+    // never walked for refs (their bodies can't clean-unfold anyway).
+    let mut spec_fn_body_refs: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for f in functions.iter() {
+        if !(f.x.mode == vir::ast::Mode::Spec && f.x.decrease.is_empty()) {
+            continue;
+        }
+        let Some(body) = &f.x.body else { continue };
+        let mut refs: Vec<String> = Vec::new();
+        vir::ast_visitor::expr_visitor_walk(body, &mut |e: &vir::ast::Expr| {
+            if let vir::ast::ExprX::Call(vir::ast::CallTarget::Fun(_, fun, _, _, _, _), _, _) = &e.x {
+                let name = crate::to_lean_type::lean_name(&fun.path);
+                if name != crate::to_lean_type::lean_name(&f.x.name.path)
+                    && spec_fns.contains(&name)
+                    && !refs.contains(&name)
+                {
+                    refs.push(name);
+                }
+            }
+            vir::visitor::VisitorControlFlow::Recurse
+        });
+        spec_fn_body_refs.insert(crate::to_lean_type::lean_name(&f.x.name.path), refs);
+    }
+    // Trait method IMPL bodies: the instance emission renders impl
+    // method bodies INLINE as the instance's field values
+    // (`zero := lib.rational.impl__0.from_int_spec 0`), so when simp's
+    // projection unfolding reduces a goal-mentioned class projection,
+    // the impl body's callees surface as fresh opaque atoms
+    // (`AdditiveCommutativeMonoid.zero` → `from_int_spec`, which then
+    // can't unfold — the den-small obligations died there). Map each
+    // trait method DECL (the class projection name goals mention) to
+    // the union of its impls' non-recursive spec-fn callees so the
+    // `goal_unfold_names` closure reaches through the projection.
+    for f in functions.iter() {
+        let vir::ast::FunctionKind::TraitMethodImpl { method, .. } = &f.x.kind else { continue };
+        let Some(body) = &f.x.body else { continue };
+        let mut new_refs: Vec<String> = Vec::new();
+        vir::ast_visitor::expr_visitor_walk(body, &mut |e: &vir::ast::Expr| {
+            if let vir::ast::ExprX::Call(vir::ast::CallTarget::Fun(_, fun, _, _, _, _), _, _) = &e.x {
+                let name = crate::to_lean_type::lean_name(&fun.path);
+                if name != crate::to_lean_type::lean_name(&f.x.name.path)
+                    && spec_fns.contains(&name)
+                    && !new_refs.contains(&name)
+                {
+                    new_refs.push(name);
+                }
+            }
+            vir::visitor::VisitorControlFlow::Recurse
+        });
+        let entry = spec_fn_body_refs
+            .entry(crate::to_lean_type::lean_name(&method.path))
+            .or_default();
+        for r in new_refs {
+            if !entry.contains(&r) {
+                entry.push(r);
+            }
+        }
+    }
     for d in datatypes.iter() {
         if matches!(d.x.transparency, DatatypeTransparency::Never) {
             continue;
@@ -1206,7 +1298,15 @@ pub(crate) fn datatype_simp_def_inventory(
         }
         by_type.insert(path, defs);
     }
-    crate::tactic_select::DtDefInventory { by_type, variants, spec_fns }
+    // Trait method DECLS: rendered as class projections; goal-mentioned
+    // ones join the simp set so impl obligations reduce through the
+    // registered instance (B6 mode-(b)).
+    let trait_methods: std::collections::HashSet<String> = functions
+        .iter()
+        .filter(|f| matches!(&f.x.kind, vir::ast::FunctionKind::TraitMethodDecl { .. }))
+        .map(|f| crate::to_lean_type::lean_name(&f.x.name.path))
+        .collect();
+    crate::tactic_select::DtDefInventory { by_type, variants, spec_fns, recursive_spec_fns, spec_fn_body_refs, trait_methods }
 }
 
 pub fn datatype_to_cmds(
@@ -1963,7 +2063,10 @@ fn height_fn_for_datatype(
         body,
         termination_by: vec![termination],
         termination_structural: false,
-        decreasing_by: Some("all_goals (simp_all; omega)".to_string()),
+        decreasing_by: Some(format!(
+            "all_goals (simp_all only [{}]; omega)",
+            crate::tactic_select::TERM_SIMP_LEMMAS
+        )),
     }))
 }
 

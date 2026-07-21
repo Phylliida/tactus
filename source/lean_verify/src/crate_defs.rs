@@ -260,6 +260,24 @@ fn build_defs(
         .map(|f| &f.x)
         .filter(|f| matches!(f.mode, vir::ast::Mode::Exec) && f.body.is_some())
         .collect();
+    // SPEC-mode trait-method-impl fns join the roots: trait INSTANCE
+    // emission renders every impl's spec-method body as an instance
+    // field (`sub := fun … => lib.Rational.sub_spec …`), regardless of
+    // whether any batched theorem mentions it — so the walk must cover
+    // those bodies' closures too. Without this, a spec fn reachable
+    // ONLY through an instance field (tactus-algebra's sub_spec =
+    // add∘neg, div_spec = mul∘recip — used solely via trait dispatch)
+    // is dropped from the defs module while the instance still
+    // references it: unknown identifier, defs elaboration fails, the
+    // whole crate falls back to island emission (B6 corpus, 2026-07-19).
+    let instance_field_roots: Vec<&FunctionX> = inlined_krate.functions.iter()
+        .map(|f| &f.x)
+        .filter(|f| {
+            matches!(f.mode, vir::ast::Mode::Spec)
+                && matches!(&f.kind, vir::ast::FunctionKind::TraitMethodImpl { .. })
+                && f.body.is_some()
+        })
+        .collect();
 
     // Attempt 1: full roots (proof + exec; accessors iff exec present).
     // Attempt 2 (build mode only, on Lean failure): proof roots only —
@@ -270,8 +288,12 @@ fn build_defs(
     // what the passing per-fn proof files already elaborate, so it is
     // clean by construction; exec fns fall back to standalone, where a
     // broken closure breaks only its own file — today's behavior.
-    let full_roots: Vec<&FunctionX> =
-        proof_roots.iter().copied().chain(exec_roots.iter().copied()).collect();
+    let full_roots: Vec<&FunctionX> = proof_roots
+        .iter()
+        .copied()
+        .chain(exec_roots.iter().copied())
+        .chain(instance_field_roots.iter().copied())
+        .collect();
     // Attempt ladder, narrowing on each Lean failure:
     //   1. full roots + broadcast union  — execs + everything
     //   2. proof roots + broadcast union — drops broken exec closures
@@ -312,13 +334,21 @@ fn build_defs(
             && f.x.body.is_some()
             && !tactic_bodies.contains_key(&f.x.name)
     });
+    // Proof-scope roots also carry the instance-field closure: trait
+    // instances emit in both scopes, so both walks must cover the
+    // spec fns their fields reference (see instance_field_roots).
+    let proof_roots_with_instances: Vec<&FunctionX> = proof_roots
+        .iter()
+        .copied()
+        .chain(instance_field_roots.iter().copied())
+        .collect();
     let attempts: Vec<(&[&FunctionX], bool, bool, bool)> = match kind {
         ScopeKind::Exec => vec![
             (&full_roots, !exec_roots.is_empty() || wp_routed_proof_present, true, true),
         ],
         ScopeKind::Proof => vec![
-            (&proof_roots, wp_routed_proof_present, false, true),
-            (&proof_roots, false, false, false),
+            (&proof_roots_with_instances, wp_routed_proof_present, false, true),
+            (&proof_roots_with_instances, false, false, false),
         ],
     };
     // Ladder sidecar (`<scope>.ladder`): which attempt won last run,
@@ -855,7 +885,46 @@ fn render_partitioned(
     segs: &[(usize, crate::generate::DefsSeg)],
     build: bool,
 ) -> Result<CrateDefs, String> {
-    let plan = plan_partition(item_cmds.len(), segs);
+    let mut plan = plan_partition(item_cmds.len(), segs);
+    // Companion-citation imports (2026-07-19): the part-import graph
+    // follows fn-graph REFS, but a `decreasing_by` tactic can cite the
+    // seq-measure companion theorems (`Seq.subrange_tail_len_lt`,
+    // `Seq.drop_{first,last}_len_lt`) — a TEXT dependency the graph
+    // can't see. tactus-algebra's __poly part recursed on subrange
+    // while the companion lived in the drop_last impl's part, two
+    // segments away: unknown identifier, defs elaboration failed,
+    // island fallback. For each companion name: find the part whose
+    // items DEFINE it (`theorem <ns>…name`), then make every part
+    // whose item text cites it import the definer.
+    {
+        let cmd_text = |i: usize| crate::lean_pp::pp_command(&item_cmds[i]);
+        for comp in ["subrange_tail_len_lt", "drop_first_len_lt", "drop_last_len_lt"] {
+            let def_marker = format!("Seq.{}", comp);
+            let definer: Option<(usize, String)> = plan.parts.iter().enumerate()
+                .find_map(|(pi, (name, items, _))| {
+                    items.iter().any(|&i| {
+                        let t = cmd_text(i);
+                        t.contains(&def_marker) && t.contains("theorem ")
+                            && t.find("theorem ").map_or(false, |k| {
+                                t[k..].contains(&def_marker)
+                            })
+                    })
+                    .then(|| (pi, name.clone()))
+                });
+            if let Some((def_pi, def_name)) = definer {
+                // Only LATER parts may import the definer (parts are
+                // in topological build order; a forward import would
+                // reference an olean that doesn't exist yet).
+                for pi in (def_pi + 1)..plan.parts.len() {
+                    let cites = plan.parts[pi].1.iter()
+                        .any(|&i| cmd_text(i).contains(&def_marker));
+                    if cites && !plan.parts[pi].2.contains(&def_name) {
+                        plan.parts[pi].2.push(def_name.clone());
+                    }
+                }
+            }
+        }
+    }
     // Extra imports go FIRST: the head's prelude block is a multi-line
     // Raw (import + set_options), so anything after it is no longer in
     // Lean's import section. Import order is irrelevant; position isn't.
