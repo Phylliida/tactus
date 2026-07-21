@@ -1709,6 +1709,14 @@ impl Verifier {
         let cache = if self.args.cache {
             let mut base = crate::verification_cache::ContextHasher::new();
             base.update_tag(&format!("solver:{:?}", self.args.solver));
+            // Lean-backend mode flags CHANGE what proves (the emitted
+            // environment differs per mode) — they must be part of the
+            // key or verdicts cached in one mode serve cache-hits in
+            // another (found 2026-07-19: --lean-all-proofs greens 7
+            // quantifier lemmas that honest-fail without it, and the
+            // shared key masked the difference; the flag itself is gone
+            // since e5f7aea — proof-fns always route under --lean-backend).
+            base.update_tag(&format!("lean:{:?}", self.args.lean_backend));
             base.update_debug(&krate);
             let mut bc = crate::verification_cache::BucketCache::new(base);
             for function in krate.functions.iter() {

@@ -322,17 +322,20 @@ decreasing_by all_goals (simp_all; omega)
 inductive lib.FrameList where
   | FNil
   | FBind (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
-  | FHyp (val0 : Int) (val1 : Tactus.Box lib.FrameList)
+  | FHyp (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
   | FLet (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
+  | FLetH (val0 : Int) (val1 : Int) (val2 : Int) (val3 : Int) (val4 : Int) (val5 : Tactus.Box lib.FrameList)
   deriving Inhabited
 @[simp] noncomputable def lib.FrameList.isFNil (x : lib.FrameList) : Prop :=
   match x with | lib.FrameList.FNil => True | _ => False
 @[simp] noncomputable def lib.FrameList.isFBind (x : lib.FrameList) : Prop :=
   match x with | lib.FrameList.FBind _ _ _ => True | _ => False
 @[simp] noncomputable def lib.FrameList.isFHyp (x : lib.FrameList) : Prop :=
-  match x with | lib.FrameList.FHyp _ _ => True | _ => False
+  match x with | lib.FrameList.FHyp _ _ _ => True | _ => False
 @[simp] noncomputable def lib.FrameList.isFLet (x : lib.FrameList) : Prop :=
   match x with | lib.FrameList.FLet _ _ _ => True | _ => False
+@[simp] noncomputable def lib.FrameList.isFLetH (x : lib.FrameList) : Prop :=
+  match x with | lib.FrameList.FLetH _ _ _ _ _ _ => True | _ => False
 @[simp] noncomputable def lib.FrameList.FBind_val0 (x : lib.FrameList) : Int :=
   match x with | lib.FrameList.FBind val0 _ _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.FrameList.FBind_val1 (x : lib.FrameList) : Int :=
@@ -340,17 +343,31 @@ inductive lib.FrameList where
 @[simp] noncomputable def lib.FrameList.FBind_val2 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
   match x with | lib.FrameList.FBind _ _ val2 => val2 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.FrameList.FHyp_val0 (x : lib.FrameList) : Int :=
-  match x with | lib.FrameList.FHyp val0 _ => val0 | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.FrameList.FHyp_val1 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
-  match x with | lib.FrameList.FHyp _ val1 => val1 | _ => Classical.ofNonempty
+  match x with | lib.FrameList.FHyp val0 _ _ => val0 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FHyp_val1 (x : lib.FrameList) : Int :=
+  match x with | lib.FrameList.FHyp _ val1 _ => val1 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FHyp_val2 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
+  match x with | lib.FrameList.FHyp _ _ val2 => val2 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.FrameList.FLet_val0 (x : lib.FrameList) : Int :=
   match x with | lib.FrameList.FLet val0 _ _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.FrameList.FLet_val1 (x : lib.FrameList) : Int :=
   match x with | lib.FrameList.FLet _ val1 _ => val1 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.FrameList.FLet_val2 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
   match x with | lib.FrameList.FLet _ _ val2 => val2 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FLetH_val0 (x : lib.FrameList) : Int :=
+  match x with | lib.FrameList.FLetH val0 _ _ _ _ _ => val0 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FLetH_val1 (x : lib.FrameList) : Int :=
+  match x with | lib.FrameList.FLetH _ val1 _ _ _ _ => val1 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FLetH_val2 (x : lib.FrameList) : Int :=
+  match x with | lib.FrameList.FLetH _ _ val2 _ _ _ => val2 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FLetH_val3 (x : lib.FrameList) : Int :=
+  match x with | lib.FrameList.FLetH _ _ _ val3 _ _ => val3 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FLetH_val4 (x : lib.FrameList) : Int :=
+  match x with | lib.FrameList.FLetH _ _ _ _ val4 _ => val4 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FLetH_val5 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
+  match x with | lib.FrameList.FLetH _ _ _ _ _ val5 => val5 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.FrameList.height (s : lib.FrameList) : Nat :=
-  match s with | lib.FrameList.FNil => 1 | lib.FrameList.FBind _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FHyp _ val1 => 1 + lib.FrameList.height val1.deref | lib.FrameList.FLet _ _ val2 => 1 + lib.FrameList.height val2.deref
+  match s with | lib.FrameList.FNil => 1 | lib.FrameList.FBind _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FHyp _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FLet _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FLetH _ _ _ _ _ val5 => 1 + lib.FrameList.height val5.deref
 termination_by sizeOf s
 decreasing_by all_goals (simp_all; omega)
 inductive lib.StmData where

@@ -9756,6 +9756,12 @@ test_verify_one_file! {
 //
 // Result (audit 2026-05-12): transitivity works — `min3` and `math.min`
 // both emit; closer can't unfold either; with both unfolds passes.
+//
+// Update (2026-07-21, post-N3 named-simp/script arc): PASSES WITHOUT the
+// unfold — the formE closer rung rewrites with the spec fns' equation
+// lemmas by name (`simp_all +zetaDelta only […, test.math.min,
+// test.min3] <;> omega`), closing the spec-fn-in-goal gap for this
+// shape. Flipped from the expected-Err pin to Ok.
 test_verify_one_file! {
     #[test] test_cross_crate_probe_3_transitive_spec_call verus_code! {
         use vstd::math::min;
@@ -9772,14 +9778,7 @@ test_verify_one_file! {
             else if y <= z { y }
             else { z }
         }
-    } => Err(e) => {
-        // Failing as expected: spec-fn-in-goal gap (closer can't unfold
-        // min3 nor math.min). Transitivity itself works — both names
-        // appear in the goal, confirming dep_order walked across the
-        // crate boundary AND into the user's local spec fn.
-        assert!(format!("{:?}", e).contains("tactus_auto failed"),
-            "expected tactus_auto failure due to spec-fn-in-goal gap");
-    }
+    } => Ok(())
 }
 
 // Probe 4: cross-crate datatype (`Option<u8>`) in the fn body and ensures.
