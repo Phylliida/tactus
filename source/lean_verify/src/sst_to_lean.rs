@@ -2627,6 +2627,9 @@ impl ObligationEmitter {
                             self.tactic_prefix.len() > self.baseline_prefix_len;
                         let scripted = if !user_prefix {
                             goal_shape.as_ref().and_then(|shape| {
+                                if std::env::var("TACTUS_DEBUG_FORMC").is_ok() {
+                                    eprintln!("[formc] OBLIGATION {name}");
+                                }
                                 crate::script::author_v1(
                                     &goal,
                                     shape,

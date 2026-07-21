@@ -243,7 +243,13 @@ fn form_c_refine_exact_with_nested_hoist_refs_in_facts() {
     // The 890:9 shape (pmul_comm): goal `peqv tmp19 tmp20 ∧ peqv tmp20
     // tmp21` where the matching CallFact _h_hoist_13 itself mentions
     // hoist-bound tmps (tmp17, tmp18) — the author must substitute
-    // through the candidates, not just the goal.
+    // through the candidates, not just the goal. The hoist values
+    // reference `t`, itself hoist-bound EARLIER in the spine: a
+    // single-pass substitution expands `t` on the candidate side
+    // (where it occurs directly) but not on the goal side (where it
+    // arrives only via tmp19's value, inserted after `t`'s subst
+    // already ran) — the comparison must substitute to a fixpoint.
+    let tval = app("lib.seq.Seq.subrange", vec![var("T"), var("p"), var("1")]);
     let qa = app("lib.poly.pmul", vec![var("T"), var("q"), var("t")]);            // tmp17
     let aq = app("lib.poly.pmul", vec![var("T"), var("t"), var("q")]);            // tmp18
     let qsh = app("lib.poly.pmul", vec![var("T"), var("q"), var("sh1")]);         // tmp19
@@ -278,6 +284,7 @@ fn form_c_refine_exact_with_nested_hoist_refs_in_facts() {
     );
     let shape = GoalShape {
         spine: vec![
+            hoist("t", tval),
             hoist("tmp17", qa),
             hoist("tmp18", aq),
             hoist("tmp19", qsh),
