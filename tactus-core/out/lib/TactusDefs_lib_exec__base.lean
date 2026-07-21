@@ -405,7 +405,7 @@ inductive lib.StmData where
   | Ret (val0 : Tactus.Box lib.RawExpList) (val1 : lib.RetBind)
   | If (val0 : Int) (val1 : Int) (val2 : Int) (val3 : Int) (val4 : Int) (val5 : Tactus.Box lib.StmData) (val6 : Tactus.Box lib.StmData)
   | Loop (inv_hyps : Tactus.Box lib.BinderList) (inv_obligs : Tactus.Box lib.RawExpList) (binders : Tactus.Box lib.BinderList) (binder_bounds : Tactus.Box lib.ParamBoundList) (cond_name : Int) (cond_ann : Int) (neg_cond_ann : Int) (d_old_name : Int) (d_old_val : Int) (decrease_oblig : lib.RawExp) (body : Tactus.Box lib.StmData)
-  | AssertQueryNl (val0 : Tactus.Box lib.StmData)
+  | AssertQueryNl (val0 : Tactus.Box lib.StmData) (val1 : lib.RawExp)
   | Skip
   | Seq (val0 : Tactus.Box lib.StmData) (val1 : Tactus.Box lib.StmData)
   deriving Inhabited
@@ -430,7 +430,7 @@ inductive lib.StmData where
 @[simp] noncomputable def lib.StmData.isLoop (x : lib.StmData) : Prop :=
   match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isAssertQueryNl (x : lib.StmData) : Prop :=
-  match x with | lib.StmData.AssertQueryNl _ => True | _ => False
+  match x with | lib.StmData.AssertQueryNl _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isSkip (x : lib.StmData) : Prop :=
   match x with | lib.StmData.Skip => True | _ => False
 @[simp] noncomputable def lib.StmData.isSeq (x : lib.StmData) : Prop :=
@@ -514,13 +514,15 @@ inductive lib.StmData where
 @[simp] noncomputable def lib.StmData.Loop_body (x : lib.StmData) : Tactus.Box lib.StmData :=
   match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ body => body | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.AssertQueryNl_val0 (x : lib.StmData) : Tactus.Box lib.StmData :=
-  match x with | lib.StmData.AssertQueryNl val0 => val0 | _ => Classical.ofNonempty
+  match x with | lib.StmData.AssertQueryNl val0 _ => val0 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.AssertQueryNl_val1 (x : lib.StmData) : lib.RawExp :=
+  match x with | lib.StmData.AssertQueryNl _ val1 => val1 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Seq_val0 (x : lib.StmData) : Tactus.Box lib.StmData :=
   match x with | lib.StmData.Seq val0 _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Seq_val1 (x : lib.StmData) : Tactus.Box lib.StmData :=
   match x with | lib.StmData.Seq _ val1 => val1 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.height (s : lib.StmData) : Nat :=
-  match s with | lib.StmData.Assert _ _ _ _ => 1 | lib.StmData.Assume _ _ _ => 1 | lib.StmData.Assign _ _ => 1 | lib.StmData.AssignH _ _ _ _ _ => 1 | lib.StmData.AssignR _ _ => 1 | lib.StmData.Call _ _ => 1 | lib.StmData.DeadEnd val0 => 1 + lib.StmData.height val0.deref | lib.StmData.Ret _ _ => 1 | lib.StmData.If _ _ _ _ _ val5 val6 => 1 + lib.StmData.height val5.deref + lib.StmData.height val6.deref | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ body => 1 + lib.StmData.height body.deref | lib.StmData.AssertQueryNl val0 => 1 + lib.StmData.height val0.deref | lib.StmData.Skip => 1 | lib.StmData.Seq val0 val1 => 1 + lib.StmData.height val0.deref + lib.StmData.height val1.deref
+  match s with | lib.StmData.Assert _ _ _ _ => 1 | lib.StmData.Assume _ _ _ => 1 | lib.StmData.Assign _ _ => 1 | lib.StmData.AssignH _ _ _ _ _ => 1 | lib.StmData.AssignR _ _ => 1 | lib.StmData.Call _ _ => 1 | lib.StmData.DeadEnd val0 => 1 + lib.StmData.height val0.deref | lib.StmData.Ret _ _ => 1 | lib.StmData.If _ _ _ _ _ val5 val6 => 1 + lib.StmData.height val5.deref + lib.StmData.height val6.deref | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ body => 1 + lib.StmData.height body.deref | lib.StmData.AssertQueryNl val0 _ => 1 + lib.StmData.height val0.deref | lib.StmData.Skip => 1 | lib.StmData.Seq val0 val1 => 1 + lib.StmData.height val0.deref + lib.StmData.height val1.deref
 termination_by sizeOf s
 decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.StmData.Assert.sizeOf_spec, lib.StmData.Assume.sizeOf_spec, lib.StmData.Assign.sizeOf_spec, lib.StmData.AssignH.sizeOf_spec, lib.StmData.AssignR.sizeOf_spec, lib.StmData.Call.sizeOf_spec, lib.StmData.DeadEnd.sizeOf_spec, lib.StmData.Ret.sizeOf_spec, lib.StmData.If.sizeOf_spec, lib.StmData.Loop.sizeOf_spec, lib.StmData.AssertQueryNl.sizeOf_spec, lib.StmData.Skip.sizeOf_spec, lib.StmData.Seq.sizeOf_spec]; omega)
 inductive lib.CastKind where

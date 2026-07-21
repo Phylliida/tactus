@@ -409,6 +409,38 @@ struct Serializer<'a> {
     /// seeded from the actual production goal shapes, so they match by
     /// construction). Non-lift returns never touch this.
     lifted_return_recomputes: u64,
+    /// N1-hoist mirror (bootstrap-74 slice 2): the 1-based ordinal of the
+    /// LAST Hyp frame pushed on the current walk path — production's
+    /// `hyp_counter` in `hoist_all`. Incremented at every FHyp-producing
+    /// site (`next_hyp_name`); snapshotted/restored around If branches
+    /// (each branch resumes from the pre-If count, its cond/neg-cond hyp
+    /// taking the pre-If ordinal + 1 — count_down evidence: cond is
+    /// `_h_hoist_1` in BOTH branches) and around AssertQueryNl scopes
+    /// (production's `new_scope` drops hyps — the sub-walk numbers
+    /// independently from 0, mul_bound evidence).
+    hyp_ordinal: u64,
+    /// Names of residue (Bool-typed) lets in scope on the current walk
+    /// path — the poison-check domain (bootstrap-74 slice 2). A hyp prop
+    /// or let-equation mentioning one of these forces whole-goal wrap
+    /// (the FHyp poison bit / the FLetH→FLet collapse), mirroring
+    /// `hoist_all`'s bail check. Residue lets keep their source names
+    /// (goal-position lets shadow textually), so a name stays
+    /// poison-relevant for the rest of the walk.
+    residue_names: Vec<String>,
+    /// The declared return var's NAME text (`sanitize`d, finding-4's
+    /// `pending_ret_name` companion) — the eq-leaf pair for the hoisted
+    /// return binding (`RetBind::RetLetH`, bootstrap-74 slice 2) renders
+    /// `_h_<ret>_hoist1` and `<ret> = <value>` from it.
+    pending_ret_lname: Option<String>,
+    /// Local let-binder typs (Lean-level), mirroring production's
+    /// `OblCtx.let_binder_typs`: populated at call-dest lets with the
+    /// instantiated callee ret typ and trust `true` (the Phase-5 site,
+    /// sst_to_lean.rs:4304) so a downstream Var read of a Ref-typed
+    /// call result coerces with `.deref` — the `r = tmp__1.deref`
+    /// RetLet equation in vec_read. (Assign lets are NOT recorded yet —
+    /// no current fixture diverges on it; add the walk_let mirror if
+    /// one shows up.)
+    let_binder_typs: im::HashMap<crate::lean_name::LeanName, (Typ, bool)>,
 }
 
 impl<'a> Serializer<'a> {
@@ -568,6 +600,116 @@ impl<'a> Serializer<'a> {
     fn binder_id(&mut self, vid: &VarIdent) -> u64 {
         let name = crate::lean_name::LeanName::from_var_ident(vid);
         self.text_leaf(name.as_str())
+    }
+
+    // ── N1-hoist mirror helpers (bootstrap-74 slice 2) ───────────────
+
+    /// Intern the NEXT hyp name `_h_hoist_{ordinal}` and bump the walk
+    /// counter — production's `hyp_counter` in `hoist_all` (each Hyp
+    /// frame's 1-based ordinal among Hyp frames on the goal's path).
+    fn next_hyp_name(&mut self) -> u64 {
+        self.hyp_ordinal += 1;
+        self.text_leaf(&format!("_h_hoist_{}", self.hyp_ordinal))
+    }
+
+    /// Poison check: does the rendered prop mention any in-scope
+    /// residue-let name? Mirrors `hoist_all`'s bail check
+    /// (`lexpr_mentions_var` over the hoisted binders' types) — a
+    /// poisoned hyp forces the WHOLE goal into wrap mode, and a
+    /// poisoned let-equation collapses its FLetH to a plain FLet
+    /// (lossless: wrap mode discards the hoist payload).
+    fn hyp_poison(&self, e: &LExpr) -> u64 {
+        if self.residue_names.iter().any(|n| crate::sst_to_lean::lexpr_mentions_var(e, n)) {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// The hoisted-let equation pair `(eq-name leaf, eq-prop leaf)` for
+    /// binder `lname` with rendered rhs `rhs`. The eq prop is
+    /// production's `LExpr::eq(LExpr::var(chosen), v2)` pp'd through the
+    /// SAME pp path (byte-for-byte the binder's equation hypothesis);
+    /// the eq name is `_h_{x}_hoist1` — production's `fresh()` first
+    /// try. (Taken-name freshening — a user binder literally named
+    /// `_h_{x}_hoist1` — is the documented `hoist-name-collision`
+    /// census caveat, not mirrored: the bridge honest-fails on it.)
+    fn eq_leaves(&mut self, lname: &crate::lean_name::LeanName, rhs: &LExpr) -> (u64, u64) {
+        let ep = self.leaves.intern(pp_expr(&LExpr::eq(LExpr::var(lname.clone()), rhs.clone())));
+        let en = self.text_leaf(&format!("_h_{}_hoist1", lname.as_str()));
+        (en, ep)
+    }
+
+    /// The N1-hoist classification for a plain let statement
+    /// (bootstrap-74 slice 2), mirroring `hoist_all`'s per-let decision:
+    /// typ known + non-Bool → `AssignH` (the hoisted binder pair —
+    /// unless the equation mentions a residue let, when it collapses to
+    /// plain `Assign`, losslessly); Bool → `AssignR` (residue —
+    /// registering the name so later hyps poison on it); typ-less →
+    /// plain `Assign` (production's `hoist_all` None case, forces wrap).
+    /// Shared by the `Assign` arm (typ from `local_typs`) and the
+    /// Return-arm Bnd-let peel (typ from the binder's rhs exp).
+    fn assign_let_term(
+        &mut self,
+        lname: &crate::lean_name::LeanName,
+        dest: u64,
+        typ: Option<Typ>,
+        rhs_lx: &LExpr,
+        rhs_leaf: u64,
+    ) -> String {
+        match typ {
+            Some(typ) if matches!(&*typ, vir::ast::TypX::Bool) => {
+                self.residue_names.push(lname.as_str().to_string());
+                format!("({}.StmData.AssignR {} {})", NS, dest, rhs_leaf)
+            }
+            Some(typ) => {
+                let eq_lx = LExpr::eq(LExpr::var(lname.clone()), rhs_lx.clone());
+                if self.hyp_poison(&eq_lx) == 1 {
+                    format!("({}.StmData.Assign {} {})", NS, dest, rhs_leaf)
+                } else {
+                    let ty_leaf = self.typ_leaf(&typ);
+                    let (en, ep) = self.eq_leaves(lname, rhs_lx);
+                    format!(
+                        "({}.StmData.AssignH {} {} {} {} {})",
+                        NS, dest, ty_leaf, rhs_leaf, en, ep
+                    )
+                }
+            }
+            None => format!("({}.StmData.Assign {} {})", NS, dest, rhs_leaf),
+        }
+    }
+
+    /// The dest-let frame for a call (bootstrap-74 slice 2 N1
+    /// classification), shared by both post paths: FLetH when the dest
+    /// typ is known non-Bool and the equation `dest = E` is
+    /// residue-free (poisoned → plain FLet, lossless); FLetR for a Bool
+    /// dest (registering the residue name for later poison checks);
+    /// plain FLet when the typ is Bool-irrelevant-but-missing. `tail`
+    /// is the already-built inner frame.
+    fn dest_let_frame(        &mut self,
+        dest_id: u64,
+        dest_name: &crate::lean_name::LeanName,
+        dest_typ: &Typ,
+        dv_lx: &LExpr,
+        tail: String,
+    ) -> String {
+        let dv = self.leaves.intern(pp_expr(dv_lx));
+        if matches!(&**dest_typ, vir::ast::TypX::Bool) {
+            self.residue_names.push(dest_name.as_str().to_string());
+            format!("({}.FrameList.FLetR {} {} {})", NS, dest_id, dv, box_(&tail))
+        } else {
+            let eq_lx = LExpr::eq(LExpr::var(dest_name.clone()), dv_lx.clone());
+            if self.hyp_poison(&eq_lx) == 1 {
+                format!("({}.FrameList.FLet {} {} {})", NS, dest_id, dv, box_(&tail))
+            } else {
+                let ty_leaf = self.typ_leaf(dest_typ);
+                let (en, ep) = self.eq_leaves(dest_name, dv_lx);
+                format!(
+                    "({}.FrameList.FLetH {} {} {} {} {} {})",
+                    NS, dest_id, ty_leaf, dv, en, ep, box_(&tail)
+                )
+            }
+        }
     }
 
     // ── W6c: raw-SST → RawExp transcription (the reference-side input) ─
@@ -1547,6 +1689,16 @@ impl<'a> Serializer<'a> {
                 let sub = self.lexpr_to_exprdata(inner)?;
                 Ok(format!("({}.ExprData.SpanMark {} {})", NS, loc, box_ed(&sub)))
             }
+            // Type ascription `(e : T)` (bootstrap-74 slice 2 §3c) —
+            // ERASED. The reference `RawExp` mirror never carries
+            // ascriptions (SST typ erasure; `render_exp` re-derives the
+            // coercions from the `TypData` tags), so the goal side drops
+            // them too — both sides then agree on the un-annotated shape
+            // (vec_read's `((lib.view.View.view (v : Tactus.Ref …)) :
+            // lib.seq.Seq Int)` → the plain view AppN + Atom). This is
+            // stage-A-safe: ascription TYPE content is leaf rendering
+            // (stage B), not the assembly the bridge certifies.
+            ExprNode::TypeAnnot { expr, .. } => self.lexpr_to_exprdata(expr),
             // G4 (W6e) — the value-if-lift's `let`/`¬` scaffolding. Production
             // folds a fall-through `if` INTO each ensures leaf as a
             // branch-folded implication `c → (let r := (let m := v; …); ens)`
@@ -1914,15 +2066,25 @@ impl<'a> Serializer<'a> {
             StmX::Assert(_, _, e) | StmX::AssertCompute(_, e, _) => {
                 // Intern the BARE hyp first (keeps it in body pre-order), then
                 // the obligation slot (`oblig_slot` interns the span_mark'd
-                // leaf + the deep `raw_exp` atoms after it).
-                let hyp = self.exp_leaf(e)?;
+                // leaf + the deep `raw_exp` atoms after it). The hyp render
+                // is kept as an LExpr first so the N1-hoist poison check
+                // (bootstrap-74 slice 2) sees the exact interned term: a
+                // prop mentioning an in-scope residue let poisons the frame
+                // (whole-goal wrap, mirroring hoist_all's bail).
+                let hyp_lx = crate::to_lean_sst_expr::sst_exp_to_ast_checked(e)
+                    .map_err(|reason| format!("leaf-render: {}", reason))?;
+                let hp = self.hyp_poison(&hyp_lx);
+                let hyp = self.leaves.intern(pp_expr(&hyp_lx));
+                // The forward hyp's `_h_hoist_i` name (bump AFTER the prop
+                // interns so the name leaf follows the prop in the table).
+                let hn = self.next_hyp_name();
                 // W6d.2b: the obligation slot is a DEEP `RawExp` when the assert
                 // condition is coverable (`raw_exp` succeeds → `RawExp.Span(loc,
                 // raw)`, id → `deep_ids`); else the opaque `atom_ob(id)` fallback
                 // (same interned id the goal side atom-matches — the W6d.2a
                 // verdict-neutral behavior).
                 let (_id, slot) = self.oblig_slot(e)?;
-                Ok(format!("({}.StmData.Assert {} {})", NS, slot, hyp))
+                Ok(format!("({}.StmData.Assert {} {} {} {})", NS, slot, hn, hyp, hp))
             }
 
             StmX::Assume(e) => {
@@ -1932,8 +2094,12 @@ impl<'a> Serializer<'a> {
                 if crate::sst_to_lean::is_synthetic_assume_to_drop(e) {
                     return Ok(self.skip());
                 }
-                let id = self.exp_leaf(e)?;
-                Ok(format!("({}.StmData.Assume {})", NS, id))
+                let e_lx = crate::to_lean_sst_expr::sst_exp_to_ast_checked(e)
+                    .map_err(|reason| format!("leaf-render: {}", reason))?;
+                let hp = self.hyp_poison(&e_lx);
+                let id = self.leaves.intern(pp_expr(&e_lx));
+                let hn = self.next_hyp_name();
+                Ok(format!("({}.StmData.Assume {} {} {})", NS, hn, id, hp))
             }
 
             StmX::Assign { lhs, rhs } => {
@@ -1944,11 +2110,55 @@ impl<'a> Serializer<'a> {
                     return Err("assign-field-path".to_string());
                 };
                 let dest = self.binder_id(vid);
-                let rhs_leaf = self.exp_leaf(rhs)?;
-                Ok(format!("({}.StmData.Assign {} {})", NS, dest, rhs_leaf))
+                // Render the rhs ONCE as an LExpr — the value leaf, the
+                // hoist equation prop, and the poison check all read it.
+                let rhs_lx = crate::to_lean_sst_expr::sst_exp_to_ast_checked(rhs)
+                    .map_err(|reason| format!("leaf-render: {}", reason))?;
+                let rhs_leaf = self.leaves.intern(pp_expr(&rhs_lx));
+                // N1-hoist classification (bootstrap-74 slice 2), mirroring
+                // hoist_all's per-let decision (see `assign_let_term`).
+                let lname = crate::lean_name::LeanName::from_var_ident(vid);
+                Ok(self.assign_let_term(&lname, dest, self.local_typs.get(vid).cloned(), &rhs_lx, rhs_leaf))
             }
 
             StmX::Return { ret_exp, .. } => {
+                // Bnd-let peel (bootstrap-74 slice 2): Ghost/spec lets
+                // lower to `ExpX::Bind(BndX::Let, …)` INSIDE the return
+                // expression (use_multiarg's `let _g2: Ghost<nat> =
+                // Ghost(…)`). Production's walk pushes each as its own
+                // frame let (`walk_let`) BEFORE the return binding —
+                // mirror them as AssignH-class statements Seq'd ahead
+                // of the Ret. Only single-binder Let chains peel;
+                // anything else stays inside the value render (the
+                // plain path, which honest-fails on divergence).
+                let mut peel_terms: Vec<String> = Vec::new();
+                let mut cur: Option<&Exp> = ret_exp.as_ref();
+                while let Some(e) = cur {
+                    let ExpX::Bind(bnd, body) = &e.x else { break };
+                    let Some((lname, rhs, inner)) =
+                        crate::sst_to_lean::match_single_let_bind(bnd, body)
+                    else {
+                        break;
+                    };
+                    let rhs_lx = crate::to_lean_sst_expr::sst_exp_to_ast_checked(rhs)
+                        .map_err(|reason| format!("leaf-render: {}", reason))?;
+                    let rhs_leaf = self.leaves.intern(pp_expr(&rhs_lx));
+                    let dest = self.text_leaf(lname.as_str());
+                    // The let's typ is the rhs exp's SST typ
+                    // (production's `walk_let`: `Some(b.a.typ)`) —
+                    // Ghost lets declare no local, so `local_typs` has
+                    // no entry; the rhs typ is the same source.
+                    let term = self.assign_let_term(
+                        &lname,
+                        dest,
+                        Some(rhs.typ.clone()),
+                        &rhs_lx,
+                        rhs_leaf,
+                    );
+                    peel_terms.push(term);
+                    cur = Some(inner);
+                }
+                let ret_exp: Option<&Exp> = cur;
                 // G4/W6e — the value-if-lift path. When the return VALUE lifts
                 // (`value_lifts`: an `if` in value position production pulls
                 // into each ensures leaf) AND every ensures went deep, recompute
@@ -1962,7 +2172,8 @@ impl<'a> Serializer<'a> {
                 // counter drives the post-stm-walk `deep_ids` seeding so the goal
                 // side deepens the matching `Implies` leaves. Pinned by probe14.
                 if let (Some(rname), Some(e)) = (self.pending_ret_name, ret_exp) {
-                    if self.pending_ens_all_deep
+                    if peel_terms.is_empty()
+                        && self.pending_ens_all_deep
                         && !self.pending_ens_oblig.is_empty()
                         && value_lifts(e)
                     {
@@ -2020,32 +2231,76 @@ impl<'a> Serializer<'a> {
                         // alone can't reach (no explicit deref in the Exp). For
                         // a return whose Exp typ already equals `ret_typ`
                         // (u64→u64, arith, generic `T`) the coerce is a no-op.
-                        // Scoped so the `&self` borrows (render_ctx, ret_typ)
-                        // end (`vtext` is owned) before `intern` takes
-                        // `&mut self`. if-value LIFTING is still NOT replicated
-                        // (a genuinely-liftable-if return renders as one leaf
-                        // here vs production's lifted And/Imp structure) — that
-                        // case honest-fails the bridge, never silent-passes.
-                        let vtext = {
-                            let lexpr = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(
-                                e,
-                                &self.render_ctx(),
-                            )
-                            .map_err(|reason| format!("leaf-render: {}", reason))?;
-                            let coerced = match &self.ret_typ {
-                                Some(rt) => {
-                                    crate::expr_shared::coerce_lexpr(lexpr, &e.typ, rt)
-                                }
-                                None => lexpr,
-                            };
-                            pp_expr(&coerced)
+                        // Scoped so the `&self` borrows (render_ctx,
+                        // let_binder_typs, ret_typ) end before `intern`
+                        // takes `&mut self`. if-value LIFTING is still
+                        // NOT replicated (a genuinely-liftable-if return
+                        // renders as one leaf here vs production's
+                        // lifted And/Imp structure) — that case
+                        // honest-fails the bridge, never silent-passes.
+                        // The value renders through production's TYPED
+                        // SPINE (`sst_exp_to_typed` + `into_slot`) with
+                        // the let-binder env — that's what inserts
+                        // `.deref` on a Ref-typed call-result local
+                        // (`r = tmp__1.deref` in vec_read), which the
+                        // checked path + claimed-typ coerce could not
+                        // reach. The coerced LExpr is ALSO the equation
+                        // rhs for the N1-hoisted binding (rendered
+                        // once, used twice).
+                        let coerced = {
+                            let rctx = self.render_ctx()
+                                .with_let_binder_typs(&self.let_binder_typs);
+                            let typed = crate::to_lean_sst_expr::sst_exp_to_typed(e, &rctx)
+                                .map_err(|reason| format!("leaf-render: {}", reason))?;
+                            match &self.ret_typ {
+                                Some(rt) => typed.into_slot(rt),
+                                None => typed.inner,
+                            }
                         };
-                        let vleaf = self.leaves.intern(vtext);
-                        format!("{}.RetBind.RetLet {} {}", NS, nleaf, vleaf)
+                        let vleaf = self.leaves.intern(pp_expr(&coerced));
+                        // N1-hoist (bootstrap-74 slice 2): the return
+                        // binding is a typed let — hoist it to
+                        // `RetLetH` (binder pair `(r : T)
+                        // (_h_r_hoist1 : r = v)`) when the declared ret
+                        // typ is known non-Bool and the equation is
+                        // residue-free; a Bool ret or a poisoned
+                        // equation stays `RetLet` (wrap — a Bool ret is
+                        // the documented RetLetR-less caveat: production
+                        // residue-wraps it, the bridge honest-fails).
+                        let ret_lname = self.pending_ret_lname.clone()
+                            .map(crate::lean_name::LeanName::synthetic);
+                        let hoistable = match (&self.ret_typ, &ret_lname) {
+                            (Some(rt), Some(_)) => !matches!(&**rt, vir::ast::TypX::Bool),
+                            _ => false,
+                        };
+                        match (hoistable, ret_lname) {
+                            (true, Some(lname)) => {
+                                let eq_lx = LExpr::eq(LExpr::var(lname.clone()), coerced.clone());
+                                if self.hyp_poison(&eq_lx) == 1 {
+                                    format!("{}.RetBind.RetLet {} {}", NS, nleaf, vleaf)
+                                } else {
+                                    let rt = self.ret_typ.clone().unwrap();
+                                    let ty_leaf = self.typ_leaf(&rt);
+                                    let (en, ep) = self.eq_leaves(&lname, &coerced);
+                                    format!(
+                                        "{}.RetBind.RetLetH {} {} {} {} {}",
+                                        NS, nleaf, ty_leaf, vleaf, en, ep
+                                    )
+                                }
+                            }
+                            _ => format!("{}.RetBind.RetLet {} {}", NS, nleaf, vleaf),
+                        }
                     }
                     _ => format!("{}.RetBind.RetNone", NS),
                 };
-                Ok(format!("({}.StmData.Ret {} {})", NS, box_(&list), paren(&retbind)))
+                let ret_term = format!("({}.StmData.Ret {} {})", NS, box_(&list), paren(&retbind));
+                // Wrap the Bnd-let peels ahead of the Ret (source order:
+                // the first peeled let is outermost).
+                let mut term = ret_term;
+                for p in peel_terms.into_iter().rev() {
+                    term = format!("({}.StmData.Seq {} {})", NS, box_(&p), box_(&term));
+                }
+                Ok(term)
             }
 
             StmX::If(cond, then_stm, else_stm) => {
@@ -2062,12 +2317,32 @@ impl<'a> Serializer<'a> {
                 // used nowhere, so we do not intern it.
                 let c = self.oblig_leaf(cond)?;
                 let nc = self.neg_oblig_leaf(cond)?;
+                // N1-hoist (bootstrap-74 slice 2): the cond/neg-cond hyps
+                // are each branch's FIRST pushed hyp, so both take the
+                // pre-If ordinal + 1 (the SAME name leaf — count_down
+                // evidence: `_h_hoist_1` in both branches). Each branch
+                // walk resumes from that ordinal; the post-If counter
+                // restores the pre-If value (the two-way join is the
+                // documented unmodeled case). The cond poison covers
+                // both hyps (c and ¬c mention the same names).
+                let cond_inner = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(
+                    cond,
+                    &self.render_ctx(),
+                )
+                .map_err(|reason| format!("leaf-render: {}", reason))?;
+                let cp = self.hyp_poison(&cond_inner);
+                let save = self.hyp_ordinal;
+                let cn = self.text_leaf(&format!("_h_hoist_{}", save + 1));
+                let ncn = cn;
+                self.hyp_ordinal = save + 1;
                 let t = self.stm(then_stm)?;
+                self.hyp_ordinal = save + 1;
                 let e = match else_stm {
                     Some(s) => self.stm(s)?,
                     None => self.skip(),
                 };
-                Ok(format!("({}.StmData.If {} {} {} {})", NS, c, nc, box_(&t), box_(&e)))
+                self.hyp_ordinal = save;
+                Ok(format!("({}.StmData.If {} {} {} {} {} {} {})", NS, c, cn, nc, ncn, cp, box_(&t), box_(&e)))
             }
 
             StmX::Loop {
@@ -2144,8 +2419,28 @@ impl<'a> Serializer<'a> {
             // `have := by <tactic>` render, not an isolated goal list)
             // — sharper tag, still fail-loud.
             StmX::AssertQuery { mode: AssertQueryMode::NonLinear, body, .. } => {
+                // N1-hoist (bootstrap-74 slice 2): production's
+                // `new_scope` DROPS the enclosing hyps for the isolated
+                // query, so the sub-walk numbers its hyps from 0
+                // (mul_bound evidence: `_h_hoist_1` inside the query);
+                // the enclosing counter resumes untouched after (the
+                // query's hyps don't leak — the proven facts re-enter
+                // via the follow-on Assume statements, which number
+                // themselves).
+                let save = self.hyp_ordinal;
+                self.hyp_ordinal = 0;
                 let b = self.stm(body)?;
-                Ok(format!("({}.StmData.AssertQueryNl {})", NS, box_(&b)))
+                self.hyp_ordinal = save;
+                // The query's own ensures is EMPTY — production emits
+                // one final in-scope goal `True`
+                // (`emit_done_or_split`'s `and_all([])` fallback, the
+                // `_tactus_ensures_` theorem; mul_bound evidence). The
+                // model closes it under the post-body frame; the
+                // obligation slot is the opaque `atom_ob("True")` (the
+                // goal side atom-matches the interned `True` text).
+                let true_id = self.leaves.intern("True".to_string());
+                let tq = atom_ob_lit(true_id);
+                Ok(format!("({}.StmData.AssertQueryNl {} {})", NS, box_(&b), tq))
             }
             StmX::AssertQuery { mode: AssertQueryMode::Tactus { .. }, .. } =>
                 Err("assert-query-tactus".to_string()),
@@ -2207,20 +2502,39 @@ impl<'a> Serializer<'a> {
                 if !then_div && !else_div {
                     let c = self.oblig_leaf(cond)?;
                     let nc = self.neg_oblig_leaf(cond)?;
+                    // N1-hoist names + per-branch counter snapshot (see the
+                    // StmX::If arm — the cond hyp is `_h_hoist_{save+1}` in
+                    // BOTH branches; each branch walk resumes from save+1;
+                    // the counter restores after).
+                    let cond_inner = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(
+                        cond,
+                        &self.render_ctx(),
+                    )
+                    .map_err(|reason| format!("leaf-render: {}", reason))?;
+                    let cp = self.hyp_poison(&cond_inner);
+                    let save = self.hyp_ordinal;
+                    let cn = self.text_leaf(&format!("_h_hoist_{}", save + 1));
+                    let ncn = cn;
                     // Serialize the then-branch, then the continuation ONCE
                     // (its leaves intern in then-branch position — matching
                     // production's after-clone walk order), then reuse the
                     // `rest` term verbatim in the else branch (interning is
                     // idempotent). An absent else falls through as `Skip`.
+                    self.hyp_ordinal = save + 1;
                     let then_body = self.stm(then_stm)?;
                     let rest = self.block(&stms[1..])?;
                     let t = format!("({}.StmData.Seq {} {})", NS, box_(&then_body), box_(&rest));
+                    self.hyp_ordinal = save + 1;
                     let else_body = match else_stm {
                         Some(s) => self.stm(s)?,
                         None => self.skip(),
                     };
                     let e = format!("({}.StmData.Seq {} {})", NS, box_(&else_body), box_(&rest));
-                    return Ok(format!("({}.StmData.If {} {} {} {})", NS, c, nc, box_(&t), box_(&e)));
+                    self.hyp_ordinal = save;
+                    return Ok(format!(
+                        "({}.StmData.If {} {} {} {} {} {} {})",
+                        NS, c, cn, nc, ncn, cp, box_(&t), box_(&e)
+                    ));
                 }
             }
         }
@@ -2259,48 +2573,76 @@ impl<'a> Serializer<'a> {
         // (same path as `binder_id`; production Phase-5 binds
         // `let <dest> := …`).
         let dest_id = self.text_leaf(leaves.dest_name.as_str());
+        let dest_name = leaves.dest_name.clone();
+        let dest_typ = leaves.dest_typ.clone();
+        // Record the dest binder at its Lean-level typ (production's
+        // Phase-5 `with_let_binder(dest, ret_typ_subst, true)`, every
+        // path) so downstream Var reads coerce correctly (`.deref` on a
+        // Ref-typed call result).
+        self.let_binder_typs.insert(dest_name.clone(), (dest_typ.clone(), true));
         let post = match leaves.post {
             CertCallPost::RetEq { e_bound, rest, dest_value } => {
                 // Frame (outer→inner): [FHyp(E_bound)] [FHyp(rest)]
-                // FLet(dest, E). Built innermost-out so E_bound ends up
-                // outermost — matching `push_ret_frames`' push order
-                // (E_bound Hyp, then rest Hyp, then Phase-5 dest Let).
-                let dv = self.leaves.intern(pp_expr(&dest_value));
+                // FLet/FLetH/FLetR(dest, E). Built innermost-out so
+                // E_bound ends up outermost — matching
+                // `push_ret_frames`' push order (E_bound Hyp, then rest
+                // Hyp, then Phase-5 dest Let). Hyp names are assigned
+                // in PUSH order (bootstrap-74 slice 2): E_bound takes
+                // the earlier `_h_hoist_i`.
+                let eb_name = if e_bound.is_some() { Some(self.next_hyp_name()) } else { None };
+                let rest_name = if rest.is_some() { Some(self.next_hyp_name()) } else { None };
                 let fnil = format!("{}.FrameList.FNil", NS);
-                let mut post = format!(
-                    "({}.FrameList.FLet {} {} {})", NS, dest_id, dv, box_(&fnil));
+                let mut post = self.dest_let_frame(dest_id, &dest_name, &dest_typ, &dest_value, fnil);
                 if let Some(rest) = rest {
+                    let hp = self.hyp_poison(&rest);
                     let r = self.leaves.intern(pp_expr(&rest));
-                    post = format!("({}.FrameList.FHyp {} {})", NS, r, box_(&post));
+                    post = format!(
+                        "({}.FrameList.FHyp {} {} {} {})",
+                        NS, rest_name.unwrap(), r, hp, box_(&post)
+                    );
                 }
                 if let Some(eb) = e_bound {
+                    let hp = self.hyp_poison(&eb);
                     let b = self.leaves.intern(pp_expr(&eb));
-                    post = format!("({}.FrameList.FHyp {} {})", NS, b, box_(&post));
+                    post = format!(
+                        "({}.FrameList.FHyp {} {} {} {})",
+                        NS, eb_name.unwrap(), b, hp, box_(&post)
+                    );
                 }
                 post
             }
             CertCallPost::Forall { ret_typ, ret_bound, ens, binder_name, dest_value, use_dest_name } => {
                 // ∀-path (bootstrap-71; no callee `r == E` conjunct).
                 // Frame (outer→inner): FBind(binder, ret_typ)
-                // [FHyp(ret_bound)] [FHyp(ens)] [FLet(dest, binder)] —
-                // matching `push_ret_frames`' ∀-path push order (binder,
-                // bound Hyp, ens Hyp) + the Phase-5 alias let, which is
+                // [FHyp(ret_bound)] [FHyp(ens)] [dest-let] — matching
+                // `push_ret_frames`' ∀-path push order (binder, bound
+                // Hyp, ens Hyp) + the Phase-5 alias let, which is
                 // SKIPPED when Approach A named the ∀-binder with the
                 // dest's own name (`use_dest_name` ⟺ binder == dest).
+                // Hyp names in push order (ret_bound before ens).
+                let rb_name = if ret_bound.is_some() { Some(self.next_hyp_name()) } else { None };
+                let ens_name = if ens.is_some() { Some(self.next_hyp_name()) } else { None };
                 let fnil = format!("{}.FrameList.FNil", NS);
                 let mut post = if use_dest_name {
                     fnil
                 } else {
-                    let dv = self.leaves.intern(pp_expr(&dest_value));
-                    format!("({}.FrameList.FLet {} {} {})", NS, dest_id, dv, box_(&fnil))
+                    self.dest_let_frame(dest_id, &dest_name, &dest_typ, &dest_value, fnil)
                 };
                 if let Some(e) = ens {
+                    let hp = self.hyp_poison(&e);
                     let i = self.leaves.intern(pp_expr(&e));
-                    post = format!("({}.FrameList.FHyp {} {})", NS, i, box_(&post));
+                    post = format!(
+                        "({}.FrameList.FHyp {} {} {} {})",
+                        NS, ens_name.unwrap(), i, hp, box_(&post)
+                    );
                 }
                 if let Some(rb) = ret_bound {
+                    let hp = self.hyp_poison(&rb);
                     let b = self.leaves.intern(pp_expr(&rb));
-                    post = format!("({}.FrameList.FHyp {} {})", NS, b, box_(&post));
+                    post = format!(
+                        "({}.FrameList.FHyp {} {} {} {})",
+                        NS, rb_name.unwrap(), b, hp, box_(&post)
+                    );
                 }
                 let bn = self.text_leaf(binder_name.as_str());
                 let ty = self.leaves.intern(pp_expr(&ret_typ));
@@ -2517,7 +2859,20 @@ impl<'a> Serializer<'a> {
     /// is all §4/acceptance §3 require of the goal half (the leaf table is
     /// audit-only; the bridge never reads id values).
     fn goal_data(&mut self, shape: &GoalShape) -> String {
-        let leaf_id = self.lexpr_leaf(&shape.leaf);
+        // Residue-let peel (bootstrap-74 slice 2): production's partial
+        // hoist folds Bool-typed residue lets AROUND the leaf
+        // (`let tmp__1 := s < 2000; <annotated leaf>`), and the ref side
+        // emits them structurally as `GoalData::Let` via `residue_fold_e`.
+        // Peel them here (outermost first) so both sides agree: the
+        // binder id is the name's interned text, the value leaf the
+        // interned value text — the same ids the FLetR frame carries.
+        let mut residue: Vec<(&crate::lean_name::LeanName, &LExpr)> = Vec::new();
+        let mut core = &shape.leaf;
+        while let ExprNode::Let { name, value, body } = &core.node {
+            residue.push((name, value));
+            core = body;
+        }
+        let leaf_id = self.lexpr_leaf(core);
         // W6d.2b emit gate — deepen the goal's core leaf into
         // `LeafE(ExprData…)` ONLY when the matching obligation went DEEP on the
         // reference side (`deep_ids`, the "ob-drives" coordination — populated
@@ -2532,13 +2887,21 @@ impl<'a> Serializer<'a> {
         let atom_core =
             || format!("{}.GoalData.LeafE ({}.ExprData.Atom {})", NS, NS, leaf_id);
         let mut term = if self.deep_ids.contains(&leaf_id) {
-            match self.lexpr_to_exprdata(&shape.leaf) {
+            match self.lexpr_to_exprdata(core) {
                 Ok(ed) => format!("{}.GoalData.LeafE {}", NS, ed),
                 Err(_) => atom_core(),
             }
         } else {
             atom_core()
         };
+        // Wrap the residue lets back around the core, INNERMOST first —
+        // the outermost residue let ends up outermost (frame order,
+        // matching residue_fold_e).
+        for (n, v) in residue.into_iter().rev() {
+            let name = self.text_leaf(n.as_str());
+            let val = self.lexpr_leaf(v);
+            term = format!("{}.GoalData.Let {} {} {}", NS, name, val, box_(&term));
+        }
         for node in shape.spine.iter().rev() {
             term = match node {
                 GoalSpine::Imp(p, _) => {
@@ -2742,6 +3105,13 @@ fn serialize<'a>(
         .dest
         .as_ref()
         .map(|d| s.text_leaf(&crate::to_lean_type::sanitize(d.0.as_str())));
+    // The SAME name, kept as text for the RetLetH equation pair
+    // (bootstrap-74 slice 2).
+    s.pending_ret_lname = check
+        .post_condition
+        .dest
+        .as_ref()
+        .map(|d| crate::to_lean_type::sanitize(d.0.as_str()));
 
     // Local-decl typ map (finding-3): the `Loop` arm re-derives its
     // modified-local havoc set from the body and looks up each var's typ

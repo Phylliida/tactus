@@ -1800,7 +1800,7 @@ fn rename_frame_vars(
 /// hoist's bail check: a theorem-level binder may not refer to a
 /// goal-position residue let. No shadow tracking — a shadowed
 /// coincidence bails conservatively (the pre-partial-hoist behavior).
-fn lexpr_mentions_var(e: &LExpr, name: &str) -> bool {
+pub(crate) fn lexpr_mentions_var(e: &LExpr, name: &str) -> bool {
     match &e.node {
         crate::lean_ast::ExprNode::Var(n) => n.as_str() == name,
         _ => {
@@ -5027,6 +5027,11 @@ pub(crate) struct CertCallLeaves {
     pub precondition: Option<LExpr>,
     /// The call's dest binder name (`let <dest> := …`).
     pub dest_name: crate::lean_name::LeanName,
+    /// The dest local's declared typ (from the dest Exp — the same
+    /// source the caller's `type_map` reads). The serializer's N1-hoist
+    /// classification (bootstrap-74 slice 2) decides FLetH / FLetR /
+    /// FLet for the dest let from it.
+    pub dest_typ: vir::ast::Typ,
     /// The post-call frame ingredients, path-tagged. The serializer
     /// chooses the `FrameList` shape from the tag.
     pub post: CertCallPost,
@@ -5273,6 +5278,12 @@ pub(crate) fn cert_call_leaves<'a>(
     Ok(CertCallLeaves {
         precondition,
         dest_name: crate::lean_name::LeanName::from_var_ident(dest_ident),
+        // The dest let's binder typ is the instantiated CALLEE ret typ
+        // (production's Phase-5 `ret_typ_subst`, sst_to_lean.rs:4306) —
+        // NOT the SST dest local's declared typ (Verus auto-derefs the
+        // call result into the local: `vec_index`'s Ref-typed return
+        // becomes an Int local while the binder stays `Tactus.Ref Int`).
+        dest_typ: ret_typ_subst,
         post,
     })
 }
