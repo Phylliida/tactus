@@ -708,6 +708,8 @@ fn script_names_resolve(moves: &[Move], shape: &GoalShape, dts: &DtDefInventory)
                 || crate::tactic_select::CORE_LEMMAS.contains(c)
                 || crate::tactic_select::STRUCTURAL_EXTRA_LEMMAS.contains(c)
                 || crate::tactic_select::ITE_COLLAPSE_LEMMAS.contains(c)
+                || crate::tactic_select::LEG_SIMP_LEMMAS.contains(c)
+                || crate::tactic_select::TERM_SIMP_LEMMAS.contains(c)
                 || c.contains('.');
             if !visible.contains(c) && !global {
                 return false;

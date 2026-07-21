@@ -254,6 +254,19 @@ pub(crate) const LEG_SIMP_LEMMAS: &str =
      Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, \
      Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add";
 
+/// The termination normalizer set (every `decreasing_by` arm and the
+/// datatype-height `simp`): LEG_SIMP_LEMMAS plus `Int.natCast_sub`
+/// (`↑(n - m)` collapses, side conditions discharged from the
+/// decreasing goals' own bounds — divmod's `toNat (n - len b)`
+/// termination needs it; probe t80, 2026-07-20 — pmul's full ladder
+/// elaborates with the wild arms replaced one-for-one).
+pub(crate) const TERM_SIMP_LEMMAS: &str =
+    "if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, \
+     Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, \
+     Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, \
+     Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, \
+     Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add";
+
 /// Arithmetic collapse lemmas for the goal-only form G arm: identity /
 /// annihilator / cast-push laws PLUS (sub)distribution, so the whole
 /// expansion reaches a monomial normal form whose nonlinear pieces

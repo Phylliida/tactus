@@ -1969,7 +1969,7 @@ fn seq_suffix_mono_companion_cmd(
     // Nat.le_of_lt ∘ drop_first_len_lt)` chains the IH (found by
     // `assumption`, accessibility-agnostic) with `len (drop_first x) < len x`
     // (`apply` reads `x` off the goal, `omega` reads `¬ len x = 0` off the
-    // negated guard); `(simp_all <;> omega)` / `simp_all` mop up the
+    // negated guard); `(simp_all only [TERM])` mops up the
     // vacuous guard-contradiction branches `split` can introduce. Validated
     // against the real emitted `m3_blinker` oleans under BOTH the gate
     // prelude and a plain-`∨` prelude (bootstrap-47).
@@ -1982,9 +1982,10 @@ fn seq_suffix_mono_companion_cmd(
          | (apply Nat.le_trans <;>\n          \
          first\n            \
          | assumption\n            \
-         | (apply Nat.le_of_lt; apply {df}_len_lt <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)))\n      \
-         | (simp_all <;> omega)\n      \
-         | simp_all",
+         | (apply Nat.le_of_lt; apply {df}_len_lt <;> (first | assumption | omega | (simp_all only [{ts}] <;> omega) | simp_all only [{ts}])))\n      \
+         | (simp_all only [{ts}] <;> omega)\n      \
+         | simp_all only [{ts}]",
+        ts = crate::tactic_select::TERM_SIMP_LEMMAS,
     ));
     Some((mono_name, cmd))
 }
