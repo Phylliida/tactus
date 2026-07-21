@@ -21,7 +21,7 @@ echo
 
 TACTUS_LEAN_OUT="$OUT" "$VERUS" \
   --lean-backend -V cache --crate-type=lib \
-  --emit-lean --lean-all-proofs --tactus-emit-cert \
+  --emit-lean --tactus-emit-cert \
   --verify-module symbol \
   "$TGT/src/lib.rs" 2>&1
 rc=$?

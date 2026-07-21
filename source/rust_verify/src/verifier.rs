@@ -1953,10 +1953,14 @@ impl Verifier {
                         // above) through the Lean WP path. `#[verifier::z3]`
                         // remains the per-fn opt-out for shapes the WP
                         // translator can't handle yet.
+                        // Under --lean-backend, exec AND plain proof fns
+                        // route through Lean (always, since 2026-07-19 —
+                        // "--lean-backend" means "verify with Lean"; the
+                        // former --lean-all-proofs flag is gone). Per-fn
+                        // opt-out: #[verifier::z3].
                         let route_to_lean = if self.args.lean_backend {
                             (function.x.mode == vir::ast::Mode::Exec
-                                || (self.args.lean_all_proofs
-                                    && function.x.mode == vir::ast::Mode::Proof))
+                                || function.x.mode == vir::ast::Mode::Proof)
                                 && !function.x.attrs.tactus_z3
                         } else {
                             function.x.attrs.tactus_auto
@@ -3477,6 +3481,17 @@ impl Verifier {
         // census is emission coverage, independent of verdicts).
         if self.args.tactus_emit_cert {
             let report = lean_verify::sst_serialize::census_report();
+            if !report.is_empty() {
+                let reporter = Reporter::new(spans, compiler);
+                reporter.report_now(&note_bare(report).to_any());
+            }
+        }
+
+        // N3-M0 closer census (DESIGN-N3-provenance-scripts.md §8): one
+        // summary line per crate run, unconditionally at crate end, so the
+        // N4 ratchet can read emission choices independent of verdicts.
+        {
+            let report = lean_verify::closer_census_report();
             if !report.is_empty() {
                 let reporter = Reporter::new(spans, compiler);
                 reporter.report_now(&note_bare(report).to_any());

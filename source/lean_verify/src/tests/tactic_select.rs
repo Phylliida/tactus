@@ -219,7 +219,7 @@ fn derived_closer_is_search_free_and_census_exact() {
     // no search tactic named, kernel rungs + generated intro/refine
     // prefix + fixed CORE set + omega tail.
     let goal = bin(BinOp::Eq, var("x"), var("y"));
-    let derived = derived_closer(&goal, &Default::default(), &[], false, &[]);
+    let derived = derived_closer(&goal, &Default::default(), &[], false, &[], 0, None);
     assert!(!derived.contains("tactus_auto"));
     assert!(!derived.contains("case_split"));
     assert!(!derived.contains("tactus_first"));
@@ -229,12 +229,14 @@ fn derived_closer_is_search_free_and_census_exact() {
     // delta on arith goals with stuck matches hits uncatchable
     // maxRecDepth). Shape-derived, see goal_core_is_equation.
     assert!(derived.starts_with("first | rfl | decide | omega | ("));
+    // No goal-mentioned spec fns here, so no form E arm: the chain
+    // ends with the structural rung (no eliminators registered).
     assert!(derived.ends_with("] <;> omega)"));
     // A flat goal has no structure to peel: the kernel branch is just
     // the leaf ladder.
     assert!(derived.contains("first | rfl | decide | omega"));
     let goal_le = bin(BinOp::Le, var("x"), var("y"));
-    let derived_le = derived_closer(&goal_le, &Default::default(), &[], false, &[]);
+    let derived_le = derived_closer(&goal_le, &Default::default(), &[], false, &[], 0, None);
     assert!(derived_le.starts_with("first | with_reducible rfl | decide | omega | ("));
     // The CORE set is the census union + extensions: 51 lemmas (50 separators).
     assert_eq!(CORE_LEMMAS.matches(", ").count(), 50);
@@ -242,6 +244,143 @@ fn derived_closer_is_search_free_and_census_exact() {
     // `_root_.not_imp`; the qualified form is mandatory.
     assert!(CORE_LEMMAS.contains("Classical.not_imp"));
     assert!(!CORE_LEMMAS.contains(", not_imp,"));
+}
+
+#[test]
+fn unfold_once_arm_for_recursive_lhs_head() {
+    // N3 form B (probe pmul_conv.lean): ⊢ pmul p q = rhs — the LHS
+    // head is a RECURSIVE spec fn, so the derived closer gains the
+    // one-step `rw [pmul]` arm (recursive fns never ride simp sets).
+    let app = |f: &str, args: Vec<Expr>| Expr::new(ExprNode::App {
+        head: Box::new(var(f)),
+        args,
+    });
+    let goal = bin(
+        BinOp::Eq,
+        app("lib.poly.pmul", vec![var("p"), var("q")]),
+        app("lib.poly.padd", vec![var("s"), var("t")]),
+    );
+    let dts = DtDefInventory {
+        recursive_spec_fns: ["lib.poly.pmul".to_string()].into_iter().collect(),
+        ..Default::default()
+    };
+    let derived = derived_closer(&goal, &dts, &[], false, &[], 0, None);
+    assert!(derived.contains("rw [lib.poly.pmul]"), "{derived}");
+    assert!(derived.contains("simp_all only [if_true, if_false, reduceIte, reduceCtorEq, Nat.succ_ne_zero"), "{derived}");
+    // The arm is one measured step followed by kernel/ladder closes.
+    assert!(derived.contains("; first | rfl | ("), "{derived}");
+}
+
+#[test]
+fn no_unfold_once_arm_for_nonrecursive_or_rhs_heads() {
+    let app = |f: &str, args: Vec<Expr>| Expr::new(ExprNode::App {
+        head: Box::new(var(f)),
+        args,
+    });
+    let dts = DtDefInventory {
+        recursive_spec_fns: ["lib.poly.pmul".to_string()].into_iter().collect(),
+        ..Default::default()
+    };
+    // Non-recursive LHS head: no rw arm.
+    let goal_coeff = bin(
+        BinOp::Eq,
+        app("lib.poly.coeff", vec![var("p"), var("i")]),
+        var("z"),
+    );
+    let derived = derived_closer(&goal_coeff, &dts, &[], false, &[], 0, None);
+    assert!(!derived.contains("rw ["), "{derived}");
+    // Recursive fn present but only on the RHS: no rw arm (first-match
+    // discipline keeps the rewrite to exactly the LHS head).
+    let goal_rhs = bin(
+        BinOp::Eq,
+        var("z"),
+        app("lib.poly.pmul", vec![var("p"), var("q")]),
+    );
+    let derived = derived_closer(&goal_rhs, &dts, &[], false, &[], 0, None);
+    assert!(!derived.contains("rw ["), "{derived}");
+}
+
+#[test]
+fn unfold_once_arm_looks_through_n1_let_wrapper() {
+    // N1 shape (probe pmul_conv.lean): ⊢ let t := s; (let tmp := (pmul t e = rhs); tmp)
+    // — the Eq core hides behind the trailing wrapper. The wrapper is
+    // NOT intro'd (rw searches through the goal-position let), but the
+    // outer let is.
+    let app = |f: &str, args: Vec<Expr>| Expr::new(ExprNode::App {
+        head: Box::new(var(f)),
+        args,
+    });
+    let eq = bin(
+        BinOp::Eq,
+        app("lib.poly.pmul", vec![var("t"), var("e")]),
+        app("lib.poly.padd", vec![var("s"), var("h")]),
+    );
+    // The wrapper's body var arrives SpanMark-wrapped on real
+    // (rust-annotated) goals — the detection must look through it.
+    let spanned_tmp = Expr::new(ExprNode::SpanMark {
+        rust_loc: "poly_ring.rs:1:1".to_string(),
+        rust_span: None,
+        kind: crate::lean_ast::AssertKind::Obligation(crate::lean_ast::ObligationKind::Plain),
+        inner: Box::new(var("tmp")),
+    });
+    let wrapper = Expr::new(ExprNode::Let {
+        name: LeanName::lit("tmp"),
+        value: Box::new(eq),
+        body: Box::new(spanned_tmp),
+    });
+    let goal = Expr::new(ExprNode::Let {
+        name: LeanName::lit("t"),
+        value: Box::new(var("s")),
+        body: Box::new(wrapper),
+    });
+    let dts = DtDefInventory {
+        recursive_spec_fns: ["lib.poly.pmul".to_string()].into_iter().collect(),
+        ..Default::default()
+    };
+    let derived = derived_closer(&goal, &dts, &[], false, &[], 2, None);
+    assert!(derived.contains("intro t; subst t; rw [lib.poly.pmul]"), "{derived}");
+    // The wrapper is never intro'd BEFORE the rw in the UnfoldOnce arm
+    // (the structural rung's own `intro t tmp` is its own business —
+    // it closes by simp, not by rewriting through the wrapper).
+    assert!(!derived.contains("intro t tmp; rw ["), "{derived}");
+    // The guard simp excludes every broadcast have (the ext axioms
+    // would otherwise explode the goal's Seq equality) — and only
+    // those; the goal's own hyps stay usable.
+    assert!(derived.contains("-_tactus_bc_0"), "{derived}");
+    assert!(derived.contains("-_tactus_bc_1"), "{derived}");
+    assert!(!derived.contains("-_tactus_bc_2"), "{derived}");
+}
+
+#[test]
+fn form_e_arm_is_two_phase() {
+    // Form E (probe zpoly_generic.lean): a targeted unfold of the
+    // goal-mentioned fns as phase 1 (NO CORE — it leaves residuals the
+    // split can't close), then the guarded split. The two phases are
+    // ONE arm: as a bare chain arm `split` never sees the ite guards
+    // hidden inside unfolded spec fns.
+    let app = |f: &str, args: Vec<Expr>| Expr::new(ExprNode::App {
+        head: Box::new(var(f)),
+        args,
+    });
+    let goal = bin(
+        BinOp::Eq,
+        app("lib.poly.coeff", vec![var("p"), var("i")]),
+        var("z"),
+    );
+    let dts = DtDefInventory {
+        spec_fns: ["lib.poly.coeff".to_string()].into_iter().collect(),
+        ..Default::default()
+    };
+    let derived = derived_closer(&goal, &dts, &[], false, &[], 0, None);
+    let expected = format!(
+        " | (simp_all only [lib.poly.coeff]; first | omega | (split <;> simp_all only [{}] <;> omega) | (split <;> simp_all only [{}]))",
+        crate::tactic_select::LEG_SIMP_LEMMAS,
+        crate::tactic_select::LEG_SIMP_LEMMAS,
+    );
+    assert!(derived.contains(&expected), "{derived}");
+    // No goal-mentioned unfolds → no form E arm at all.
+    let bare = derived_closer(&bin(BinOp::Eq, var("x"), var("y")), &Default::default(), &[], false, &[], 0, None);
+    assert!(!bare.contains("split"), "{bare}");
 }
 
 #[test]
@@ -322,4 +461,41 @@ fn peel_mixed_wrappers() {
         render_peel(&goal, "LEAF"),
         "intro _; intro ⟨_, _⟩; refine ⟨by LEAF, by LEAF⟩"
     );
+}
+
+
+#[test]
+fn census_marks_which_arms_fired() {
+    // N3-M0 census (DESIGN-N3 §8): derived_closer records which M1
+    // arms it attached, via the out-param.
+    let app = |f: &str, args: Vec<Expr>| Expr::new(ExprNode::App {
+        head: Box::new(var(f)),
+        args,
+    });
+    let dts = DtDefInventory {
+        spec_fns: ["lib.poly.coeff".to_string()].into_iter().collect(),
+        recursive_spec_fns: ["lib.poly.pmul".to_string()].into_iter().collect(),
+        ..Default::default()
+    };
+    // Recursive-LHS head + a goal-mentioned spec fn → both arms.
+    let goal = bin(
+        BinOp::Eq,
+        app("lib.poly.pmul", vec![var("p"), var("q")]),
+        app("lib.poly.coeff", vec![var("s"), var("i")]),
+    );
+    let mut c = crate::lean_ast::CloserCensus::RungOnly;
+    derived_closer(&goal, &dts, &[], false, &[], 0, Some(&mut c));
+    assert_eq!(c, crate::lean_ast::CloserCensus::RungFormBE);
+    // No recursive head → form E only.
+    let goal2 = bin(BinOp::Eq, app("lib.poly.coeff", vec![var("p"), var("i")]), var("z"));
+    let mut c = crate::lean_ast::CloserCensus::RungOnly;
+    derived_closer(&goal2, &dts, &[], false, &[], 0, Some(&mut c));
+    assert_eq!(c, crate::lean_ast::CloserCensus::RungFormE);
+    // Bare goal → plain rung.
+    let mut c = crate::lean_ast::CloserCensus::RungFormB;
+    derived_closer(&bin(BinOp::Eq, var("x"), var("y")), &dts, &[], false, &[], 0, Some(&mut c));
+    assert_eq!(c, crate::lean_ast::CloserCensus::RungOnly);
+    // The artifact comment spellings are the fixed N4 format.
+    assert_eq!(crate::lean_ast::CloserCensus::RungFormBE.as_str(), "rung:formB+formE");
+    assert_eq!(crate::lean_ast::CloserCensus::S1Omega.as_str(), "s1-omega");
 }

@@ -214,9 +214,75 @@ pub(crate) fn core_simp() -> String {
 /// collapse) and ite collapse over reduced Prop discriminators
 /// (`if True then a else b` after `is<Variant>` unfolds on a
 /// constructor). Probe-tested on the e2e exec corpus (2026-07-17,
-/// the 26-test squeeze-regression sweep).
+/// the 26-test squeeze-regression sweep). NOTE: `if_pos`/`if_neg`
+/// (context-conditioned ite collapse) do NOT belong here — in the
+/// rung's full set they mangle pmul's guarded forms (the 2026-07-20
+/// recip-arc regression); they live in the script's targeted set
+/// instead, where the unfold has just exposed the guard.
 pub(crate) const STRUCTURAL_EXTRA_LEMMAS: &str =
     "true_or, or_true, if_true, if_false, reduceCtorEq";
+
+/// The ite-collapse family used by the script's targeted leg
+/// (LeafTargetedSimp): context-conditioned (`if_pos`/`if_neg`) plus
+/// decided-condition (`if_true`/`if_false`) ite rewrites. Kept as a
+/// named const so the render-time name discipline
+/// (`script_names_resolve`) treats them as builtins — none of them
+/// contain a `.`, so the dotted-name shortcut misses them.
+pub(crate) const ITE_COLLAPSE_LEMMAS: &str = "if_pos, if_neg, if_true, if_false";
+
+/// The leg normalizer set for ALL SplitIf legs (LeafSimpOnlyOmega and
+/// form E's split legs): every simp in the emitted corpus is `simp
+/// only [named things]` — bare `simp_all` is BOTH opaque (its behavior
+/// is invisible to the user) and version-unstable (the default simp
+/// set drifts with Mathlib, silently changing a script's meaning on
+/// upgrade — Danielle's law, 2026-07-20). The set is deliberately
+/// small: ite collapse (context- and decided-condition), constructor
+/// disjointness, and a trimmed arithmetic normalizer — the work the
+/// DEFAULT simp set was silently doing for the wild legs (the t72
+/// form E legs: `mul_zero`/`ofNat_eq_coe` are default @[simp], and a
+/// 6-name ite set "makes no progress" without them). Deliberately NO
+/// `Int.ofNat_toNat` (rewrites subrange's toNat forms out from under
+/// divmod's `split`) and no distributive set beyond the collapse
+/// quartet. The spine already unfolded the goal's fns, `simp_all
+/// only` uses context hyps as rewrites regardless (broadcast haves,
+/// branch facts), omega finishes — and a bigger set is a whnf-budget
+/// hazard on divmod/pmul-sized legs (the 204:9 timeout).
+pub(crate) const LEG_SIMP_LEMMAS: &str =
+    "if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, \
+     Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, \
+     Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, \
+     Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, \
+     Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add";
+
+/// The termination normalizer set (every `decreasing_by` arm and the
+/// datatype-height `simp`): LEG_SIMP_LEMMAS plus `Int.natCast_sub`
+/// (`↑(n - m)` collapses, side conditions discharged from the
+/// decreasing goals' own bounds — divmod's `toNat (n - len b)`
+/// termination needs it; probe t80, 2026-07-20 — pmul's full ladder
+/// elaborates with the wild arms replaced one-for-one).
+pub(crate) const TERM_SIMP_LEMMAS: &str =
+    "if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, \
+     Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, \
+     Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, \
+     Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, \
+     Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add";
+
+/// Arithmetic collapse lemmas for the goal-only form G arm: identity /
+/// annihilator / cast-push laws PLUS (sub)distribution, so the whole
+/// expansion reaches a monomial normal form whose nonlinear pieces
+/// cancel as equal atoms under omega (`a.num * ↑a.den - a.num * ↑a.den`).
+/// The sub-variants are load-bearing: `neg_spec` emits `0 - self.num`,
+/// and `Int.mul_add`/`Int.add_mul` don't fire on a subtraction (the
+/// add_inverse postcondition starved there, probe t17 2026-07-20).
+/// omega-only terminator: `nlinarith` is NOT in scope — per-obligation
+/// artifacts only import Mathlib.Tactic.Linarith when the fn has a
+/// `by(nonlinear_arith)` scope (the 275-error "unknown tactic"
+/// regression, 2026-07-20).
+pub(crate) const ARITH_COLLAPSE_LEMMAS: &str =
+    "Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, \
+     Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.mul_add, Int.add_mul, \
+     Int.mul_sub, Int.sub_mul, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, \
+     Nat.add_zero, Nat.zero_add";
 
 /// Marker text written where the DERIVED closer would go when the goal
 /// isn't known yet — the `by(nonlinear_arith)` AssertQuery scope
@@ -242,7 +308,15 @@ pub(crate) const DERIVED_MARKER: &str = "tactus_derived_marker__";
 ///   omega tail, then the STRUCTURAL rung (`structural_rung` below):
 ///   named intros + `cases` on the goal's own datatype scrutinees +
 ///   `simp_all +zetaDelta` over CORE plus the goal-mentioned
-///   generated datatype defs.
+///   generated datatype defs. N3-M1 then appends, before the
+///   eliminator arms: the UnfoldOnce arm (form B — one measured
+///   `rw [f]` step when the goal core's LHS head is a RECURSIVE spec
+///   fn, which can never ride a simp set — the loop law; probe
+///   `probe-n3-scripts/pmul_conv.lean`) and the two-phase form E arm
+///   (targeted unfold of the goal-mentioned fns, then a guarded
+///   `split`; the phases must be ONE arm — bare split chain-arms
+///   never see the ite guards hidden inside unfolded spec fns; probe
+///   `probe-n3-scripts/zpoly_generic.lean`).
 ///
 /// Every branch is a decision procedure, a generated structural prefix,
 /// or a FIXED, site-invariant rewrite set — or, for the structural
@@ -263,7 +337,9 @@ pub(crate) fn derived_closer(
     dts: &DtDefInventory,
     binders: &[Binder],
     user_prefix: bool,
-    eliminators: &[String],
+    eliminators: &[(String, Option<String>)],
+    broadcast_count: usize,
+    census: Option<&mut crate::lean_ast::CloserCensus>,
 ) -> String {
     // Which `rfl` the kernel ladder gets is DERIVED from the goal's
     // core shape (after peeling the ∀/let/→ spine):
@@ -284,8 +360,158 @@ pub(crate) fn derived_closer(
     //   fails fast and catchably there, and non-equation goals never
     //   needed delta rfl.
     let rfl_form = if goal_core_is_equation(goal) { "rfl" } else { "with_reducible rfl" };
-    let kernel = format!("first | {} | decide | omega", rfl_form);
+    // False-hypothesis elim: a binder of type `False` closes anything
+    // (the `assert(false)`-in-a-branch idiom makes every downstream
+    // obligation in that branch vacuous — recip_congruence's
+    // `b.num == 0` leg, 2026-07-20). `cases h` is a core decision
+    // step; inside the kernel ladder it also lands after
+    // render_peel's intro prefix, so wrap-shape goals are covered.
+    let false_arms: String = binders
+        .iter()
+        .filter_map(|b| {
+            let n = b.name.as_ref()?;
+            let mut t = &b.ty;
+            while let ExprNode::SpanMark { inner, .. } = &t.node {
+                t = inner;
+            }
+            if matches!(&t.node, ExprNode::LitBool(false)) {
+                Some(format!(" | (cases {})", n.as_str()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let kernel = format!("first | {} | decide | omega{}", rfl_form, false_arms);
     let rung = structural_rung(goal, dts, binders, user_prefix);
+    // N3-M1 arms (probes: probe-n3-scripts/, 2026-07-19). All ADDITIVE
+    // — they run only where every pre-existing arm already failed.
+    //
+    // UnfoldOnce (form B): the goal's Eq/Iff core has a RECURSIVE spec
+    // fn as its LHS head. Recursive fns can never ride a simp set
+    // (loop law), so the arm takes exactly one measured step:
+    // `rw [f]` (first-match instantiation — the RHS's differently-
+    // instantiated recursive call is left alone, no conv needed),
+    // then a guard simp — `simp_all only` so the branch hypothesis
+    // (¬(len = 0) etc.) is used as a rewrite WITHOUT provenance —
+    // then kernel close, with the structural simp ladder as the tail
+    // for sides that differ by further non-recursive unfolds.
+    //
+    // The spine walk resolves N1's trailing equation wrapper
+    // (`let tmp := <eq>; tmp`): the wrapper must NOT be intro'd (the
+    // goal would collapse to an opaque var that `rw` cannot search),
+    // and the Eq core hides behind it (probe pmul_conv.lean). Earlier
+    // lets ARE intro'd AND subst'd (the render_peel pattern): the
+    // branch/fact hypotheses ride in as let-bound antecedents
+    // (`let tmp := <fact>; tmp → …`), and only subst turns them into
+    // rewrites the guard simp can use.
+    let (uo_steps, uo_core) = unfold_once_spine(goal);
+    let intro_step = if user_prefix {
+        "intros;".to_string()
+    } else if uo_steps.is_empty() {
+        String::new()
+    } else {
+        format!("{};", uo_steps.join("; "))
+    };
+    // Guard-simp lemma set: if-collapse + Nat-literal/constructor
+    // collapses for the `len _ + 1 = 0` / `1 = 0` shapes that follow
+    // broadcast-free rewrites — and, critically, EXCLUSIONS for every
+    // broadcast have (`-_tactus_bc_<i>`): left in, the Prop-valued
+    // extensionality axioms among them rewrite the goal's own Seq
+    // equality into len∧pointwise form and the one-step close
+    // degenerates into the structural rung's known failure. The goal's
+    // OWN hyps (branch conditions, call facts) stay usable. Validated
+    // on lemma_pmul_push's base-case assert (probe_169 lineage).
+    let bc_exclusions: String = (0..broadcast_count)
+        .map(|i| format!(", -_tactus_bc_{}", i))
+        .collect();
+    let guard_simp_set = format!(
+        "if_true, if_false, reduceIte, reduceCtorEq, Nat.succ_ne_zero, Nat.add_one, Nat.zero_add, Nat.add_zero{}",
+        bc_exclusions
+    );
+    let form_b_fires = recursive_lhs_head(uo_core, dts).is_some();
+    let unfold_once_arm: String = match recursive_lhs_head(uo_core, dts) {
+        None => String::new(),
+        Some(f) => format!(
+            " | ({} rw [{}]; simp_all only [{}]; first | rfl | ({}))",
+            intro_step,
+            f,
+            guard_simp_set,
+            rung_tail(goal, dts, binders),
+        ),
+    };
+    // Form E (the provenance-free harvest, probe zpoly_generic.lean):
+    // a TARGETED unfold of the goal-mentioned spec fns / trait methods
+    // / datatype defs as phase 1, then a guarded split phase. Two
+    // shape constraints, both probe-validated: (1) the phase-1 set is
+    // the scan's unfolds ONLY — adding CORE leaves a residual the
+    // split can't close (observed on lemma_zpoly_empty's obligation);
+    // (2) the two phases are ONE arm — as a bare chain arm `split`
+    // never sees the ite guards hidden inside unfolded spec fns.
+    // (Phase 1 closing the goal outright is fine: the `first|`
+    // succeeds vacuously on zero goals.)
+    let mut form_e_fires = false;
+    let form_e_arm: String = {
+        let scan = run_structural_scan(goal, dts, binders);
+        let mut unfolds: Vec<String> = scan.unfolds.iter().cloned().collect();
+        unfolds.extend(scan.mentioned_spec_fns.iter().cloned());
+        unfolds.extend(scan.mentioned_trait_methods.iter().cloned());
+        unfolds.sort();
+        unfolds.dedup();
+        if unfolds.is_empty() {
+            String::new()
+        } else {
+            form_e_fires = true;
+            format!(
+                " | (simp_all only [{}]; first | omega | (split <;> simp_all only [{}] <;> omega) | (split <;> simp_all only [{}]))",
+                unfolds.join(", "),
+                crate::tactic_select::LEG_SIMP_LEMMAS,
+                crate::tactic_select::LEG_SIMP_LEMMAS,
+            )
+        }
+    };
+    // N3-M0 census: which M1 arms the author attached (the S1/derived
+    // choice is made by the caller; the script classes land in M2).
+    if let Some(c) = census {
+        *c = match (form_b_fires, form_e_fires) {
+            (true, true) => crate::lean_ast::CloserCensus::RungFormBE,
+            (true, false) => crate::lean_ast::CloserCensus::RungFormB,
+            (false, true) => crate::lean_ast::CloserCensus::RungFormE,
+            (false, false) => crate::lean_ast::CloserCensus::RungOnly,
+        };
+    }
+    // Form G (goal-only collapse, probes t11/t17 2026-07-20): the goal's
+    // core is headed by a TRAIT METHOD projection (eqv/le/lt — a
+    // Prop-valued class projection). Two failure modes block the other
+    // arms there: (1) the simp_all rung hits maxRecDepth — let-wrapped
+    // equation antecedents (`let tmp := az = a; …`) become rewrites
+    // whose +zetaDelta-unfolded LHS keeps re-matching; (2) form E's
+    // phase-1 leaves the cast/mul-identity soup omega abstracts into
+    // mismatched nonlinear atoms (`a.num * ↑a.den` vs `a.num * 1 *
+    // ↑a.den`). Going goal-only (`at ⊢`) after `intros` removes the
+    // hyp-rewrite loop's fuel entirely, and the collapse+distribution
+    // set (ARITH_COLLAPSE_LEMMAS) normalizes the expansion to monomials
+    // that cancel as equal atoms under omega. Needs no hyps: the
+    // projection unfolds decide it (the den-small postconditions). Runs
+    // after form E, so only goals every other arm failed ever pay for
+    // it. omega-only terminator — nlinarith is not import-safe here
+    // (see ARITH_COLLAPSE_LEMMAS).
+    let form_g_arm: String = match goal_core_app_head(goal) {
+        Some(h) if dts.trait_methods.contains(h) => {
+            let mut unfolds = goal_unfold_names(goal, dts, binders);
+            unfolds.sort();
+            unfolds.dedup();
+            let set = if unfolds.is_empty() {
+                ARITH_COLLAPSE_LEMMAS.to_string()
+            } else {
+                format!("{}, {}", ARITH_COLLAPSE_LEMMAS, unfolds.join(", "))
+            };
+            format!(
+                " | (intros; simp +zetaDelta only [{}] at ⊢; first | omega | done)",
+                set
+            )
+        }
+        _ => String::new(),
+    };
     // Equation-eliminator arms, LAST in the chain: for each broadcast
     // lemma whose conclusion is a non-Prop equation (derived from
     // signatures at emit time — see the emitter's `eliminators`
@@ -297,13 +523,26 @@ pub(crate) fn derived_closer(
     // equation-core goals get the arms (apply against a non-equation
     // goal cannot unify anyway), and being last they run only where
     // every existing arm already failed.
+    //
+    // Apply-guard: skip an arm when the eliminator's conclusion LHS
+    // head is statically known AND differs from the goal's own
+    // equation LHS head — the apply could never unify, so the arm only
+    // burns heartbeats and its `apply failed: could not unify` error
+    // masks the real closer failure in diagnostics (the Rational
+    // den-small obligations all reported the seq-subranges eliminator
+    // this way). Unknown on either side → keep the arm (conservative).
     let elim_arms: String = if eliminators.is_empty() || !goal_core_is_equation(goal) {
         String::new()
     } else {
         let legs = format!("(first | assumption | ({}))", rung_tail(goal, dts, binders));
+        let goal_head = equation_lhs_head_name(goal);
         eliminators
             .iter()
-            .map(|e| {
+            .filter(|(_, head)| match (head, goal_head) {
+                (Some(h), Some(g)) => h == g,
+                _ => true,
+            })
+            .map(|(e, _)| {
                 format!(
                     " | (apply {e} <;> {legs}) | ((apply Eq.symm; apply {e}) <;> {legs})",
                     e = e,
@@ -312,14 +551,180 @@ pub(crate) fn derived_closer(
             })
             .collect()
     };
+    // Denom-injectivity arm (probes t45/t46, 2026-07-20): the goal
+    // core is an equality on field projections (`l.den = r.den`), and
+    // at least one binder's type mentions `lib.Rational.denom`. Since
+    // `denom x = ↑(x.den + 1)`, a denominator equation in context
+    // decides the `.den` equation — after the unfold, omega finishes
+    // the cast. Targeted `at ⊢ <names>` (never bare `at *` — the
+    // divmod lesson). Runs after the rung: its gate is narrow enough
+    // that it only ever sees goals the rung couldn't take, and the
+    // hoisted associativity asserts drown the rung's full-context
+    // simp_all but fall to this in one step.
+    let denom_inj_arm: String = {
+        let is_proj_eq = {
+            let mut cur = goal;
+            loop {
+                match &cur.node {
+                    ExprNode::SpanMark { inner, .. } => cur = inner,
+                    ExprNode::Forall { body, .. } => cur = body,
+                    ExprNode::Let { name, value, body } => {
+                        // Trailing equation wrapper (`let tmp := v;
+                        // tmp`): look through to the VALUE — the Eq
+                        // core hides behind it (the residue-let shape,
+                        // N1's wrapper rule; 233's `let tmp__3 :=
+                        // l.den = r.den; tmp__3` gated the arm off
+                        // entirely).
+                        let mut b = body.as_ref();
+                        while let ExprNode::SpanMark { inner, .. } = &b.node {
+                            b = inner;
+                        }
+                        if matches!(&b.node, ExprNode::Var(n) if n.as_str() == name.as_str()) {
+                            cur = value;
+                        } else {
+                            cur = body;
+                        }
+                    }
+                    ExprNode::BinOp { op: BinOp::Implies, rhs, .. } => cur = rhs,
+                    ExprNode::BinOp { op: BinOp::Eq, lhs, .. } => {
+                        let mut l = lhs.as_ref();
+                        while let ExprNode::SpanMark { inner, .. } = &l.node {
+                            l = inner;
+                        }
+                        break matches!(l.node, ExprNode::FieldProj { .. });
+                    }
+                    _ => break false,
+                }
+            }
+        };
+        let names: Vec<String> = binders
+            .iter()
+            .filter_map(|b| {
+                let n = b.name.as_ref()?;
+                if contains_app_head(&b.ty, "lib.Rational.denom") {
+                    Some(n.as_str().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if is_proj_eq && !names.is_empty() {
+            format!(
+                " | (intros; simp only [lib.Rational.denom, lib.Rational.denom_nat] at ⊢ {}; first | omega | done)",
+                names.join(" ")
+            )
+        } else {
+            String::new()
+        }
+    };
     format!(
-        "first | {} | decide | omega | ({}) | ({}) | ({}){}",
+        "first | {} | decide | omega | ({}) | ({}) | ({}){}{}{}{}{}",
         rfl_form,
         render_peel(goal, &kernel),
         core_simp(),
         rung,
+        denom_inj_arm,
+        unfold_once_arm,
+        form_e_arm,
+        form_g_arm,
         elim_arms
     )
+}
+
+/// N3 form B spine walk: peel the leading ∀-binder / goal-let /
+/// implication spine, emitting intro steps — but do NOT peel (or
+/// step) N1's trailing equation wrapper `let tmp := v; tmp`, whose
+/// value becomes the returned core. The wrapper must survive into the
+/// emitted tactic as a goal-position let: `rw` searches through it,
+/// whereas intro'ing `tmp` would leave an opaque context let-var that
+/// `rw` cannot search (probe pmul_conv.lean). All EARLIER lets are
+/// intro'd AND subst'd (the render_peel pattern) so let-bound fact
+/// antecedents become usable rewrites.
+fn unfold_once_spine(goal: &Expr) -> (Vec<String>, &Expr) {
+    fn peel_spans(mut e: &Expr) -> &Expr {
+        while let ExprNode::SpanMark { inner, .. } = &e.node {
+            e = inner;
+        }
+        e
+    }
+    let mut steps: Vec<String> = Vec::new();
+    let mut cur = goal;
+    loop {
+        match &cur.node {
+            ExprNode::SpanMark { inner, .. } => cur = inner,
+            ExprNode::Forall { binders, body } => {
+                let names: Vec<String> = binders
+                    .iter()
+                    .map(|b| match &b.name {
+                        Some(n) => n.as_str().to_string(),
+                        None => "_".to_string(),
+                    })
+                    .collect();
+                steps.push(format!("intro {}", names.join(" ")));
+                cur = body;
+            }
+            ExprNode::BinOp { op: BinOp::Implies, rhs, .. } => {
+                steps.push("intro _".to_string());
+                cur = rhs;
+            }
+            ExprNode::Let { name, value, body } => {
+                // The wrapper's body var is SpanMark-wrapped on real
+                // (rust-annotated) goals — unwrap before comparing.
+                let b = peel_spans(body);
+                if matches!(&b.node, ExprNode::Var(n) if n.as_str() == name.as_str()) {
+                    // Trailing wrapper: look through to the value.
+                    cur = value;
+                } else {
+                    steps.push(format!("intro {0}; subst {0}", name.as_str()));
+                    cur = body;
+                }
+            }
+            _ => break,
+        }
+    }
+    (steps, cur)
+}
+
+/// N3 form B target detection: the goal core is an `Eq`/`Iff` whose
+/// LHS is an application of a RECURSIVE spec fn; return its full Lean
+/// name. Only the LHS head qualifies: that is the position `rw [f]`'s
+/// first-match instantiation hits (probe `pmul_conv.lean`), keeping
+/// the rewrite exactly one measured step.
+pub(crate) fn recursive_lhs_head<'a>(core: &'a Expr, dts: &DtDefInventory) -> Option<&'a str> {
+    // Real goals arrive annotated: `(eq : Prop)` around the whole
+    // obligation, SpanMarks from the source mapping. Both are
+    // transparent at the Lean level; look through them.
+    fn peel_transparent(mut e: &Expr) -> &Expr {
+        loop {
+            match &e.node {
+                ExprNode::SpanMark { inner, .. } => e = inner,
+                ExprNode::TypeAnnot { expr, .. } => e = expr,
+                _ => return e,
+            }
+        }
+    }
+    match &peel_transparent(core).node {
+        ExprNode::BinOp { op: BinOp::Eq | BinOp::Iff, lhs, .. } => {
+            match &peel_transparent(lhs).node {
+                ExprNode::App { head, .. } => {
+                    // The head may be a nested curried App or an
+                    // annotated/wrapped Var — walk to the root.
+                    let mut h = peel_transparent(head);
+                    while let ExprNode::App { head: inner, .. } = &h.node {
+                        h = peel_transparent(inner);
+                    }
+                    match &h.node {
+                        ExprNode::Var(n) if dts.recursive_spec_fns.contains(n.as_str()) => {
+                            Some(n.as_str())
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Pass-1/2 scan shared by `structural_rung` and `rung_tail`.
@@ -353,7 +758,12 @@ fn run_structural_scan<'a>(
 /// equation-eliminator arms — no intros, no cases: leg goals have
 /// their own spines and the repro-validated leg form is the bare
 /// simp ladder).
-fn simp_tail_from_unfolds(unfolds: &mut Vec<String>, scan: &StructuralScan) -> String {
+/// The merged simp LIST from an already-collected unfold set plus the
+/// scan's injEq derivation: CORE + structural extras + unfolds, sorted
+/// and deduped. Shared by `simp_tail_from_unfolds` (the structural
+/// `… <;> omega` tail) and the N3-M1 form E arm (the same normalizer
+/// as a phase-1 for the guarded split).
+fn simp_list_from_unfolds(unfolds: &mut Vec<String>, scan: &StructuralScan) -> String {
     for t in &scan.mentioned_types {
         if let Some(vs) = scan.dts.variants.get(t) {
             for v in vs {
@@ -363,20 +773,59 @@ fn simp_tail_from_unfolds(unfolds: &mut Vec<String>, scan: &StructuralScan) -> S
     }
     unfolds.sort();
     unfolds.dedup();
-    let simp_list = if unfolds.is_empty() {
+    if unfolds.is_empty() {
         format!("{}, {}", CORE_LEMMAS, STRUCTURAL_EXTRA_LEMMAS)
     } else {
         format!("{}, {}, {}", CORE_LEMMAS, STRUCTURAL_EXTRA_LEMMAS, unfolds.join(", "))
-    };
-    format!("simp_all +zetaDelta only [{}] <;> omega", simp_list)
+    }
+}
+
+/// The `simp_all … <;> omega` tail from an already-sorted unfold
+/// list plus the scan's injEq derivation. Shared by
+/// `structural_rung` (full rung) and `rung_tail` (legs of the
+/// equation-eliminator arms — no intros, no cases: leg goals have
+/// their own spines and the repro-validated leg form is the bare
+/// simp ladder).
+fn simp_tail_from_unfolds(unfolds: &mut Vec<String>, scan: &StructuralScan) -> String {
+    format!("simp_all +zetaDelta only [{}] <;> omega", simp_list_from_unfolds(unfolds, scan))
 }
 
 /// Leg ladder for eliminator arms: the structural simp tail alone.
 fn rung_tail(goal: &Expr, dts: &DtDefInventory, binders: &[Binder]) -> String {
     let scan = run_structural_scan(goal, dts, binders);
+    let mut unfolds: Vec<String> = goal_unfold_names(goal, dts, binders);
+    simp_tail_from_unfolds(&mut unfolds, &scan)
+}
+
+/// The goal-mentioned unfold names (non-recursive spec fns, trait
+/// methods, generated datatype defs) — sorted, deduped. Shared by the
+/// form E arm, the structural rung, and the N3-M2 script author
+/// (`UnfoldSet` / `StructuralTail`).
+pub(crate) fn goal_unfold_names(goal: &Expr, dts: &DtDefInventory, binders: &[Binder]) -> Vec<String> {
+    let scan = run_structural_scan(goal, dts, binders);
     let mut unfolds: Vec<String> = scan.unfolds.iter().cloned().collect();
     unfolds.extend(scan.mentioned_spec_fns.iter().cloned());
-    simp_tail_from_unfolds(&mut unfolds, &scan)
+    unfolds.extend(scan.mentioned_trait_methods.iter().cloned());
+    // N3 recursive-unfold law for NON-recursive fns: close over body
+    // references so a one-level unfold never strands the goal one def
+    // short of a finishable form (denom → denom_nat). Recursive fns
+    // are never targets (they're not in the map's values by
+    // construction — the loop law). Bounded by the map's size.
+    let mut seen: std::collections::HashSet<String> = unfolds.iter().cloned().collect();
+    let mut work: Vec<String> = unfolds.clone();
+    while let Some(f) = work.pop() {
+        if let Some(refs) = dts.spec_fn_body_refs.get(&f) {
+            for r in refs {
+                if seen.insert(r.clone()) {
+                    unfolds.push(r.clone());
+                    work.push(r.clone());
+                }
+            }
+        }
+    }
+    unfolds.sort();
+    unfolds.dedup();
+    unfolds
 }
 
 /// True when the goal's core — after peeling the leading ∀-binder /
@@ -392,6 +841,92 @@ fn goal_core_is_equation(goal: &Expr) -> bool {
             ExprNode::BinOp { op: BinOp::Implies, rhs, .. } => cur = rhs,
             ExprNode::BinOp { op: BinOp::Eq | BinOp::Iff | BinOp::Ne, .. } => return true,
             _ => return false,
+        }
+    }
+}
+
+/// The goal core's application head symbol: the same spine peel
+/// `goal_core_is_equation` uses, then transparent-peel and the
+/// curried-App walk to the root Var — for ANY application core (not
+/// just equation LHSes). Drives the form G gate in `derived_closer`
+/// (trait-projection-headed Prop goals).
+fn goal_core_app_head(goal: &Expr) -> Option<&str> {
+    fn peel_transparent(mut e: &Expr) -> &Expr {
+        loop {
+            match &e.node {
+                ExprNode::SpanMark { inner, .. } => e = inner,
+                ExprNode::TypeAnnot { expr, .. } => e = expr,
+                _ => return e,
+            }
+        }
+    }
+    let mut cur = goal;
+    loop {
+        match &cur.node {
+            ExprNode::SpanMark { inner, .. } => cur = inner,
+            ExprNode::Forall { body, .. } => cur = body,
+            ExprNode::Let { body, .. } => cur = body,
+            ExprNode::BinOp { op: BinOp::Implies, rhs, .. } => cur = rhs,
+            _ => {
+                let c = peel_transparent(cur);
+                return match &c.node {
+                    ExprNode::App { .. } => {
+                        let mut h = c;
+                        while let ExprNode::App { head: inner, .. } = &h.node {
+                            h = peel_transparent(inner);
+                        }
+                        match &h.node {
+                            ExprNode::Var(n) => Some(n.as_str()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+            }
+        }
+    }
+}
+
+/// The goal core's equation-LHS head symbol: the same spine peel
+/// `goal_core_is_equation` uses, then the App-head walk of
+/// `recursive_lhs_head` (transparent-peel, curried-App walk to the root
+/// Var). `Some(name)` only for an application LHS rooted at a Var;
+/// anything else (non-equation core, bare-var LHS, non-Var head) is
+/// `None`. Drives the eliminator apply-guard in `derived_closer` — a
+/// `None` keeps the arm (unknown → conservative).
+fn equation_lhs_head_name(goal: &Expr) -> Option<&str> {
+    fn peel_transparent(mut e: &Expr) -> &Expr {
+        loop {
+            match &e.node {
+                ExprNode::SpanMark { inner, .. } => e = inner,
+                ExprNode::TypeAnnot { expr, .. } => e = expr,
+                _ => return e,
+            }
+        }
+    }
+    let mut cur = goal;
+    loop {
+        match &cur.node {
+            ExprNode::SpanMark { inner, .. } => cur = inner,
+            ExprNode::Forall { body, .. } => cur = body,
+            ExprNode::Let { body, .. } => cur = body,
+            ExprNode::BinOp { op: BinOp::Implies, rhs, .. } => cur = rhs,
+            ExprNode::BinOp { op: BinOp::Eq | BinOp::Iff | BinOp::Ne, lhs, .. } => {
+                return match &peel_transparent(lhs).node {
+                    ExprNode::App { .. } => {
+                        let mut h = peel_transparent(lhs);
+                        while let ExprNode::App { head: inner, .. } = &h.node {
+                            h = peel_transparent(inner);
+                        }
+                        match &h.node {
+                            ExprNode::Var(n) => Some(n.as_str()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+            }
+            _ => return None,
         }
     }
 }
@@ -416,6 +951,15 @@ pub(crate) struct DtDefInventory {
     /// equation-vs-equation goals, which need injectivity (and
     /// `reduceCtorEq` disjointness) to resolve under `simp_all only`.
     pub variants: std::collections::HashMap<String, Vec<String>>,
+    /// Full Lean names of the crate's TRAIT METHOD DECLS (rendered as
+    /// Lean class projections, e.g. `repro.Foo.foo_le`). A
+    /// goal-mentioned trait method joins the unfold list: impl
+    /// obligation goals are stated against the bare projection
+    /// (`⊢ Foo.foo_le a a` at the impl type), and `simp only
+    /// [Foo.foo_le]` reduces it through the registered instance to
+    /// the impl body (Lean's projection simproc — hand-validated,
+    /// instance name itself not needed). B6 mode-(b) closer half.
+    pub trait_methods: std::collections::HashSet<String>,
     /// Full Lean names of the crate's SPEC fns (defs the emitter
     /// generates). A goal-mentioned spec fn joins the structural
     /// rung's unfold list: N1 hoisting turns goal-position lets into
@@ -424,6 +968,22 @@ pub(crate) struct DtDefInventory {
     /// by defeq; `(h : r = {a := 0}) ⊢ sview r = 0` needs `sview`
     /// unfolded by simp). Derived: only goal-mentioned names enter.
     pub spec_fns: std::collections::HashSet<String>,
+    /// Full Lean names of the crate's RECURSIVE spec fns (bodies with
+    /// a nonempty `decreases`). These can NEVER ride a simp set — the
+    /// equation lemma's RHS contains the recursive call, which
+    /// re-matches to an uncatchable maxRecDepth (the N3 loop law;
+    /// probe `probe-n3-scripts/pmul_conv.lean`). They are the
+    /// `UnfoldOnce` rung-arm's `rw` targets instead: a goal whose Eq
+    /// core has one of these as its LHS head gets one measured
+    /// rewrite step (form B). They are deliberately NOT in `spec_fns`
+    /// (the non-recursive filter, kept permanently).
+    pub recursive_spec_fns: std::collections::HashSet<String>,
+    /// Non-recursive spec fn → the non-recursive spec fns its body
+    /// references. `goal_unfold_names` closes over this so the unfold
+    /// reaches a finishable form (denom → denom_nat; N3's
+    /// recursive-unfold law for NON-recursive fns — recursive fns are
+    /// never targets, see `recursive_spec_fns`).
+    pub spec_fn_body_refs: std::collections::HashMap<String, Vec<String>>,
 }
 
 /// The STRUCTURAL rung (2026-07-17, the squeeze-regression fix): the
@@ -480,9 +1040,8 @@ pub(crate) fn structural_rung(
     steps.push("intros".to_string());
     let prefix = steps.join("; ");
 
-    let mut unfolds: Vec<String> = scan.unfolds.iter().cloned().collect();
+    let mut unfolds: Vec<String> = goal_unfold_names(goal, dts, binders);
     // (constructor .injEq derivation lives in simp_tail_from_unfolds)
-    unfolds.extend(scan.mentioned_spec_fns.iter().cloned());
     unfolds.sort();
     let tail = simp_tail_from_unfolds(&mut unfolds, &scan);
 
@@ -539,6 +1098,7 @@ struct StructuralScan<'a> {
     dts: &'a DtDefInventory,
     mentioned_types: std::collections::HashSet<String>,
     mentioned_spec_fns: std::collections::HashSet<String>,
+    mentioned_trait_methods: std::collections::HashSet<String>,
     unfolds: std::collections::BTreeSet<String>,
     targets: Vec<String>,
     targets_seen: std::collections::HashSet<String>,
@@ -550,6 +1110,7 @@ impl<'a> StructuralScan<'a> {
             dts,
             mentioned_types: Default::default(),
             mentioned_spec_fns: Default::default(),
+            mentioned_trait_methods: Default::default(),
             unfolds: Default::default(),
             targets: Vec::new(),
             targets_seen: Default::default(),
@@ -572,6 +1133,9 @@ impl<'a> StructuralScan<'a> {
             }
             if self.dts.spec_fns.contains(s) {
                 self.mentioned_spec_fns.insert(s.to_string());
+            }
+            if self.dts.trait_methods.contains(s) {
+                self.mentioned_trait_methods.insert(s.to_string());
             }
         }
         e.for_each_child(&mut |c| self.collect_mentioned_types(c));
@@ -1018,3 +1582,796 @@ fn is_lit(e: &Expr) -> bool {
 #[cfg(test)]
 #[path = "tests/tactic_select.rs"]
 mod tests;
+
+// ────────────────────────────────────────────────────────────────────
+// The nonlinear ladder (the Rational story, R2)
+// ────────────────────────────────────────────────────────────────────
+
+/// Marker text planted in the PRIMARY slot of a `by(nonlinear_arith)`
+/// AssertQuery scope's composed closer (sst_to_lean.rs's AssertQuery
+/// walker). `emit_with_extras` substitutes `nonlin_ladder(goal,
+/// binders)` per theorem — the scope composes once but the multiplier
+/// pool is goal-specific. If it ever leaks into an artifact it fails
+/// LOUD (unknown identifier) — substitution is total.
+pub(crate) const NONLIN_MARKER: &str = "tactus_nonlin_marker__";
+
+/// The `by(nonlinear_arith)` primary, per-goal form. Bare `nlinarith`
+/// cannot multiply hypotheses by atoms (empirically pinned
+/// 2026-07-19: it closes single-step identities and pure inequality
+/// chains, and fails every equality chain/congruence in the Rational
+/// instance). The ladder:
+///
+/// 1. `nlinarith [pool]` where pool = the context's arithmetic hyps
+///    PLUS each Int-Eq hyp congrArg-multiplied by each goal-mentioned
+///    Int atom (binder-typed Int vars + `Rational.denom` applications
+///    — the only structurally Int-known terms). The transitivity /
+///    congruence certificates live in that pool.
+/// 2. For Eq goals with a denominator positivity hyp in context: the
+///    `mul_eq_zero` cancel — `D * (lhs - rhs) = 0` by nlinarith over
+///    the same pool, then `resolve_left (by omega : D ≠ 0)`.
+/// 3. For denominator-positivity goals themselves: unfold
+///    `Rational.denom`/`denom_nat` (den = den+1, positive by
+///    construction) and omega.
+///
+/// Everything is derived from the goal text + binder types — no
+/// ambient-scope reads, deterministic, and each branch fails fast.
+pub(crate) fn nonlin_ladder(goal: &Expr, binders: &[Binder]) -> String {
+    let hyps = arith_hyps(binders);
+    let mut multipliers = int_atoms(goal, binders);
+    // The definition hyps carry the BASE atoms the goal's derived atoms
+    // rewrite to (`denom ac` rewrites to `denom a * denom c` — `dc`
+    // never appears in the goal text, but the certificate needs it).
+    for h in &hyps {
+        collect_denom_apps(&h.lhs, &mut multipliers);
+        collect_denom_apps(&h.rhs, &mut multipliers);
+    }
+    multipliers.sort();
+    multipliers.dedup();
+    multipliers.truncate(8);
+    // congrArg-multiply each Int-Eq hyp by each multiplier (capped),
+    // rendering the have's TYPE as the beta-reduced multiplied form
+    // (a bare congrArg leaves the lambda unreduced — nlinarith then
+    // treats the fact as an opaque application and misses the proof).
+    // The sides MUST be parenthesized: `(X + Y) * d` vs the bare
+    // `X + Y * d` parse is not defeq, and the mismatch fails the
+    // have's elaboration, killing the whole primary arm (surfaced by
+    // the NONLIN hoist, which first let SUM-rhs hyps into the pool —
+    // axiom_add_inverse_right, 2026-07-20).
+    //
+    // THE RULE (the ladder's statable contract): every Int equation
+    // hypothesis is also presented to nlinarith multiplied by each
+    // goal/hyp-mentioned Int atom, in emission order, up to 8 atoms
+    // (`multipliers.truncate(8)`) and 12 haves (`count >= 12`). The
+    // caps are a deliberate, documented budget boundary — the cap-free
+    // computed arms (R1–R4) stand behind them. Experiment
+    // (TACTUS_NONLIN_NO_POOL=1, 2026-07-20): this arm carries 132
+    // obligations across ~45 fns; it is the ladder's workhorse, one
+    // deterministic tactic call with visible inputs — not a menu.
+    let mut pool: Vec<String> = hyps.iter().map(|h| h.name.clone()).collect();
+    let mut pre: Vec<String> = Vec::new();
+    let mut count = 0usize;
+    for h in &hyps {
+        if !h.is_eq {
+            continue;
+        }
+        for d in &multipliers {
+            if count >= 12 {
+                break;
+            }
+            let ml = crate::lean_pp::pp_expr(&h.lhs);
+            let mr = crate::lean_pp::pp_expr(&h.rhs);
+            pre.push(format!(
+                "have _m{count} : ({ml}) * {d} = ({mr}) * {d} := congrArg (fun t : Int => t * {d}) {h}",
+                count = count,
+                ml = ml,
+                mr = mr,
+                d = d,
+                h = h.name
+            ));
+            pool.push(format!("_m{}", count));
+            count += 1;
+        }
+    }
+    let pool_text = if pool.is_empty() { "[]".to_string() } else { format!("[{}]", pool.join(", ")) };
+    let pre_text = if pre.is_empty() { String::new() } else { format!("{}; ", pre.join("; ")) };
+    // EXPERIMENT (2026-07-20, Danielle's infra review): the pool arm is
+    // the last bounded-search component in the ladder — each Int-Eq hyp
+    // multiplied by each of ≤8 goal/atom atoms, capped at 12 haves,
+    // handed to nlinarith's internal certificate search. Whether the
+    // winner is inside the cap decides success, which is exactly the
+    // luck-bounded shape the quotient derivation replaced.
+    // TACTUS_NONLIN_NO_POOL=1 disables the arm so the corpus can name
+    // its true dependents; the computed arms (cancel, R1–R4) are the
+    // intended successors.
+    let mut branches: Vec<String> = if std::env::var("TACTUS_NONLIN_NO_POOL").is_err() {
+        vec![format!("({}nlinarith {})", pre_text, pool_text)]
+    } else {
+        Vec::new()
+    };
+    // Cancel branch for equality goals with a positivity hyp.
+    if let Some((d, lhs, rhs)) = cancel_target(goal, binders) {
+        branches.push(format!(
+            "({}have _e : ({d} : Int) ≠ 0 := (by omega); \
+             have _z : {d} * (({lhs}) - ({rhs})) = 0 := (by nlinarith {pool}); \
+             have _r := (mul_eq_zero.mp _z).resolve_left _e; \
+             nlinarith [_r])",
+            pre_text,
+            d = d,
+            lhs = crate::lean_pp::pp_expr(lhs),
+            rhs = crate::lean_pp::pp_expr(rhs),
+            pool = pool_text
+        ));
+    }
+    // Certificate computation (the cross-multiply family; probes
+    // t12/t21–t24, 2026-07-20). NO search: every branch is a computed
+    // certificate or is not emitted at all (the transparency /
+    // predictability law — statable rules, loud failure otherwise;
+    // the monomial MENU this replaces was luck-bounded search).
+    //
+    // The comparison hyps partition into:
+    //   DEFINITION hyps — an atom (projection or spec application)
+    //     equal to anything, occurring in the goal → `rw` material.
+    //   KERNEL hyps — equations/inequalities between products →
+    //     certificate seeds.
+    //   positivity (`D > 0`) / nonneg (`x ≥ 0`) hyps → sign proofs
+    //     for inequality multipliers.
+    //
+    // R1 (base): with ≥1 definition hyp, `rw` them into the goal and
+    // try `nlinarith []` — a hyp-free ring identity needs no kernel
+    // (mul_distributes_left).
+    //
+    // R2 (eq quotient): for an eq kernel K, the certificate is the
+    // UNIQUE monomial M making K's left side divide the (rewritten)
+    // goal's left side, requiring the same M on the right
+    // (`quotient_monomial` — multiset difference, not enumeration);
+    // `congrArg (· * M) K`, then nlinarith.
+    //
+    // R3 (le quotient): the same M for a ≤ kernel against a ≤ goal,
+    // via `mul_le_mul_of_nonneg_right` with the nonneg proof read off
+    // M's shape (`nonneg_proof`: a square, or atoms carrying hyps).
+    //
+    // R4 (two-sided congruence): a ≤ goal, ≥1 eq kernel and ≥1 ≤
+    // kernel, all over positivity-covered atoms. Each fact is
+    // multiplied by the denominators it does NOT mention; the
+    // inequality's own denominators are the cancel factor K
+    // (`mul_le_mul_iff_left₀`). le_congruence is the shape.
+    let mut rewrites: Vec<&ArithHyp> = Vec::new();
+    let mut eq_kernels: Vec<&ArithHyp> = Vec::new();
+    let mut le_kernels: Vec<(String, Expr, Expr)> = Vec::new(); // normalized ≤
+    let mut pos_atoms: Vec<(String, String)> = Vec::new(); // (atom pp, hyp name)
+    let mut ge0_atoms: Vec<(String, String)> = Vec::new();
+    for h in &hyps {
+        match h.op {
+            crate::lean_ast::BinOp::Eq => {
+                let lhs_pp = crate::lean_pp::pp_expr(&h.lhs);
+                let rhs_pp = crate::lean_pp::pp_expr(&h.rhs);
+                let is_atom_lhs = match &h.lhs.node {
+                    ExprNode::FieldProj { .. } => true,
+                    ExprNode::App { head, .. } => matches!(&head.node, ExprNode::Var(_)),
+                    _ => false,
+                };
+                if is_atom_lhs && !rhs_pp.contains(&*lhs_pp) && goal_mentions_pp(goal, &lhs_pp) {
+                    rewrites.push(h);
+                } else if matches!(&h.lhs.node, ExprNode::BinOp { .. }) {
+                    eq_kernels.push(h);
+                }
+            }
+            crate::lean_ast::BinOp::Le => {
+                le_kernels.push((h.name.clone(), h.lhs.clone(), h.rhs.clone()))
+            }
+            crate::lean_ast::BinOp::Ge => {
+                if is_zero_lit(&h.rhs) {
+                    ge0_atoms.push((crate::lean_pp::pp_expr(&h.lhs), h.name.clone()));
+                } else {
+                    le_kernels.push((h.name.clone(), h.rhs.clone(), h.lhs.clone()));
+                }
+            }
+            crate::lean_ast::BinOp::Gt if is_zero_lit(&h.rhs) => {
+                pos_atoms.push((crate::lean_pp::pp_expr(&h.lhs), h.name.clone()))
+            }
+            crate::lean_ast::BinOp::Lt if is_zero_lit(&h.lhs) => {
+                pos_atoms.push((crate::lean_pp::pp_expr(&h.rhs), h.name.clone()))
+            }
+            _ => {}
+        }
+    }
+    let rw_list = rewrites.iter().map(|h| h.name.clone()).collect::<Vec<_>>().join(", ");
+    let rw_prefix = if rw_list.is_empty() {
+        String::new()
+    } else {
+        format!("rw [{}]; ", rw_list)
+    };
+    // R1 (base): rewrite-and-ring.
+    if !rewrites.is_empty() {
+        branches.push(format!("(rw [{}]; nlinarith [])", rw_list));
+    }
+    // The goal's comparison core, normalized to ≤ for inequality work.
+    let core = comparison_core(goal);
+    // Substituted (definition-folded) goal sides for quotient
+    // computation — mirrors the tactic's `rw`, so certificates are
+    // computed against the goal the closer actually sees.
+    let subst_pairs: Vec<(String, &Expr)> = rewrites
+        .iter()
+        .map(|h| (crate::lean_pp::pp_expr(&h.lhs), &h.rhs))
+        .collect();
+    if let Some((gop, glhs, grhs)) = core {
+        let (ngl, ngr): (&Expr, &Expr) = match gop {
+            crate::lean_ast::BinOp::Ge => (grhs, glhs),
+            _ => (glhs, grhs),
+        };
+        let (sl, sr) = if subst_pairs.is_empty() {
+            (ngl.clone(), ngr.clone())
+        } else {
+            (subst_atoms(ngl, &subst_pairs), subst_atoms(ngr, &subst_pairs))
+        };
+        let gl = monomials(&sl);
+        let gr = monomials(&sr);
+        // R2 (eq quotient).
+        if matches!(gop, crate::lean_ast::BinOp::Eq) {
+            for k in &eq_kernels {
+                let kl = monomials(&k.lhs);
+                let kr = monomials(&k.rhs);
+                if let Some(m) = quotient_monomial(&gl, &gr, &kl, &kr) {
+                    let m_pp = m.join(" * ");
+                    branches.push(format!(
+                        "({}have _k : ({}) * ({}) = ({}) * ({}) := \
+                           congrArg (fun t : Int => t * ({})) {}; \
+                         nlinarith [_k])",
+                        rw_prefix,
+                        crate::lean_pp::pp_expr(&k.lhs),
+                        m_pp,
+                        crate::lean_pp::pp_expr(&k.rhs),
+                        m_pp,
+                        m_pp,
+                        k.name,
+                    ));
+                }
+            }
+        }
+        // R3 (le quotient).
+        if matches!(gop, crate::lean_ast::BinOp::Le | crate::lean_ast::BinOp::Ge) {
+            for (kn, klhs, krhs) in &le_kernels {
+                let kl = monomials(klhs);
+                let kr = monomials(krhs);
+                if let Some(m) = quotient_monomial(&gl, &gr, &kl, &kr) {
+                    if let Some(proof) = nonneg_proof(&m, &pos_atoms, &ge0_atoms) {
+                        let m_pp = m.join(" * ");
+                        branches.push(format!(
+                            "({}have _p : ({}) * ({}) ≤ ({}) * ({}) := \
+                               mul_le_mul_of_nonneg_right {} {}; \
+                             nlinarith [_p])",
+                            rw_prefix,
+                            crate::lean_pp::pp_expr(klhs),
+                            m_pp,
+                            crate::lean_pp::pp_expr(krhs),
+                            m_pp,
+                            kn,
+                            proof,
+                        ));
+                    }
+                }
+            }
+        }
+        // R4 (two-sided congruence): disjoint-atom chains.
+        if matches!(gop, crate::lean_ast::BinOp::Le | crate::lean_ast::BinOp::Ge)
+            && !le_kernels.is_empty()
+            && !eq_kernels.is_empty()
+            && !pos_atoms.is_empty()
+        {
+            let atom_set = |e1: &Expr, e2: &Expr| -> std::collections::BTreeSet<String> {
+                monomials(e1).into_iter().chain(monomials(e2)).flatten().collect()
+            };
+            let denom_set = |e1: &Expr, e2: &Expr| -> std::collections::BTreeSet<String> {
+                atom_set(e1, e2)
+                    .into_iter()
+                    .filter(|a| a.starts_with("lib.Rational.denom "))
+                    .collect()
+            };
+            let pos_set: std::collections::BTreeSet<String> =
+                pos_atoms.iter().map(|(a, _)| a.clone()).collect();
+            // Coverage asks about DENOMINATOR atoms only: the nums are
+            // exchanged between the eq kernels (they never cancel), so
+            // they need no positivity hyps. The complement computation
+            // subtracts from pos_set, so it already yields denoms only.
+            let covered = eq_kernels.iter().all(|k| denom_set(&k.lhs, &k.rhs).is_subset(&pos_set))
+                && le_kernels.iter().all(|(_, l, r)| denom_set(l, r).is_subset(&pos_set));
+            if covered {
+                let mut certs: Vec<String> = Vec::new();
+                let mut cert_names: Vec<String> = Vec::new();
+                let mut idx = 0usize;
+                let mut ok = true;
+                for k in &eq_kernels {
+                    let comp: Vec<String> =
+                        pos_set.difference(&atom_set(&k.lhs, &k.rhs)).cloned().collect();
+                    if comp.is_empty() {
+                        continue; // the bare kernel is already in context
+                    }
+                    let m_pp = comp.join(" * ");
+                    certs.push(format!(
+                        "have _c{} : ({}) * ({}) = ({}) * ({}) := \
+                           congrArg (fun t : Int => t * ({})) {}",
+                        idx,
+                        crate::lean_pp::pp_expr(&k.lhs),
+                        m_pp,
+                        crate::lean_pp::pp_expr(&k.rhs),
+                        m_pp,
+                        m_pp,
+                        k.name,
+                    ));
+                    cert_names.push(format!("_c{}", idx));
+                    idx += 1;
+                }
+                for (kn, klhs, krhs) in &le_kernels {
+                    let comp: Vec<String> =
+                        pos_set.difference(&atom_set(klhs, krhs)).cloned().collect();
+                    if comp.is_empty() {
+                        continue;
+                    }
+                    match nonneg_proof(&comp, &pos_atoms, &ge0_atoms) {
+                        Some(proof) => {
+                            let m_pp = comp.join(" * ");
+                            certs.push(format!(
+                                "have _c{} : ({}) * ({}) ≤ ({}) * ({}) := \
+                                   mul_le_mul_of_nonneg_right {} {}",
+                                idx,
+                                crate::lean_pp::pp_expr(klhs),
+                                m_pp,
+                                crate::lean_pp::pp_expr(krhs),
+                                m_pp,
+                                kn,
+                                proof,
+                            ));
+                            cert_names.push(format!("_c{}", idx));
+                            idx += 1;
+                        }
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    // K: the le kernel's own DENOMINATOR atoms (the
+                    // nums are what the eq kernels exchange). One
+                    // branch per le kernel as the K choice.
+                    for (_, klhs, krhs) in &le_kernels {
+                        let k_atoms: Vec<String> = atom_set(klhs, krhs)
+                            .into_iter()
+                            .filter(|a| a.starts_with("lib.Rational.denom "))
+                            .collect();
+                        if k_atoms.is_empty() {
+                            continue;
+                        }
+                        let mut kp: Option<String> = None;
+                        let mut k_ok = true;
+                        for a in &k_atoms {
+                            match pos_atoms.iter().find(|(pa, _)| pa == a) {
+                                Some((_, h)) => {
+                                    kp = Some(match kp {
+                                        None => h.clone(),
+                                        Some(p) => format!("(mul_pos {} {})", p, h),
+                                    });
+                                }
+                                None => {
+                                    k_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !k_ok {
+                            continue;
+                        }
+                        let k_pp = k_atoms.join(" * ");
+                        branches.push(format!(
+                            "({}; \
+                             have _chain : ({}) * ({}) ≤ ({}) * ({}) := \
+                               (by nlinarith [{}]); \
+                             have _K : (0 : Int) < {} := {}; \
+                             exact (mul_le_mul_iff_left₀ _K).mp _chain)",
+                            certs.join("; "),
+                            crate::lean_pp::pp_expr(&sl),
+                            k_pp,
+                            crate::lean_pp::pp_expr(&sr),
+                            k_pp,
+                            cert_names.join(", "),
+                            k_pp,
+                            kp.unwrap(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    // Denominator-positivity branch.
+    if is_denom_positivity_goal(goal) {
+        branches.push(
+            "(simp only [lib.Rational.denom, lib.Rational.denom_nat]; omega)".to_string(),
+        );
+    }
+    format!("first | {}", branches.join(" | "))
+}
+
+/// One arithmetic hypothesis from the theorem binders: a binder whose
+/// type is an Int-typed comparison/equation. Carries the sides for
+/// the congrArg-multiply rendering (the have's explicit type must be
+/// the beta-reduced multiplied form — a bare `congrArg (fun t => t*d)
+/// h` leaves the lambda unreduced and nlinarith can't see through it).
+/// `is_eq` is Eq ONLY: `congrArg` needs a genuine equation — a `≠`
+/// hyp makes the have fail elaboration (wasted arm; the rewrite-ladder
+/// partition also keys on it).
+struct ArithHyp {
+    name: String,
+    is_eq: bool,
+    op: crate::lean_ast::BinOp,
+    lhs: Expr,
+    rhs: Expr,
+}
+
+fn arith_hyps(binders: &[Binder]) -> Vec<ArithHyp> {
+    let mut out = Vec::new();
+    for b in binders {
+        let Some(name) = &b.name else { continue };
+        let mut t = &b.ty;
+        while let ExprNode::SpanMark { inner, .. } = &t.node {
+            t = inner;
+        }
+        if let ExprNode::BinOp { op, lhs, rhs } = &t.node {
+            use crate::lean_ast::BinOp::*;
+            // `is_eq` gates congrArg use — and congrArg is a TYPE
+            // CHECK: the multiplier lambda is `fun t : Int => …`, so a
+            // Rational- or Nat-valued equation hyp (`l = add_spec …`,
+            // `a.den = …`) makes the have fail ELABORATION, poisoning
+            // the whole primary arm (the NONLIN-hoist exposed this:
+            // hoisted `_h_*_hoist1` Rational-Eq binders joined the pool
+            // and axiom_add_associative's primary died on `l * denom l
+            // : Int`). Eq ONLY, both sides structurally Int.
+            let is_eq = matches!(op, Eq)
+                && int_arith_sides(binders, lhs)
+                && int_arith_sides(binders, rhs);
+            if is_eq || matches!(op, Ne | Le | Lt | Ge | Gt) {
+                out.push(ArithHyp {
+                    name: name.as_str().to_string(),
+                    is_eq,
+                    op: *op,
+                    lhs: lhs.as_ref().clone(),
+                    rhs: rhs.as_ref().clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Does `needle` (pp text) occur as a subterm of `goal`? Structural
+/// occurrence via pp-equality at each node (Expr carries no PartialEq;
+/// a bare substring check on the goal's pp is unsound —
+/// `lib.Rational.denom a` is a prefix of `lib.Rational.denom ac`).
+/// Used by the rewrite-ladder to keep only definition hyps whose atom
+/// actually appears in the goal (`rw` on a missing pattern fails the
+/// whole branch).
+fn goal_mentions_pp(goal: &Expr, needle_pp: &str) -> bool {
+    if crate::lean_pp::pp_expr(goal) == needle_pp {
+        return true;
+    }
+    let mut found = false;
+    goal.for_each_child(|c| found = found || goal_mentions_pp(c, needle_pp));
+    found
+}
+
+/// The goal's comparison core (`Eq` / `Le` / `Ge`), peeling the
+/// ∀/let/implication spine and annotations — the same peel
+/// `goal_core_is_equation` uses, returning the sides.
+fn comparison_core(goal: &Expr) -> Option<(crate::lean_ast::BinOp, &Expr, &Expr)> {
+    let mut cur = goal;
+    loop {
+        match &cur.node {
+            ExprNode::SpanMark { inner, .. } => cur = inner,
+            ExprNode::TypeAnnot { expr, .. } => cur = expr,
+            ExprNode::Forall { body, .. } => cur = body,
+            ExprNode::Let { body, .. } => cur = body,
+            ExprNode::BinOp { op: BinOp::Implies, rhs, .. } => cur = rhs,
+            ExprNode::BinOp { op: op @ (BinOp::Eq | BinOp::Le | BinOp::Ge), lhs, rhs } => {
+                return Some((*op, lhs, rhs));
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Is `e` the literal `0` (through SpanMarks)? The `D > 0` / `x ≥ 0`
+/// positivity-hyp shape.
+fn is_zero_lit(e: &Expr) -> bool {
+    match &e.node {
+        ExprNode::Lit(n) => n == "0",
+        ExprNode::SpanMark { inner, .. } => is_zero_lit(inner),
+        _ => false,
+    }
+}
+
+/// Replace every subterm of `e` that pp-matches a rewrite lhs with the
+/// corresponding rhs (the emitter-side mirror of the tactic's `rw`,
+/// used to compute certificates against the goal the closer actually
+/// sees). Literal whole-node replacement: a match drops the node's
+/// own SpanMarks, which is harmless for certificate computation.
+fn subst_atoms(e: &Expr, rewrites: &[(String, &Expr)]) -> Expr {
+    let pp = crate::lean_pp::pp_expr(e);
+    for (lhs_pp, rhs) in rewrites {
+        if pp == *lhs_pp {
+            return (*rhs).clone();
+        }
+    }
+    Expr::new(crate::lean_ast::map_children(&e.node, |c| subst_atoms(c, rewrites)))
+}
+
+/// Distribute an Int arithmetic expression into its monomials: a list
+/// of sorted atom multisets (pp strings). Signs are flattened away
+/// (Sub unions like Add; the certificate's ring check verifies the
+/// signed whole), literal factors contribute the unit monomial, and
+/// anything non-arithmetic is one opaque atom.
+fn monomials(e: &Expr) -> Vec<Vec<String>> {
+    match &e.node {
+        ExprNode::SpanMark { inner, .. } => monomials(inner),
+        ExprNode::TypeAnnot { expr, .. } => monomials(expr),
+        ExprNode::BinOp { op: BinOp::Add | BinOp::Sub, lhs, rhs } => {
+            let mut out = monomials(lhs);
+            out.extend(monomials(rhs));
+            out
+        }
+        ExprNode::BinOp { op: BinOp::Mul, lhs, rhs } => {
+            let l = monomials(lhs);
+            let r = monomials(rhs);
+            let mut out = Vec::new();
+            for m1 in &l {
+                for m2 in &r {
+                    let mut m = m1.clone();
+                    m.extend(m2.iter().cloned());
+                    m.sort();
+                    out.push(m);
+                }
+            }
+            out
+        }
+        ExprNode::UnOp { arg, .. } => monomials(arg),
+        ExprNode::Lit(_) => vec![Vec::new()],
+        _ => vec![vec![crate::lean_pp::pp_expr(e)]],
+    }
+}
+
+/// Multiset difference: `big − small` when `small ⊆ big` (both sorted
+/// or not — position-wise removal), else `None`.
+fn multiset_diff(big: &[String], small: &[String]) -> Option<Vec<String>> {
+    let mut rest = big.to_vec();
+    for s in small {
+        let pos = rest.iter().position(|x| x == s)?;
+        rest.remove(pos);
+    }
+    rest.sort();
+    Some(rest)
+}
+
+/// The certificate monomial for a kernel against goal monomials:
+/// the unique M such that a kernel-lhs monomial divides some goal-lhs
+/// monomial with quotient M AND a kernel-rhs monomial divides some
+/// goal-rhs monomial with the SAME quotient M. `None` when no such M
+/// exists (or M is trivial — the bare kernel is already in context).
+/// This is a quotient, not an enumeration: dc² falls out of
+/// `{a.num, dc, db, dc} − {a.num, db}`.
+fn quotient_monomial(
+    gl: &[Vec<String>],
+    gr: &[Vec<String>],
+    kl: &[Vec<String>],
+    kr: &[Vec<String>],
+) -> Option<Vec<String>> {
+    for gm in gl {
+        for km in kl {
+            if let Some(q) = multiset_diff(gm, km) {
+                if q.is_empty() {
+                    continue;
+                }
+                for gm2 in gr {
+                    for km2 in kr {
+                        if multiset_diff(gm2, km2).as_ref() == Some(&q) {
+                            return Some(q);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The nonneg proof for a multiplier monomial, read off its shape:
+/// a single atom needs a positivity (`D > 0`) or nonneg (`x ≥ 0`)
+/// hyp; a square is `mul_self_nonneg`; a pair multiplies per-atom
+/// proofs; an atom times a square nests. Anything else: no proof, no
+/// branch (loud).
+fn nonneg_proof(
+    m: &[String],
+    pos: &[(String, String)],
+    ge0: &[(String, String)],
+) -> Option<String> {
+    let atom_proof = |a: &str| -> Option<String> {
+        if let Some((_, h)) = pos.iter().find(|(pa, _)| pa == a) {
+            Some(format!("(le_of_lt {})", h))
+        } else if let Some((_, h)) = ge0.iter().find(|(ga, _)| ga == a) {
+            Some(h.clone())
+        } else {
+            None
+        }
+    };
+    match m.len() {
+        1 => atom_proof(&m[0]),
+        2 if m[0] == m[1] => Some(format!("(mul_self_nonneg ({}))", m[0])),
+        2 => {
+            let p1 = atom_proof(&m[0])?;
+            let p2 = atom_proof(&m[1])?;
+            Some(format!("(mul_nonneg {} {})", p1, p2))
+        }
+        3 if m[0] == m[1] => {
+            let p = atom_proof(&m[2])?;
+            Some(format!("(mul_nonneg (mul_self_nonneg ({})) {})", m[0], p))
+        }
+        3 if m[1] == m[2] => {
+            let p = atom_proof(&m[0])?;
+            Some(format!("(mul_nonneg {} (mul_self_nonneg ({})))", p, m[1]))
+        }
+        _ => None,
+    }
+}
+
+/// Structural Int-side check for congrArg eligibility (see the caller):
+/// literals, Int-typed binders, `.num` projections, `lib.Rational.denom`
+/// applications (their ARGS are Rational terms — deliberately NOT
+/// walked), and `+`/`-`/`*`/negation over those. Everything else —
+/// Rational vars/apps, `.den` / `denom_nat` (Nat), casts, matches — is
+/// conservative-rejected: the hyp stays in the by-name nlinarith pool
+/// but never sees a congrArg multiplier.
+fn int_arith_sides(binders: &[Binder], e: &Expr) -> bool {
+    match &e.node {
+        ExprNode::Lit(_) => true,
+        ExprNode::Var(n) => binders.iter().any(|b| {
+            matches!(&b.name, Some(bn) if bn.as_str() == n.as_str())
+                && matches!(&b.ty.node, ExprNode::Var(t) if t.as_str() == "Int")
+        }),
+        ExprNode::FieldProj { field, .. } => field == "num",
+        ExprNode::App { head, .. } => {
+            matches!(&head.node, ExprNode::Var(h) if h.as_str() == "lib.Rational.denom")
+        }
+        ExprNode::BinOp { op, lhs, rhs } => {
+            use crate::lean_ast::BinOp::*;
+            matches!(op, Add | Sub | Mul)
+                && int_arith_sides(binders, lhs)
+                && int_arith_sides(binders, rhs)
+        }
+        ExprNode::UnOp { arg, .. } => int_arith_sides(binders, arg),
+        ExprNode::SpanMark { inner, .. } => int_arith_sides(binders, inner),
+        ExprNode::TypeAnnot { expr, .. } => int_arith_sides(binders, expr),
+        _ => false,
+    }
+}
+
+/// Type-safe Int-atom multipliers: binder names whose declared type is
+/// `Int`, plus `lib.Rational.denom …` applications mentioned anywhere
+/// in the goal (denom returns Int structurally). Anything else (Nat
+/// vars, Seq terms) would make `congrArg (fun t : Int => t * d) h`
+/// ill-typed — an ELABORATION error, not a catchable failure.
+fn int_atoms(goal: &Expr, binders: &[Binder]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for b in binders {
+        if let (Some(n), ExprNode::Var(t)) = (&b.name, &b.ty.node) {
+            if t.as_str() == "Int" {
+                out.push(n.as_str().to_string());
+            }
+        }
+    }
+    collect_denom_apps(goal, &mut out);
+    out
+}
+
+/// The `lib.Rational.denom …` applications mentioned anywhere in `e`
+/// (pp text, for the congrArg multiplier / monomial menus).
+fn collect_denom_apps(e: &Expr, out: &mut Vec<String>) {
+    match &e.node {
+        ExprNode::App { head, args } => {
+            if let ExprNode::Var(n) = &head.node {
+                if n.as_str() == "lib.Rational.denom" {
+                    out.push(crate::lean_pp::pp_expr(e));
+                }
+            }
+            for a in args {
+                collect_denom_apps(a, out);
+            }
+        }
+        _ => e.for_each_child(|c| collect_denom_apps(c, out)),
+    }
+}
+
+/// For an Eq goal with a denominator positivity hyp in context:
+/// (positivity atom D as pp text, lhs, rhs).
+fn cancel_target<'a>(goal: &'a Expr, binders: &[Binder]) -> Option<(String, &'a Expr, &'a Expr)> {
+    let mut cur = goal;
+    loop {
+        match &cur.node {
+            ExprNode::SpanMark { inner, .. } => cur = inner,
+            ExprNode::TypeAnnot { expr, .. } => cur = expr,
+            ExprNode::Forall { body, .. } => cur = body,
+            ExprNode::BinOp { op: crate::lean_ast::BinOp::Implies, rhs, .. } => cur = rhs,
+            ExprNode::BinOp { op: crate::lean_ast::BinOp::Eq, lhs, rhs } => {
+                // Find a `D > 0` hyp where D is a denom application
+                // mentioned in the goal.
+                for b in binders {
+                    if let ExprNode::BinOp { op: crate::lean_ast::BinOp::Gt, lhs: dl, rhs: zr } =
+                        &b.ty.node
+                    {
+                        if matches!(&zr.node, ExprNode::Lit(n) if n == "0") {
+                            if let ExprNode::App { head, .. } = &dl.node {
+                                if let ExprNode::Var(n) = &head.node {
+                                    if n.as_str() == "lib.Rational.denom"
+                                        && contains_app_head(goal, "lib.Rational.denom")
+                                    {
+                                        return Some((
+                                            crate::lean_pp::pp_expr(dl),
+                                            lhs,
+                                            rhs,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                return None;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn contains_app_head(e: &Expr, name: &str) -> bool {
+    match &e.node {
+        ExprNode::App { head, args } => {
+            if let ExprNode::Var(n) = &head.node {
+                if n.as_str() == name {
+                    return true;
+                }
+            }
+            args.iter().any(|a| contains_app_head(a, name))
+        }
+        _ => {
+            let mut found = false;
+            e.for_each_child(|c| {
+                found = found || contains_app_head(c, name);
+            });
+            found
+        }
+    }
+}
+
+/// Is the goal literally `lib.Rational.denom x > 0` (or `0 < denom x`)?
+fn is_denom_positivity_goal(goal: &Expr) -> bool {
+    fn is_denom_app(e: &Expr) -> bool {
+        match &e.node {
+            ExprNode::App { head, .. } => {
+                matches!(&head.node, ExprNode::Var(n) if n.as_str() == "lib.Rational.denom")
+            }
+            _ => false,
+        }
+    }
+    let mut cur = goal;
+    loop {
+        match &cur.node {
+            ExprNode::SpanMark { inner, .. } => cur = inner,
+            ExprNode::TypeAnnot { expr, .. } => cur = expr,
+            ExprNode::Forall { body, .. } => cur = body,
+            ExprNode::BinOp { op: crate::lean_ast::BinOp::Implies, rhs, .. } => cur = rhs,
+            ExprNode::BinOp { op: crate::lean_ast::BinOp::Gt, lhs, .. } => {
+                return is_denom_app(lhs);
+            }
+            ExprNode::BinOp { op: crate::lean_ast::BinOp::Lt, lhs, rhs } => {
+                return is_denom_app(rhs);
+            }
+            _ => return false,
+        }
+    }
+}

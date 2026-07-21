@@ -861,6 +861,7 @@ fn branch_ctor_frames(
     let var_san = crate::to_lean_type::sanitize(p.variant);
     let mut frames: Vec<CtxFrame> = Vec::new();
     let mut args: Vec<LExpr> = Vec::new();
+    let mut field_names: Vec<LeanName> = Vec::new();
     for f in variant.fields.iter() {
         let fty = vir::sst_util::subst_typ_for_datatype(
             &dx.typ_params, typ_args, &f.a.0,
@@ -868,6 +869,7 @@ fn branch_ctor_frames(
         let fname = LeanName::synthetic(format!(
             "{}_{}", p.scrut.as_str(), crate::to_lean_fn::field_name(&f.name),
         ));
+        field_names.push(fname.clone());
         frames.push(CtxFrame::Binder(LBinder::explicit(
             fname.clone(),
             crate::to_lean_type::typ_to_expr(&fty),
@@ -895,7 +897,13 @@ fn branch_ctor_frames(
     );
     frames.push(CtxFrame::Hyp(
         eq,
-        HypProvenance::Branch(branch_test_of(cond, true)),
+        // N2's constructor equation — distinct from the branch
+        // condition that produced it (N3 §3.3).
+        HypProvenance::CtorEq {
+            scrutinee: p.scrut.clone(),
+            variant: var_san.clone(),
+            fields: field_names,
+        },
     ));
     Some(frames)
 }
@@ -1214,7 +1222,88 @@ pub fn exec_fn_theorems_to_ast<'a>(
     )?;
 
     let mut binders = build_param_binders(fn_sst);
+    // Trait-bound INSTANCE binders (`[Equivalence T]`), inserted after
+    // the typ params (build_param_binders puts those first) and before
+    // value params would need them — same rendering as proof-fn
+    // signatures (`fn_binders` → `trait_bounds_to_ast`). Without
+    // these, a trait-generic fn's obligation theorems bind `(T : Type)`
+    // bare and every trait-method application in the goal fails
+    // instance synthesis (B6: tactus-algebra's 182-lemma corpus, every
+    // generic lemma). Insert position: after the leading typ-param run.
+    {
+        let unemittable = crate::expr_shared::unemittable_traits(krate, &fn_map);
+        // OUTPARAM-FREE bounds only, for now: a trait with associated
+        // types renders as `class Tr (Self) (Assoc : outParam Type)`,
+        // and the bare bound `[Tr T]` is under-applied ("type
+        // expected") — threading the assoc args needs impl_subst's
+        // standalone-fn augmentation (the proof-fn path's
+        // maybe_augment_standalone_fn), a follow-on. Assoc-typed
+        // bounds keep their prior no-binder rendering, which the
+        // suite's assoc probes exercise green.
+        let trait_map: HashMap<vir::ast::Path, &vir::ast::TraitX> = krate
+            .traits
+            .iter()
+            .map(|t| (t.x.name.clone(), &t.x))
+            .collect();
+        let outparams =
+            crate::trait_emit::compute_trait_outparams(&trait_map, &unemittable);
+        let outparam_free: vir::ast::GenericBounds = std::sync::Arc::new(
+            fn_sst
+                .x
+                .typ_bounds
+                .iter()
+                .filter(|b| match &***b {
+                    vir::ast::GenericBoundX::Trait(vir::ast::TraitId::Path(p), _) => {
+                        outparams.get(p).map_or(true, |v| v.is_empty())
+                    }
+                    _ => true,
+                })
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let mut bound_binders = crate::trait_emit::trait_bounds_to_ast(
+            &outparam_free,
+            &unemittable,
+        );
+        // `[Nonempty T]` brackets (B4 seeds): the defs pipeline adds
+        // these to FunctionX copies (`add_fn_nonempty_bounds`), but the
+        // SST obligation path renders from fn_sst and never saw them —
+        // first surfaced by tactus-algebra's generic-T-with-Seq lemmas
+        // (stmt defs citing `Seq.empty T` with no `Nonempty T` in
+        // scope). Computed lazily: only generic fns pay for the
+        // crate-wide propagation map (obligation fns are overwhelmingly
+        // monomorphic elsewhere). Param-indexed needs only — the
+        // projection-typed needs ride assoc-typ traits, which the
+        // outparam filter above already defers.
+        if !fn_sst.x.typ_params.is_empty() {
+            if let Some(need) = cached_nonempty_need(krate, &fn_sst.x.name) {
+                for &i in need.0.iter() {
+                    if let Some(tp) = fn_sst.x.typ_params.get(i) {
+                        bound_binders.push(LBinder::instance(LExpr::app(
+                            LExpr::var_lit("Nonempty"),
+                            vec![LExpr::var_lit(tp.as_str())],
+                        )));
+                    }
+                }
+            }
+        }
+        let is_typ_param = |b: &LBinder| -> bool {
+            matches!(&b.ty.node,
+                crate::lean_ast::ExprNode::Var(n) if n.as_str() == "Type")
+        };
+        let insert_at = binders
+            .iter()
+            .position(|b| !is_typ_param(b))
+            .unwrap_or(binders.len());
+        for (i, b) in bound_binders.into_iter().enumerate() {
+            binders.insert(insert_at + i, b);
+        }
+    }
     binders.extend(build_borrow_mut_binders(check));
+    // Req binders land as the trailing `h_req<i>` run of `base_binders`
+    // — remember where the run starts so `build_goal_shape` can mark
+    // them `Requires { index }` (N3-M0) instead of name-sniffing.
+    let req_binder_start = binders.len();
     binders.extend(build_req_binders(fn_sst, check, &mut_param_names, &fn_map));
 
     // Build the whole WP tree from the (mut-ref-rewritten) body,
@@ -1267,7 +1356,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
     // (vec_clone_view_eq_u8 closing view-equality from a vec clone's
     // pointwise ensures is the motivating case — the final e2e
     // residue; see BUG-vecfield-clone-ensures.md).
-    let eliminators: Vec<String> = broadcast_lemmas
+    let eliminators: Vec<(String, Option<String>)> = broadcast_lemmas
         .iter()
         .filter_map(|fun| {
             let fx = krate.functions.iter().find(|f| &f.x.name == *fun)?;
@@ -1278,7 +1367,50 @@ pub fn exec_fn_theorems_to_ast<'a>(
                 vir::ast::ExprX::Binary(vir::ast::BinaryOp::Eq(_), l, _)
                     if !matches!(&*vir::ast_util::undecorate_typ(&l.typ), vir::ast::TypX::Bool) =>
                 {
-                    Some(crate::to_lean_type::lean_name(&fun.path))
+                    // Conclusion LHS head symbol (App head of the
+                    // equation's LHS) for the derived closer's
+                    // apply-guard: an eliminator arm only emits when the
+                    // goal's own equation LHS head textually matches —
+                    // otherwise the `apply` can never unify and the arm
+                    // only wastes heartbeats and masks the real closer
+                    // failure (`lib.seq.lemma_seq_two_subranges_index`
+                    // reported against every Rational equation goal).
+                    // `None` = head not statically known (non-Call LHS)
+                    // → the arm is kept (conservative).
+                    let head = match &l.x {
+                        vir::ast::ExprX::Call(
+                            vir::ast::CallTarget::Fun(_, f, _, _, _, _),
+                            _,
+                            _,
+                        ) => Some(crate::to_lean_type::lean_name(&f.path)),
+                        _ => None,
+                    };
+                    Some((crate::to_lean_type::lean_name(&fun.path), head))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    // Have-names of the PROP-valued equation rewrites among the
+    // broadcast lemmas (`(s1 = s2) = …` — the ext_equal family): used
+    // as simp `simp_all` rewrites they explode a goal's own Seq
+    // equality into len∧pointwise form, which is exactly the
+    // structural tail's failure on the pmul definitional asserts. The
+    // script's StructuralTail excludes them by name (same-pass naming
+    // contract — the haves are seeded below by this same loop).
+    let bc_ext_haves: Vec<String> = broadcast_lemmas
+        .iter()
+        .enumerate()
+        .filter_map(|(i, fun)| {
+            let fx = krate.functions.iter().find(|f| &f.x.name == *fun)?;
+            if fx.x.ensure.0.len() != 1 {
+                return None;
+            }
+            match &fx.x.ensure.0[0].x {
+                vir::ast::ExprX::Binary(vir::ast::BinaryOp::Eq(_), l, _)
+                    if matches!(&*vir::ast_util::undecorate_typ(&l.typ), vir::ast::TypX::Bool) =>
+                {
+                    Some(format!("_tactus_bc_{}", i))
                 }
                 _ => None,
             }
@@ -1300,6 +1432,9 @@ pub fn exec_fn_theorems_to_ast<'a>(
         goal_shapes: Vec::new(),
         tactic_prefix,
         eliminators,
+        broadcast_count: broadcast_lemmas.len(),
+        bc_ext_haves,
+        req_binder_start,
         baseline_prefix_len,
         default_closer,
         heartbeats: fn_sst.x.attrs.tactus_heartbeats,
@@ -1645,6 +1780,21 @@ fn rename_frame_vars(
     }
 }
 
+/// Does `e` mention `name` as a `Var` node? Used by the partial
+/// hoist's bail check: a theorem-level binder may not refer to a
+/// goal-position residue let. No shadow tracking — a shadowed
+/// coincidence bails conservatively (the pre-partial-hoist behavior).
+fn lexpr_mentions_var(e: &LExpr, name: &str) -> bool {
+    match &e.node {
+        crate::lean_ast::ExprNode::Var(n) => n.as_str() == name,
+        _ => {
+            let mut found = false;
+            e.for_each_child(|c| found = found || lexpr_mentions_var(c, name));
+            found
+        }
+    }
+}
+
 /// One frame of accumulated context as the obligation walker descends
 /// into a Wp tree. Pushed at scope-introducing points (let bindings,
 /// branch hypotheses, assert hypotheses, assume hypotheses); popped
@@ -1886,7 +2036,24 @@ impl OblCtx {
     /// Returns `None` — caller falls back to goal-position `wrap` —
     /// when any `Let` frame lacks its typ (the N1 coverage meter:
     /// `LetRaw`, ensures-leaf let peels, and mut-ref shadows don't
-    /// carry one yet).
+    /// carry one yet), or when a hoisted binder would have to mention
+    /// a residue let (see below).
+    ///
+    /// Bool-typed lets are the WP's if-condition temps (`let tmp__1 :=
+    /// x < 50`) and comparison results kept for later antecedents
+    /// (`let tmp__10 := r.num = da * l.num` in mul_distributes_left).
+    /// Hoisting THEM as binders + propositional equations loops simp
+    /// (CORE's `eq_iff_iff` family — the nested_if maxRecDepth
+    /// regression, 2026-07-17). But bailing the WHOLE hoist on one
+    /// incidental Bool-let strands every other frame's requires-hyps
+    /// anonymous on the wrap path (mul_distributes_left starved
+    /// there, 2026-07-20). So: Bool-lets become GOAL-POSITION lets
+    /// around the otherwise-flat leaf (the "residue"), everything else
+    /// hoists — no Prop equations enter the telescope, and textual
+    /// order preserves shadowing semantics. If any hoisted binder's
+    /// type or let-equation would have to MENTION a residue name
+    /// (impossible for a theorem-level binder — the residue let is
+    /// inner), the whole hoist bails as before.
     fn hoist_all(
         &self,
         leaf: &LExpr,
@@ -1896,25 +2063,11 @@ impl OblCtx {
         for f in self.frames.iter() {
             match f {
                 CtxFrame::Let(_, _, None) => return None,
-                // Bool-typed lets are the WP's if-condition temps
-                // (`let tmp__1 := x < 50`). Hoisted, they become
-                // Prop-typed binders with PROPOSITIONAL equations
-                // (`tmp__1 = (x < 50)`) — omega cannot consume a
-                // Prop equation, `decide` cannot touch the free
-                // binder, and CORE's `eq_iff_iff` family loops simp
-                // on them (nested_if maxRecDepth regression,
-                // 2026-07-17). Keep those obligations on the
-                // goal-position wrap until N2 splits the conditions
-                // properly.
-                CtxFrame::Let(_, _, Some(t))
-                    if matches!(&**t, vir::ast::TypX::Bool) =>
-                {
-                    return None;
-                }
                 _ => {}
             }
         }
         let mut out: Vec<(LBinder, Option<HypProvenance>)> = Vec::new();
+        let mut residue: Vec<(LeanName, LExpr)> = Vec::new();
         let mut env: HashMap<String, LeanName> = HashMap::new();
         let mut bound: std::collections::HashSet<String> = taken_names.clone();
         let mut fresh = |base: &str, bound: &mut std::collections::HashSet<String>| -> LeanName {
@@ -1931,6 +2084,17 @@ impl OblCtx {
         let mut hyp_counter = 0usize;
         for frame in self.frames.iter() {
             match frame {
+                CtxFrame::Let(name, v, Some(t)) if matches!(&**t, vir::ast::TypX::Bool) => {
+                    // Bool-let → goal-position residue let (see the fn
+                    // doc). `bound` takes the source name so a LATER
+                    // frame reusing it freshens (shadowing discipline
+                    // matches the hoist's); the residue let itself
+                    // keeps its source name — goal-position lets shadow
+                    // textually, which matches source order.
+                    let v2 = rename_frame_vars(v, &env);
+                    bound.insert(name.as_str().to_string());
+                    residue.push((name.clone(), v2));
+                }
                 CtxFrame::Let(name, v, typ) => {
                     let typ = typ.as_ref().expect("checked above");
                     let v2 = rename_frame_vars(v, &env);
@@ -1955,12 +2119,13 @@ impl OblCtx {
                     out.push((
                         LBinder::explicit(
                             eq_name,
-                            LExpr::eq(LExpr::var(chosen), v2),
+                            LExpr::eq(LExpr::var(chosen.clone()), v2),
                         ),
-                        // Definitional-equation hypothesis; census-Other
-                        // for the Link-discharge spine until a dedicated
-                        // provenance variant exists (doc §5 Q1).
-                        Some(HypProvenance::Other),
+                        // Definitional-equation hypothesis for the
+                        // hoisted let-binder — N1's HoistEq, the
+                        // SubstHoists script move's target (N3 §3.3;
+                        // resolves doc §5 Q1).
+                        Some(HypProvenance::HoistEq { binder: chosen.clone() }),
                     ));
                 }
                 CtxFrame::Hyp(p, prov) => {
@@ -1996,7 +2161,25 @@ impl OblCtx {
                 }
             }
         }
-        Some((out, rename_frame_vars(leaf, &env)))
+        // Bail check: no hoisted binder's TYPE (including the hoisted
+        // let-equations, which are types) may mention a residue name —
+        // theorem binders can't refer to the inner goal-lets. Residue
+        // names never enter `env`, so references stay source-named and
+        // detectable here.
+        for (b, _) in out.iter() {
+            for (n, _) in residue.iter() {
+                if lexpr_mentions_var(&b.ty, n.as_str()) {
+                    return None;
+                }
+            }
+        }
+        // Fold the residue lets around the renamed leaf, frame order
+        // (the earliest residue let is outermost).
+        let mut flat = rename_frame_vars(leaf, &env);
+        for (n, v) in residue.into_iter().rev() {
+            flat = LExpr::let_bind(n, v, flat);
+        }
+        Some((out, flat))
     }
 
     /// Build an explicit-named `intro` list for any frames that did
@@ -2128,9 +2311,30 @@ struct ObligationEmitter {
     tactic_prefix: Vec<String>,
     /// Lean names of equation-eliminator broadcast lemmas in scope
     /// (single-ensure, non-Prop equation conclusion — computed from
-    /// lemma signatures at construction). The derived closer appends
-    /// last-resort `apply`-arms for these.
-    eliminators: Vec<String>,
+    /// lemma signatures at construction), paired with the conclusion's
+    /// LHS head symbol when statically known (the derived closer's
+    /// apply-guard skips arms whose head cannot unify with the goal's).
+    /// The derived closer appends last-resort `apply`-arms for these.
+    eliminators: Vec<(String, Option<String>)>,
+    /// Number of broadcast-lemma haves seeded into `tactic_prefix`
+    /// (`have _tactus_bc_<i> := …` for i < n). The UnfoldOnce arm's
+    /// guard simp EXCLUDES them by name (`-_tactus_bc_<i>`): left in,
+    /// the Prop-valued extensionality axioms (`axiom_seq_ext_equal`)
+    /// rewrite the goal's own Seq equality into len∧pointwise form and
+    /// blow up the one-step-unfold close. Same-pass naming contract —
+    /// the haves are seeded by this same construction site.
+    broadcast_count: usize,
+    /// Have-names of the PROP-valued equation rewrites among the
+    /// broadcast lemmas (the ext_equal family) — the script's
+    /// StructuralTail excludes just these (the guard simp excludes
+    /// everything, the tail still wants the arithmetic seq axioms).
+    bc_ext_haves: Vec<String>,
+    /// Index in `base_binders` where the trailing `h_req<i>` run starts
+    /// (usize::MAX when there is none — shell/test emitters). Lets
+    /// `build_goal_shape` mark requires-hyps `Requires { index }` by
+    /// position rather than by sniffing names (N3's information-flows-
+    /// forward rule).
+    req_binder_start: usize,
     /// `tactic_prefix.len()` at construction — the broadcast-lemma
     /// `have` block only. Entries beyond this are USER prefixes
     /// (walk-pushed `proof { tac }` scopes), which reshape goals;
@@ -2260,11 +2464,21 @@ impl ObligationEmitter {
         // pairs, so the goal reaches the closers with no goal-position
         // lets (no `+zetaDelta`, no opaque let-fvar omega atoms) and
         // flat arithmetic goals classify into S1's omega fragment.
-        // User closers (`tactus_tactic` overrides, AssertQuery scopes)
-        // keep the goal-position wrap — their tactic bodies were
-        // written against that shape. Falls back to the wrap when a
-        // Let frame lacks its typ (see `hoist_all`).
-        let is_default = matches!(&obl.closer, Tactic::Named(n) if n == "tactus_auto");
+        // User closers (`tactus_tactic` overrides) keep the goal-position
+        // wrap — their tactic bodies were written against that shape.
+        // Falls back to the wrap when a Let frame lacks its typ (see
+        // `hoist_all`).
+        //
+        // `by (nonlinear_arith)` AssertQuery scopes hoist TOO: their
+        // closer is our own composed ladder (NONLIN_MARKER in the
+        // primary slot), not a user tactic — and the ladder's
+        // congrArg/rewrite steps reference the requires-hyps BY NAME,
+        // which only hoisted (`_h_hoist_N`) binders provide. On the
+        // wrap path the requires arrive as anonymous `→` antecedents
+        // and the ladder degenerates to `nlinarith []` (the congruence
+        // family starved there, 2026-07-20).
+        let is_default = matches!(&obl.closer, Tactic::Named(n) if n == "tactus_auto")
+            || matches!(&obl.closer, Tactic::Raw(s) if s.contains(crate::tactic_select::NONLIN_MARKER));
         if is_default {
             let taken: std::collections::HashSet<String> = self
                 .base_binders
@@ -2317,8 +2531,13 @@ impl ObligationEmitter {
         leaf: &LExpr,
     ) -> GoalShape {
         let mut spine: Vec<GoalSpine> = Vec::new();
-        for b in self.base_binders.iter() {
-            spine.push(GoalSpine::All(b.clone(), None));
+        for (i, b) in self.base_binders.iter().enumerate() {
+            let prov = if i >= self.req_binder_start {
+                Some(HypProvenance::Requires { index: i - self.req_binder_start })
+            } else {
+                None
+            };
+            spine.push(GoalSpine::All(b.clone(), prov));
         }
         for (b, prov) in extras.iter() {
             spine.push(GoalSpine::All(b.clone(), prov.clone()));
@@ -2355,6 +2574,10 @@ impl ObligationEmitter {
     ) {
         let mut binders = self.base_binders.clone();
         binders.extend(extra_binders);
+        // N3-M0 census: which closer the emitter authored (see
+        // `CloserCensus`). Set alongside every closer selection below;
+        // aggregated per crate run by `generate::closer_census_report`.
+        let mut census = crate::lean_ast::CloserCensus::User;
         // Deterministic floor (S1, tactic_select): when the DEFAULT
         // closer would run and the goal (hypotheses included — they
         // are binder types and wrapped implications) lies in the
@@ -2369,18 +2592,64 @@ impl ObligationEmitter {
         let mut closer = match &closer {
             Tactic::Named(n) if n == "tactus_auto" => {
                 match crate::tactic_select::select_deterministic(&goal, &binders) {
-                    Some(sel) => Tactic::Raw(sel.tactic_text(&goal)),
+                    Some(sel) => {
+                        census = crate::lean_ast::CloserCensus::S1Omega;
+                        Tactic::Raw(sel.tactic_text(&goal))
+                    }
                     // S2c (§3.4): no fragment answer → the derived
                     // default closer (kernel rungs + explicit peel +
                     // fixed CORE normalizer + structural rung),
                     // replacing the `tactus_auto` search.
-                    None => Tactic::Raw(crate::tactic_select::derived_closer(
-                        &goal,
-                        &self.dt_inventory,
-                        &binders,
-                        self.tactic_prefix.len() > self.baseline_prefix_len,
-                        &self.eliminators,
-                    )),
+                    None => {
+                        // N3-M2: try authoring a script first (the
+                        // emitter holds the goal + provenance spine —
+                        // information flows forward). A script rides
+                        // PRIMARY with the derived chain as fallback;
+                        // when no v1 form applies, the derived chain
+                        // alone (the census marks that separately).
+                        let user_prefix =
+                            self.tactic_prefix.len() > self.baseline_prefix_len;
+                        let scripted = if !user_prefix {
+                            goal_shape.as_ref().and_then(|shape| {
+                                crate::script::author_v1(
+                                    &goal,
+                                    shape,
+                                    &self.dt_inventory,
+                                    &self.bc_ext_haves,
+                                )
+                            })
+                        } else {
+                            None
+                        };
+                        match scripted {
+                            Some((moves, form)) => {
+                                census = form.census();
+                                let script_text = crate::script::render_script(&moves);
+                                let chain = crate::tactic_select::derived_closer(
+                                    &goal,
+                                    &self.dt_inventory,
+                                    &binders,
+                                    user_prefix,
+                                    &self.eliminators,
+                                    self.broadcast_count,
+                                    None,
+                                );
+                                Tactic::Raw(format!(
+                                    "first | ({}) | ({})",
+                                    script_text, chain
+                                ))
+                            }
+                            None => Tactic::Raw(crate::tactic_select::derived_closer(
+                                &goal,
+                                &self.dt_inventory,
+                                &binders,
+                                user_prefix,
+                                &self.eliminators,
+                                self.broadcast_count,
+                                Some(&mut census),
+                            )),
+                        }
+                    }
                 }
             }
             _ => closer,
@@ -2389,17 +2658,28 @@ impl ObligationEmitter {
         // known (once per scope, many theorems); the marker they plant
         // is expanded to the per-goal derived closer here.
         if let Tactic::Raw(text) = &closer {
+            let mut text = text.clone();
+            if text.contains(crate::tactic_select::NONLIN_MARKER) {
+                text = text.replace(
+                    crate::tactic_select::NONLIN_MARKER,
+                    &crate::tactic_select::nonlin_ladder(&goal, &binders),
+                );
+            }
             if text.contains(crate::tactic_select::DERIVED_MARKER) {
-                closer = Tactic::Raw(text.replace(
+                text = text.replace(
                     crate::tactic_select::DERIVED_MARKER,
                     &crate::tactic_select::derived_closer(
                         &goal, &self.dt_inventory, &binders,
                         self.tactic_prefix.len() > self.baseline_prefix_len,
                         &self.eliminators,
+                        self.broadcast_count,
+                        Some(&mut census),
                     ),
-                ));
+                );
             }
+            closer = Tactic::Raw(text);
         }
+        crate::generate::census_bump(census);
         let tactic = self.compose_tactic(closer);
         // Lockstep with `out.push` below: one shape per emitted theorem.
         self.goal_shapes.push(goal_shape);
@@ -2408,6 +2688,7 @@ impl ObligationEmitter {
             binders,
             goal,
             tactic,
+            closer_census: Some(census),
             requires_preamble,
             heartbeats: self.heartbeats,
             // Exec-fn obligation theorems are flat (recursion lives in the
@@ -2493,7 +2774,7 @@ fn obl_with_choose_hyps(exp: &Exp, ctx: &WpCtx, obl: &OblCtx) -> OblCtx {
     .unwrap_or_default();
     let mut out = obl.clone();
     for h in hyps {
-        out = out.with_frame(CtxFrame::Hyp(h, HypProvenance::Other));
+        out = out.with_frame(CtxFrame::Hyp(h, HypProvenance::AssumeFact));
     }
     out
 }
@@ -2550,7 +2831,7 @@ fn walk_obligations<'a>(
             let prov = if matches!(kind, AssertKind::Obligation(ObligationKind::Termination)) {
                 HypProvenance::HeightFact
             } else {
-                HypProvenance::Other
+                HypProvenance::AssertFact
             };
             let new_obl = obl.with_frame(CtxFrame::Hyp(cond_ast, prov));
             walk_obligations(body, ctx, &new_obl, e);
@@ -2564,7 +2845,7 @@ fn walk_obligations<'a>(
                     p,
                     &ctx.render_ctx().with_let_binder_typs(&obl.let_binder_typs),
                 ),
-                HypProvenance::Other,
+                HypProvenance::AssumeFact,
             ));
             walk_obligations(body, ctx, &new_obl, e);
         }
@@ -2677,7 +2958,15 @@ fn walk_obligations<'a>(
                 }
                 other => tactic_as_str(other),
             };
-            let primary_str = tactic_as_str(primary);
+            let primary_str = match primary {
+                Tactic::Named(n) if n == "nlinarith" => {
+                    // The per-goal nonlinear ladder (R2): marker
+                    // expanded by `emit_with_extras` into the
+                    // multiplier-pool nlinarith ladder per theorem.
+                    crate::tactic_select::NONLIN_MARKER.to_string()
+                }
+                other => tactic_as_str(other),
+            };
             let composed = Tactic::Raw(format!(
                 "first | (intros; {}) | ({}) | \
                  fail \"{} scope: could not close — \
@@ -2894,7 +3183,7 @@ fn walk_assert_by_tactus<'a>(
                 e.emit_split(name, goal, obl);
             }
             // Cond as hypothesis for body theorems (reuse cond_ast).
-            let new_obl = obl.with_frame(CtxFrame::Hyp(cond_ast, HypProvenance::Other));
+            let new_obl = obl.with_frame(CtxFrame::Hyp(cond_ast, HypProvenance::AssertFact));
             walk_obligations(body, ctx, &new_obl, e);
         }
         None => {
@@ -3083,8 +3372,11 @@ fn walk_loop<'a>(
     // they're only required at break.
     let mut maintain_obl = obl.clone();
     push_mod_var_frames(&mut maintain_obl, modified_vars);
-    for inv in &entry_invs_marked {
-        maintain_obl.frames.push_back(CtxFrame::Hyp(inv.clone(), HypProvenance::Other));
+    for (i, inv) in entry_invs_marked.iter().enumerate() {
+        maintain_obl.frames.push_back(CtxFrame::Hyp(
+            inv.clone(),
+            HypProvenance::LoopInv { index: i, at: crate::lean_ast::LoopPhase::Maintain },
+        ));
     }
     if let Some(c) = cond {
         maintain_obl.frames.push_back(CtxFrame::Hyp(cond_marked(&c), HypProvenance::Branch(None)));
@@ -3119,8 +3411,11 @@ fn walk_loop<'a>(
     // to fall-through inside the body.
     let mut use_obl = obl.clone();
     push_mod_var_frames(&mut use_obl, modified_vars);
-    for inv in &exit_invs_marked {
-        use_obl.frames.push_back(CtxFrame::Hyp(inv.clone(), HypProvenance::Other));
+    for (i, inv) in exit_invs_marked.iter().enumerate() {
+        use_obl.frames.push_back(CtxFrame::Hyp(
+            inv.clone(),
+            HypProvenance::LoopInv { index: i, at: crate::lean_ast::LoopPhase::Exit },
+        ));
     }
     if let Some(c) = cond {
         use_obl.frames.push_back(CtxFrame::Hyp(LExpr::not(cond_marked(&c)), HypProvenance::Branch(None)));
@@ -4497,7 +4792,51 @@ fn build_call_fact_info(
         })
         .collect();
     let callee_name = crate::to_lean_type::lean_name_relative(&callee.name.path);
-    CallFactInfo { is_self: callee_name == e.fn_name, callee: callee_name, args }
+    CallFactInfo {
+        is_self: callee_name == e.fn_name,
+        callee: callee_name,
+        args,
+        ensures_summary: ensures_shape_summary(callee),
+    }
+}
+
+/// N3-M0 (§3.3): coarse per-conjunct shape summary of a callee's
+/// ensures, recorded at weave time. Deliberately shallow — the M3
+/// form-D author refines as corpus customers appear.
+fn ensures_shape_summary(callee: &FunctionX) -> Vec<crate::lean_ast::EnsuresShape> {
+    use crate::lean_ast::EnsuresShape;
+    let mut out = Vec::new();
+    for ens in callee.ensure.0.iter() {
+        let mut cs = Vec::new();
+        vir_top_conjuncts(ens, &mut cs);
+        for c in cs {
+            out.push(match &c.x {
+                ExprX::Binary(BinaryOp::Eq(_), l, r) => {
+                    if is_len_call(l) || is_len_call(r) {
+                        EnsuresShape::LenEq
+                    } else {
+                        EnsuresShape::OtherEq
+                    }
+                }
+                ExprX::Quant(q, _, _) if q.quant == air::ast::Quant::Forall => {
+                    EnsuresShape::ForallPointwise
+                }
+                _ => EnsuresShape::Other,
+            });
+        }
+    }
+    out
+}
+
+/// Is the expression a `*.len`-named spec call? (Coarse check for the
+/// ensures summary — last path segment only.)
+fn is_len_call(e: &Expr) -> bool {
+    match &e.x {
+        ExprX::Call(vir::ast::CallTarget::Fun(_, fun, _, _, _, _), _, _) => {
+            fun.path.segments.last().map(|s| s.as_str() == "len").unwrap_or(false)
+        }
+        _ => false,
+    }
 }
 
 fn push_ret_frames(
@@ -4789,6 +5128,9 @@ pub(crate) fn cert_call_leaves<'a>(
         goal_shapes: Vec::new(),
         tactic_prefix: Vec::new(),
         eliminators: Vec::new(),
+        broadcast_count: 0,
+        bc_ext_haves: Vec::new(),
+        req_binder_start: usize::MAX,
         baseline_prefix_len: 0,
         default_closer: Tactic::Named("tactus_auto".to_string()),
         heartbeats: None,
@@ -5108,6 +5450,58 @@ fn walk_let<'a>(
 /// every theorem the walker emits for the fn — they sit on
 /// `ObligationEmitter::base_binders` and prepend to each
 /// theorem's binder list at emit time.
+thread_local! {
+    /// Per-thread once-per-crate cache of the Nonempty needs map
+    /// (param indices only — the projection needs ride assoc-typ
+    /// traits, deferred with the outparam filter). Keyed by the
+    /// krate's address: `compute_nonempty_needs` walks the WHOLE
+    /// crate (call-graph propagation), and the obligation path runs
+    /// once per fn — recomputing per generic fn was quadratic and
+    /// dominated gt's all-proofs emission memory/time (observed
+    /// 2026-07-19). Bucket threads each compute at most once per
+    /// crate; the map stores OWNED param-index vectors.
+    static NONEMPTY_NEEDS_CACHE: std::cell::RefCell<Option<(usize, std::collections::HashMap<Fun, (Vec<usize>,)>)>> =
+        std::cell::RefCell::new(None);
+}
+
+fn cached_nonempty_need(krate: &KrateX, name: &Fun) -> Option<(Vec<usize>,)> {
+    let key = krate as *const KrateX as usize;
+    NONEMPTY_NEEDS_CACHE.with(|c| {
+        let mut slot = c.borrow_mut();
+        let stale = match &*slot {
+            Some((k, _)) => *k != key,
+            None => true,
+        };
+        if stale {
+            let all_fns: Vec<&vir::ast::FunctionX> =
+                krate.functions.iter().map(|f| &f.x).collect();
+            let multi_variant: std::collections::HashSet<&vir::ast::Path> = krate
+                .datatypes
+                .iter()
+                .filter(|d| d.x.variants.len() > 1)
+                .filter_map(|d| match &d.x.name {
+                    vir::ast::Dt::Path(p) => Some(p),
+                    vir::ast::Dt::Tuple(_) => None,
+                })
+                .collect();
+            let needs = crate::nonempty::compute_nonempty_needs(
+                &all_fns,
+                &|p| multi_variant.contains(p),
+            );
+            let owned: std::collections::HashMap<Fun, (Vec<usize>,)> = needs
+                .iter()
+                .map(|(f, n)| {
+                    let mut ps: Vec<usize> = n.params.iter().copied().collect();
+                    ps.sort();
+                    ((*f).clone(), (ps,))
+                })
+                .collect();
+            *slot = Some((key, owned));
+        }
+        slot.as_ref().and_then(|(_, m)| m.get(name).cloned())
+    })
+}
+
 fn build_param_binders(fn_sst: &FunctionSst) -> Vec<LBinder> {
     let mut out: Vec<LBinder> = Vec::new();
     // Type parameters first, so value params can reference them in

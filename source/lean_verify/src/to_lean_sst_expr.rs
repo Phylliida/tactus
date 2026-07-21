@@ -899,7 +899,40 @@ fn render_class_method_call(
             Ok(LExpr::type_annot(arg_coerced, typ_to_expr(&annot_typ)))
         }
     }).collect();
-    let app = if args.is_empty() { head } else { LExpr::app(head, app_args?) };
+    // NULLARY methods (`T::zero()`, `T::one()`): no arg exists to pin
+    // `Self`, so the result annotation is the ONLY inference anchor —
+    // and a type-PARAM annotation is fine here (the param is a bound
+    // theorem/def binder, `(…zero : T)` elaborates and resolves the
+    // `[Class ?m]` metavar that otherwise sticks — B6 corpus statics).
+    // The typ_contains_param guard below stays for the non-nullary
+    // case, where args already pin Self and a param annotation adds
+    // nothing.
+    if args.is_empty() {
+        // Pin `Self` via named argument when the instantiation is
+        // known (annotation alone only pins Self-returning methods —
+        // `picked : Int` leaves ?Self stuck; see the to_lean_expr
+        // twin).
+        let pinned = match typs.first() {
+            // Skip the pin for the trait's own Self param (inside the
+            // class decl the reference is a sibling field — see the
+            // to_lean_expr twin).
+            Some(self_typ)
+                if !matches!(&**self_typ, vir::ast::TypX::TypParam(n)
+                    if n.as_str() == "Self%" || n.as_str() == "Self") =>
+            {
+                LExpr::app(head, vec![LExpr::var_lit(&format!(
+                    "(Self := ({}))",
+                    crate::lean_pp::pp_expr(&typ_to_expr(self_typ)),
+                ))])
+            }
+            _ => head,
+        };
+        return Ok(ExprNode::TypeAnnot {
+            expr: Box::new(pinned),
+            ty: Box::new(typ_to_expr(e_typ)),
+        });
+    }
+    let app = LExpr::app(head, app_args?);
     if crate::to_lean_expr::typ_contains_param(e_typ) {
         Ok(app.node)
     } else {

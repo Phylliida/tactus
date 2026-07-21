@@ -182,6 +182,7 @@ fn theorem_with_heartbeats_emits_set_option() {
         name: "expensive".into(),
         binders: vec![],
         goal: bin(BinOp::Eq, lit(1), lit(1)),
+        closer_census: None,
         tactic: Tactic::Named("rfl".into()),
         requires_preamble: Vec::new(),
         heartbeats: Some(1600000),
@@ -199,6 +200,7 @@ fn theorem_without_heartbeats_no_set_option() {
         name: "cheap".into(),
         binders: vec![],
         goal: bin(BinOp::Eq, lit(1), lit(1)),
+        closer_census: None,
         tactic: Tactic::Named("rfl".into()),
         requires_preamble: Vec::new(),
         heartbeats: None,
@@ -222,6 +224,7 @@ fn theorem_with_named_tactic() {
             kind: BinderKind::Explicit,
         }],
         goal: bin(BinOp::Eq, var("x"), var("x")),
+        closer_census: None,
         tactic: Tactic::Named("rfl".into()),
         requires_preamble: Vec::new(),
         heartbeats: None,
@@ -253,6 +256,7 @@ fn pp_records_raw_tactic_start() {
         name: "foo".into(),
         binders: vec![],
         goal: bin(BinOp::Eq, lit(1), lit(1)),
+        closer_census: None,
         tactic: Tactic::Raw("omega".into()),
         requires_preamble: Vec::new(),
         heartbeats: None,
@@ -345,6 +349,7 @@ fn theorem_with_termination_by_single() {
             kind: BinderKind::Explicit,
         }],
         goal: bin(BinOp::Ge, var("n"), lit(0)),
+        closer_census: None,
         tactic: Tactic::Named("omega".into()),
         requires_preamble: Vec::new(),
         heartbeats: None,
@@ -368,6 +373,7 @@ fn theorem_with_termination_by_lex() {
         name: "lex_lemma".into(),
         binders: vec![],
         goal: bin(BinOp::Eq, lit(1), lit(1)),
+        closer_census: None,
         tactic: Tactic::Named("rfl".into()),
         requires_preamble: Vec::new(),
         heartbeats: None,
@@ -388,6 +394,7 @@ fn theorem_with_decreasing_by() {
         name: "rec_mod".into(),
         binders: vec![],
         goal: bin(BinOp::Eq, lit(1), lit(1)),
+        closer_census: None,
         tactic: Tactic::Named("rfl".into()),
         requires_preamble: Vec::new(),
         heartbeats: None,
@@ -411,6 +418,7 @@ fn theorem_without_termination_by_no_clause() {
         name: "trivial".into(),
         binders: vec![],
         goal: bin(BinOp::Eq, lit(1), lit(1)),
+        closer_census: None,
         tactic: Tactic::Named("rfl".into()),
         requires_preamble: Vec::new(),
         heartbeats: None,
@@ -538,4 +546,23 @@ fn vector_lit_prints_hash_v() {
     assert_eq!(pp_expr(&v), "#v[1, 2, 3]");
     let l = Expr::new(ExprNode::ArrayLit(vec![lit(1), lit(2)]));
     assert_eq!(pp_expr(&l), "[1, 2]");
+}
+
+#[test]
+fn census_comment_printed_when_some() {
+    // N3-M0 (DESIGN-N3 §8): the census marker is a fixed-format
+    // comment right before the theorem keyword, only for `Some`.
+    let t = Theorem {
+        name: "with_census".into(),
+        binders: vec![],
+        goal: bin(BinOp::Eq, lit(1), lit(1)),
+        closer_census: Some(crate::lean_ast::CloserCensus::RungFormB),
+        tactic: Tactic::Named("rfl".into()),
+        requires_preamble: Vec::new(),
+        heartbeats: None,
+        termination_by: Vec::new(),
+        decreasing_by: None,
+    };
+    let out = pp_command(&Command::Theorem(t));
+    assert!(out.starts_with("-- tactus-closer: rung:formB\ntheorem with_census"), "got:\n{}", out);
 }

@@ -21,6 +21,7 @@ pub mod prelude;
 pub mod project;
 pub mod ret_subst;
 pub mod sanity;
+pub mod script;
 pub mod tactic_select;
 pub mod source_util;
 pub mod sourcemap;
@@ -40,6 +41,7 @@ pub use generate::{
     check_exec_fn, check_package, check_proof_fn, emit_exec_fn, emit_proof_fn,
     prime_lean_driver, sourcemap_path, PrimeJob,
     CheckResult, DiagLocation, EmitOutput, PackageGateReport, TactusDiag,
+    closer_census_report,
 };
 pub use to_lean_fn::LeanSourceMap;
 pub use sourcemap::{Sidecar, SidecarFn};
