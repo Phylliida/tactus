@@ -113,9 +113,25 @@
 use std::collections::{HashMap, HashSet};
 
 use vir::sst::{
+
+
     BndX, CallFun, Dest, Exp, ExpX, FuncCheckSst, FunctionSst, InternalFun, LocalDeclKind,
     LoopInv, Par, Stm, StmX,
 };
+
+thread_local! {
+    static DEBUG_OBLIGATION_NAME: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+}
+
+/// The obligation currently being authored on this thread (emission is
+/// parallel — env-gated TACTUS_DEBUG_FORMC prints must carry the name
+/// or ENTER/DECLINE lines interleave across obligations).
+pub(crate) fn debug_obligation_name() -> String {
+    DEBUG_OBLIGATION_NAME.with(|n| n.borrow().clone())
+}
+
+
 use vir::ast::{
     AssertQueryMode, BinaryOp, Expr, ExprX, Fun, FunctionKind, FunctionX,
     KrateX, SpannedTyped, TactusKind, Typ, UnaryOp, UnaryOpr,
@@ -2628,6 +2644,7 @@ impl ObligationEmitter {
                         let scripted = if !user_prefix {
                             goal_shape.as_ref().and_then(|shape| {
                                 if std::env::var("TACTUS_DEBUG_FORMC").is_ok() {
+                                    DEBUG_OBLIGATION_NAME.with(|n| *n.borrow_mut() = name.clone());
                                     eprintln!("[formc] OBLIGATION {name}");
                                 }
                                 crate::script::author_v1(

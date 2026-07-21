@@ -402,8 +402,9 @@ pub fn author_v1(
     // pp texts — ExactHyp only when the match is exact.
     if std::env::var("TACTUS_DEBUG_FORMC").is_ok() {
         eprintln!(
-            "[formc] V1 core={}",
-            crate::lean_pp::pp_expr(core)
+            "[formc] V1 core={} @{}",
+            crate::lean_pp::pp_expr(core),
+            crate::sst_to_lean::debug_obligation_name()
         );
     }
     if let Some(moves) = author_form_c(goal, core, &spine_moves, &hyps, &ant_props, &let_substs, shape, dts) {
@@ -525,10 +526,11 @@ fn author_form_c(
     let dbg = std::env::var("TACTUS_DEBUG_FORMC").is_ok();
     if dbg {
         eprintln!(
-            "[formc] ENTER core={} hyps={} ant={}",
+            "[formc] ENTER core={} hyps={} ant={} @{}",
             crate::lean_pp::pp_expr(core),
             hyps.len(),
-            ant_props.len()
+            ant_props.len(),
+            crate::sst_to_lean::debug_obligation_name()
         );
     }
     // Normalization substs: the goal's own lets (wrap path) PLUS the
@@ -590,10 +592,11 @@ fn author_form_c(
                 break;
             }
         }
-        if found.is_none() && std::env::var("TACTUS_DEBUG_FORMC").is_ok() {
-            eprintln!("[formc] DECLINE conjunct: {nc}");
+        if found.is_none() && dbg {
+            let at = crate::sst_to_lean::debug_obligation_name();
+            eprintln!("[formc] DECLINE conjunct: {nc} @{at}");
             for (n, cp) in &cands {
-                eprintln!("[formc]   cand {n}: {cp}");
+                eprintln!("[formc]   cand {n}: {cp} @{at}");
             }
         }
         exacts.push(found?);
