@@ -1376,14 +1376,30 @@ pub fn exec_fn_theorems_to_ast<'a>(
                     // failure (`lib.seq.lemma_seq_two_subranges_index`
                     // reported against every Rational equation goal).
                     // `None` = head not statically known (non-Call LHS)
-                    // → the arm is kept (conservative).
-                    let head = match &l.x {
-                        vir::ast::ExprX::Call(
-                            vir::ast::CallTarget::Fun(_, f, _, _, _, _),
-                            _,
-                            _,
-                        ) => Some(crate::to_lean_type::lean_name(&f.path)),
-                        _ => None,
+                    // → the arm is kept (conservative). The LHS arrives
+                    // wrapped in `Unary(Trigger, …)` annotations — peel
+                    // those to reach the actual head Call.
+                    let head = {
+                        let mut cur = &l.x;
+                        loop {
+                            match cur {
+                                vir::ast::ExprX::Unary(
+                                    vir::ast::UnaryOp::Trigger(_),
+                                    inner,
+                                ) => {
+                                    cur = &inner.x;
+                                }
+                                _ => break,
+                            }
+                        }
+                        match cur {
+                            vir::ast::ExprX::Call(
+                                vir::ast::CallTarget::Fun(_, f, _, _, _, _),
+                                _,
+                                _,
+                            ) => Some(crate::to_lean_type::lean_name(&f.path)),
+                            _ => None,
+                        }
                     };
                     Some((crate::to_lean_type::lean_name(&fun.path), head))
                 }
