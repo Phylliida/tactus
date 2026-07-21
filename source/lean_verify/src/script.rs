@@ -81,18 +81,16 @@ pub enum Move {
     /// `first | assumption | omega | with_reducible rfl` — the fail-fast
     /// terminal ladder.
     LeafClose,
-    /// `simp_all; omega` — the form-E leg: broadcast haves rewrite the
-    /// guard facts (`len (empty _) = 0`) omega then consumes.
-    LeafSimpAllOmega,
-    /// `simp_all +zetaDelta only [set] <;> omega` — the TARGETED leg:
-    /// the script's own unfold set + the ite/toNat normalizers, used
-    /// when the wild `simp_all` mangles the context (the recip sign
-    /// legs: a `¬(a.num > 0)` branch hyp plus Prop-equations send the
-    /// full simp into unclosable forms; the targeted set closes the
-    /// same goals — probes t57/t62, 2026-07-20). Runs BEFORE
-    /// LeafSimpAllOmega in the leg alternation: additive, so existing
-    /// scripts keep their behavior when it misses.
-    LeafTargetedSimp(Vec<String>),
+    /// `simp_all only [set] <;> omega` — the ONLY leg simp: bare
+    /// `simp_all` is opaque and version-unstable (the default simp set
+    /// drifts with Mathlib, silently changing a script's meaning on
+    /// upgrade — Danielle's law, 2026-07-20; see LEG_SIMP_LEMMAS). The
+    /// spine already unfolded the goal's fns, context hyps rewrite
+    /// regardless of `only` (broadcast haves, branch facts), the ite
+    /// set collapses the split guards, omega finishes. Replaces both
+    /// the wild `simp_all` leg (which mangled recip-shaped contexts)
+    /// and the ite-only backstop.
+    LeafSimpOnlyOmega(Vec<String>),
     /// The structural simp ladder (rung tail) for sides that differ by
     /// further non-recursive unfolds. Carries the ext-have exclusions
     /// (`-_tactus_bc_<i>` for the PROP-valued equation rewrites — the
@@ -189,8 +187,7 @@ fn render_move(m: &Move) -> String {
         Move::Defeq => "rfl".to_string(),
         Move::Done => "done".to_string(),
         Move::LeafClose => "first | assumption | omega | with_reducible rfl".to_string(),
-        Move::LeafSimpAllOmega => "simp_all; omega".to_string(),
-        Move::LeafTargetedSimp(fns) => format!(
+        Move::LeafSimpOnlyOmega(fns) => format!(
             "simp_all only [{}] <;> omega",
             fns.join(", ")
         ),
@@ -441,22 +438,16 @@ pub fn author_v1(
     // fallback ever runs.
     let mentioning = hyps_mentioning_any_unfold(&hyps, &ant_props, &unfolds);
     moves.push(Move::UnfoldSetTargeted(unfolds.clone(), mentioning));
-    // The targeted leg is the BACKSTOP, after the wild `simp_all`:
-    // existing legs keep their baseline behavior (divmod/pmul_push
-    // whnf-budgets are tuned for the wild set; targeted-first burned
-    // the 800k budget before the wild leg ever ran). It fires exactly
-    // on wild-misses — the recip sign legs, where the full simp set
-    // mangles the branch context and the tiny ite-collapse set closes
-    // (probes t57/t62).
+    // The leg close: leaf ladder, then the ONE named leg simp
+    // (LEG_SIMP_LEMMAS — every emitted simp is `simp only [named
+    // things]`; see the const's doc), then ExactHyp, then Done.
+    let leg_set: Vec<String> = crate::tactic_select::LEG_SIMP_LEMMAS
+        .split(", ")
+        .map(|s| s.to_string())
+        .collect();
     let mut legs = vec![
         Move::LeafClose,
-        Move::LeafSimpAllOmega,
-        Move::LeafTargetedSimp(vec![
-            "if_pos".to_string(),
-            "if_neg".to_string(),
-            "if_true".to_string(),
-            "if_false".to_string(),
-        ]),
+        Move::LeafSimpOnlyOmega(leg_set),
     ];
     if let Some(h) = exact {
         legs.push(Move::ExactHyp(h));
@@ -697,10 +688,10 @@ fn script_names_resolve(moves: &[Move], shape: &GoalShape, dts: &DtDefInventory)
             Move::RefineExact(hs) => hs.iter().map(|s| s.as_str()).collect(),
             Move::UnfoldSet(fs) => fs.iter().map(|s| s.as_str()).collect(),
             Move::UnfoldSetTargeted(fs, _) => fs.iter().map(|s| s.as_str()).collect(),
-            Move::LeafTargetedSimp(fs) => fs.iter().map(|s| s.as_str()).collect(),
+            Move::LeafSimpOnlyOmega(fs) => fs.iter().map(|s| s.as_str()).collect(),
             Move::StructuralTail(fs, _) => fs.iter().map(|s| s.as_str()).collect(),
             Move::UnfoldOnce(f) => vec![f.as_str()],
-            Move::Intros(_) | Move::IntroSubst(_) | Move::Defeq | Move::Done | Move::LeafClose | Move::LeafSimpAllOmega => {
+            Move::Intros(_) | Move::IntroSubst(_) | Move::Defeq | Move::Done | Move::LeafClose => {
                 vec![]
             }
             Move::SplitIf(legs) | Move::FirstOf(legs) => {

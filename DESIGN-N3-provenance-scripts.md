@@ -1,6 +1,29 @@
 # DESIGN — N3: Provenance-Driven Proof Scripts
 
 **Status:** DRAFT v0.1 (2026-07-19), for iteration with Danielle.
+**Named-simp arc (2026-07-20):** every emitted leg simp is now
+`simp_all only [LEG_SIMP_LEMMAS]` — bare `simp_all` eliminated from
+the obligation legs (opaque AND version-unstable: the default simp
+set drifts with Mathlib). Zero-delta: 114 verified / 72 errors,
+census byte-identical to the wild-set baseline. Lesson (29) — what
+the wild `simp_all` was actually doing on legs, decomposed: (a)
+broadcast-have rewrites — context hyps fire under `only` regardless
+(probe: `simp_all only [if_true]` rewrites with `h : x = 0`); (b)
+DEFAULT-SET arithmetic collapse (`mul_zero`, `ofNat_eq_coe`, … —
+default @[simp], invisible, version-unstable): a 6-name ite set
+"makes no progress" on the arith-heavy legs (divmod 67:16), so
+LEG_SIMP_LEMMAS carries a trimmed arithmetic normalizer — NO
+`ofNat_toNat` (the divmod lesson) and only the collapse quartet of
+distribution laws; (c) ite collapse: `if_pos`/`if_neg` live in the
+LEG set only, never the spine (they collapse the ites `split`
+needs). The wild simp's failure modes on the recip legs were NOT
+the default set's arithmetic but its whole-context hyp mangling —
+the targeted set closes the same legs by keeping the rewrite stock
+small and goal-directed. Remaining bare-simp debt: the two
+termination sites (`decreasing_by all_goals (simp_all; omega)` in
+to_lean_fn.rs and `simp [height] <;> omega` in link_discharge.rs) —
+a different consumer, riskier to change (they decide termination of
+every recursive spec fn); for a dedicated pass.
 **Recip sign-split arc LANDED (2026-07-20):** the Field family
 complete — mul_recip_right, recip_congruence ×2 green; divmod (4),
 pmul_padd_right (4), pmul_pad (1), pmul_singleton_right (1) all came
