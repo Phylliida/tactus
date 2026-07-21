@@ -274,6 +274,46 @@ sweep, census-gated deferrals (shadowing, name collisions), and the
 follow-up queue (discharge Q1 provenance, b70/71 closes, b69
 decision, call-mut, loop-telescope redesign, cache fingerprint).
 
+### Slice 2 Round B IN FLIGHT (2026-07-21): serializer — 16/20 bridges close
+
+Serializer (sst_serialize.rs + CertCallLeaves) mirrors the 3-mode
+emission: `hyp_ordinal` walk state → `_h_hoist_i` names (If-branch
+snapshot/restore — cond is `_h_hoist_1` in BOTH branches;
+AssertQueryNl resets to 0 — the sub-walk numbers independently);
+Assign→AssignH/AssignR/plain classification via `local_typs` (shared
+`assign_let_term`); Call-dest FLet→FLetH/FLetR (dest typ = the
+instantiated CALLEE ret typ, NOT the SST local's auto-deref'd typ —
+`ret_typ_subst`, plumbed through `CertCallLeaves`); RetLet→RetLetH
+via `ret_typ`; poison = prop LExpr mentions an in-scope residue name
+(`lexpr_mentions_var`, now pub(crate)); poisoned FLetH collapses to
+plain Assign losslessly; `let_binder_typs` tracked at call dests so
+the Return arm's TYPED-SPINE render inserts `.deref` on Ref-typed
+call results (`r = tmp__1.deref`).
+Beyond the mapped work: goals-transcriber residue peel (`goal_data`
+peels production's `let tmp__1 := …; @loc leaf` into `GoalData::Let`
+to match `residue_fold_e`); deepener `TypeAnnot` ERASURE arm (§3c
+first item — vec_read's `((view v) : Seq Int)`); Return-arm Bnd-let
+peel (Ghost/spec lets inside the return exp → AssignH statements,
+use_multiarg); AssertQueryNl gained the query's degenerate
+ensures-`True` obligation slot (model + serializer — production's
+`and_all([])` fallback at query-scope end).
+CLOSES (16): add_capped (full residue show: pure-hoist, hoist+residue,
+and poison-wrap goals in one fn), call_g2/g3_ob, clamped_inc,
+count_down, double_exec, id_generic, max_u64, mk_point, mul_bound,
+quad_exec, scope_shape, swap_pair, tri_one, use_clamped, use_multiarg.
+REMAINING BROKE (4), triaged:
+- sum_to / find_square — LOOPS (Round C/D: loop-telescope
+  simplification + loop hyp naming + shadow-rename mirror, all
+  evidence-mapped in §2b).
+- vec_read — stage-B REFERENCE-RENDERER divergence, not assembly:
+  the binder telescope matches production EXACTLY; `render_exp` of
+  the reference RawExp derives `v.deref` where production writes `v`
+  (view-call arg) and misses the `Int.ofNat` cast on a CallN arg —
+  the mirror has no fn-map to derive per-arg spec-call coercions from.
+  Card as stage-B deep-leaf coverage (follow-up queue §7.7).
+- head_exec — needs MATCH-statement machinery (the N2 match-split;
+  stage A has no match arm — genuinely new scope, card separately).
+
 ### Slice 2 Round A DONE (2026-07-21, `a2c40ad`): model 3-mode — 230/0 + package gate green
 
 The model (tactus-core/lib.rs) now mirrors production's post-`8dcac64`
