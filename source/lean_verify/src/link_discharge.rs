@@ -1483,8 +1483,9 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
         // then dies with "no goals"; `<;>` applies omega only to
         // whatever simp leaves.
         text.push_str(&format!(
-            "decreasing_by all_goals (simp [{}.height] <;> omega)\n",
-            dt
+            "decreasing_by all_goals (simp only [{}.height, {}] <;> omega)\n",
+            dt,
+            crate::tactic_select::TERM_SIMP_LEMMAS
         ));
     }
     Ok(Outcome::Closed { text, kind: "fix", meta })

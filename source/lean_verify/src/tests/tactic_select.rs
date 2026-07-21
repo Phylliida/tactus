@@ -372,10 +372,12 @@ fn form_e_arm_is_two_phase() {
         ..Default::default()
     };
     let derived = derived_closer(&goal, &dts, &[], false, &[], 0, None);
-    assert!(
-        derived.contains(" | (simp_all only [lib.poly.coeff]; first | omega | (split <;> simp_all <;> omega) | (split <;> simp_all))"),
-        "{derived}"
+    let expected = format!(
+        " | (simp_all only [lib.poly.coeff]; first | omega | (split <;> simp_all only [{}] <;> omega) | (split <;> simp_all only [{}]))",
+        crate::tactic_select::LEG_SIMP_LEMMAS,
+        crate::tactic_select::LEG_SIMP_LEMMAS,
     );
+    assert!(derived.contains(&expected), "{derived}");
     // No goal-mentioned unfolds → no form E arm at all.
     let bare = derived_closer(&bin(BinOp::Eq, var("x"), var("y")), &Default::default(), &[], false, &[], 0, None);
     assert!(!bare.contains("split"), "{bare}");

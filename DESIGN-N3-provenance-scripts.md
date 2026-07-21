@@ -24,6 +24,24 @@ termination sites (`decreasing_by all_goals (simp_all; omega)` in
 to_lean_fn.rs and `simp [height] <;> omega` in link_discharge.rs) —
 a different consumer, riskier to change (they decide termination of
 every recursive spec fn); for a dedicated pass.
+
+**Termination pass (2026-07-20 night):** the debt above is PAID —
+every termination/dec decreasing arm is now named too
+(TERM_SIMP_LEMMAS = LEG_SIMP_LEMMAS + `Int.natCast_sub`, the
+`↑(n - m)` collapse divmod's `toNat (n - len b)` termination needs):
+the datatype-height `simp_all`, the WF-height `simp [height]`, the
+DecreasingKind ladder family (SeqSubrange/SeqDropFirst/SeqDropLast/
+Div/Ladder + the mono chain), and the mono-companion theorem. The
+ladder's named arms elaborate pmul's termination one-for-one
+(probe t80); the e2e corpus (recursive datatypes everywhere) holds
+138/140 with the 2 pre-existing failures; algebra 114/72. Lesson
+(30): the termination arms' wild simp did the same three-part work
+as the legs (hyp rewrites, default-set arithmetic collapse, guard
+contradiction mop-up) — one TERM const covers all four site
+families, and the substitution discipline is identical: name the
+set, keep it small, let the corpus name what's missing. Bare
+`simp_all`/`simp [X]` is now extinct in emitted tactic text outside
+the legacy `tactus_auto` discover-mode path.
 **Recip sign-split arc LANDED (2026-07-20):** the Field family
 complete — mul_recip_right, recip_congruence ×2 green; divmod (4),
 pmul_padd_right (4), pmul_pad (1), pmul_singleton_right (1) all came

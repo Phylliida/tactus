@@ -495,27 +495,37 @@ fn decreasing_by_tactic(measure: &LExpr, self_name: &str, body: &LExpr) -> Strin
             let monos = SUFFIX_MONO_NAMES.with(|s| s.borrow().clone());
             let applies: String = monos.iter().map(|m| format!("apply {} | ", m)).collect();
             format!(
-                "all_goals (apply Nat.lt_of_le_of_lt <;> (first | {applies}(apply {df} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all))))",
+                "all_goals (apply Nat.lt_of_le_of_lt <;> (first | {applies}(apply {df} <;> (first | assumption | omega | (simp_all only [{ts}] <;> omega) | simp_all only [{ts}]))))",
                 df = q("Seq.drop_first_len_lt"),
+                ts = crate::tactic_select::TERM_SIMP_LEMMAS,
             )
         }
         DecreasingKind::SeqSubrange => format!(
-            "all_goals (apply {} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all))",
-            q("Seq.subrange_tail_len_lt")
+            "all_goals (apply {} <;> (first | assumption | omega | (simp_all only [{}] <;> omega) | simp_all only [{}]))",
+            q("Seq.subrange_tail_len_lt"),
+            crate::tactic_select::TERM_SIMP_LEMMAS,
+            crate::tactic_select::TERM_SIMP_LEMMAS,
         ),
         DecreasingKind::SeqDropFirst => format!(
-            "all_goals (apply {} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all))",
-            q("Seq.drop_first_len_lt")
+            "all_goals (apply {} <;> (first | assumption | omega | (simp_all only [{}] <;> omega) | simp_all only [{}]))",
+            q("Seq.drop_first_len_lt"),
+            crate::tactic_select::TERM_SIMP_LEMMAS,
+            crate::tactic_select::TERM_SIMP_LEMMAS,
         ),
         DecreasingKind::SeqDropLast => format!(
-            "all_goals (apply {} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all))",
-            q("Seq.drop_last_len_lt")
+            "all_goals (apply {} <;> (first | assumption | omega | (simp_all only [{}] <;> omega) | simp_all only [{}]))",
+            q("Seq.drop_last_len_lt"),
+            crate::tactic_select::TERM_SIMP_LEMMAS,
+            crate::tactic_select::TERM_SIMP_LEMMAS,
         ),
         DecreasingKind::Modular => "all_goals (apply Nat.mod_lt <;> omega)".to_string(),
         // Inner 2-ladder: the Prop-ite guard case (bootstrap-44) is
         // guard-shape dependent, which the measure can't predict.
         DecreasingKind::Div => {
-            "all_goals (apply Nat.div_lt_self <;> (first | omega | (simp_all <;> omega)))".to_string()
+            format!(
+                "all_goals (apply Nat.div_lt_self <;> (first | omega | (simp_all only [{}] <;> omega)))",
+                crate::tactic_select::TERM_SIMP_LEMMAS,
+            )
         }
         DecreasingKind::Split => "all_goals ((repeat split) <;> omega)".to_string(),
         DecreasingKind::Structural => "all_goals decreasing_tactic".to_string(),
@@ -533,13 +543,15 @@ fn decreasing_by_tactic(measure: &LExpr, self_name: &str, body: &LExpr) -> Strin
                         .map(|m| format!("apply {} | ", m))
                         .collect();
                     format!(
-                        " | (apply Nat.lt_of_le_of_lt <;> (first | {applies}(apply {df} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all))))",
+                        " | (apply Nat.lt_of_le_of_lt <;> (first | {applies}(apply {df} <;> (first | assumption | omega | (simp_all only [{ts}] <;> omega) | simp_all only [{ts}]))))",
                         df = q("Seq.drop_first_len_lt"),
+                        ts = crate::tactic_select::TERM_SIMP_LEMMAS,
                     )
                 }
             });
             format!(
-                "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Nat.div_lt_self <;> (simp_all <;> omega)) | (apply {ds} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | (apply {df} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | (apply {dl} <;> (first | assumption | omega | (simp_all <;> omega) | simp_all)) | ((repeat split) <;> omega){chain_rung} | decreasing_tactic)",
+                "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Nat.div_lt_self <;> (simp_all only [{ts}] <;> omega)) | (apply {ds} <;> (first | assumption | omega | (simp_all only [{ts}] <;> omega) | simp_all only [{ts}])) | (apply {df} <;> (first | assumption | omega | (simp_all only [{ts}] <;> omega) | simp_all only [{ts}])) | (apply {dl} <;> (first | assumption | omega | (simp_all only [{ts}] <;> omega) | simp_all only [{ts}])) | ((repeat split) <;> omega){chain_rung} | decreasing_tactic)",
+                ts = crate::tactic_select::TERM_SIMP_LEMMAS,
                 ds = q("Seq.subrange_tail_len_lt"),
                 df = q("Seq.drop_first_len_lt"),
                 dl = q("Seq.drop_last_len_lt"),
@@ -2051,7 +2063,10 @@ fn height_fn_for_datatype(
         body,
         termination_by: vec![termination],
         termination_structural: false,
-        decreasing_by: Some("all_goals (simp_all; omega)".to_string()),
+        decreasing_by: Some(format!(
+            "all_goals (simp_all only [{}]; omega)",
+            crate::tactic_select::TERM_SIMP_LEMMAS
+        )),
     }))
 }
 
