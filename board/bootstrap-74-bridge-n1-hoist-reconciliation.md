@@ -274,6 +274,36 @@ sweep, census-gated deferrals (shadowing, name collisions), and the
 follow-up queue (discharge Q1 provenance, b70/71 closes, b69
 decision, call-mut, loop-telescope redesign, cache fingerprint).
 
+### Slice 2 Round C DONE (2026-07-21): uniform loop telescope — gate 231/0, suite 551/0
+
+The `has_let` leading/non-leading switch is DELETED (the §2b loop
+trigger). `loop_maintain_frame`/`loop_use_frame` now build ONE uniform
+telescope: `mod_var_frames` (binder + NAMED `_h_hoist_i` bound hyp),
+`binderprops_to_hyps` (named inv hyps), named cond hyp + poison bit,
+and `_tactus_d_old` as an `FLetH` binder pair (`Loop` gains
+`cond_poison`, `d_old_ty`, `d_old_eq_name`, `d_old_eq_prop`). The
+render mode falls out of the GLOBAL wrap gate, exactly as production
+behaves post-`8dcac64`. Fixtures: nested-loop fixture now pins the
+old "non-leading" shape as gate-driven (a surviving plain `FLet`
+wrap-forces; the SAME loop node hoists without it); sum_to fixture's
+12 expected goals computed by `ref_wp` itself via `#reduce` (matches
+the §2b hand-derivation incl. shadow-freshened body rebinds
+`i_hoist1`/`acc_hoist1` as `AssignH` pairs). FLAGGED KNOB:
+`wp_stm_sound` got `#[verifier::heartbeats(1600000)]` — the 15-field
+Loop node doubles the termination VC's zetaDelta normalization of the
+12-arg `loop_maintain_frame`; a per-fn whnf knob, no proof-content
+change (analyzed the storm first: dead mframe let-bindings simp
+normalizes anyway).
+
+NEXT = Round D (serializer `loop_stm`): emit the new Loop fields —
+bound/inv/cond `_h_hoist_i` ordinals (the loop's frame position), the
+d_old eq pair (`_h__tactus_d_old_<id>_0_hoist1`,
+`_tactus_d_old_<id>_0 = <measure>`), cond poison — plus the
+shadow-rename mirror for loop-body rebinds (`i_hoist1`,
+`_h_i_hoist1_hoist1` — production's `fresh()` + `rename_frame_vars`
+over downstream leaf texts). Then fixture regen + probe9 loop
+families (sum_to, find_square).
+
 ### Slice 2 Round B IN FLIGHT (2026-07-21): serializer — 16/20 bridges close
 
 Serializer (sst_serialize.rs + CertCallLeaves) mirrors the 3-mode
