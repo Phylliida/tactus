@@ -1762,6 +1762,25 @@ fn strip_span_marks_node(node: &ExprNode) -> ExprNode {
     }
 }
 
+/// Recursively strip BOTH `SpanMark` and `TypeAnnot` wrappers. Used by
+/// the script author's exact-match comparisons: both wrappers are
+/// semantically transparent, but pp renders them (`/- @rust:LOC -/`
+/// comments, `(e : Ty)` ascriptions), so a candidate fact that arrives
+/// annotated (e.g. antecedent props carry a `(P : Prop)` ascription,
+/// trait-zero atoms carry `(zero (Self := (T)) : T)`) would never
+/// textually equal the bare goal conjunct.
+pub fn strip_transparent(expr: &Expr) -> Expr {
+    Expr::new(strip_transparent_node(&expr.node))
+}
+
+fn strip_transparent_node(node: &ExprNode) -> ExprNode {
+    match node {
+        ExprNode::SpanMark { inner, .. } => strip_transparent_node(&inner.node),
+        ExprNode::TypeAnnot { expr, .. } => strip_transparent_node(&expr.node),
+        _ => map_children(node, |c| strip_transparent(c)),
+    }
+}
+
 fn substitute_impl(
     expr: &Expr,
     subst: &std::collections::HashMap<crate::lean_name::LeanName, Expr>,
