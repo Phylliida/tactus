@@ -275,20 +275,20 @@ fn hoist_eq_names(hyps: &[ShapeHyp]) -> Vec<String> {
 /// Apply the hoist-equation substitutions to an expression: replace
 /// `Var(binder)` by the equation RHS, for every HoistEq hyp. Used by
 /// the ExactHyp cheap check (the author holds both texts — no
-/// proof-time hoping). Transparent wrappers are stripped for the
-/// comparison — see `apply_let_substs`.
+/// proof-time hoping). Transparent wrappers are stripped and the
+/// substitutions applied to a fixpoint — see `apply_let_substs`.
 fn apply_hoist_substs(e: &Expr, hyps: &[ShapeHyp]) -> Expr {
-    let mut out = e.clone();
+    let mut substs: Vec<(String, Expr)> = Vec::new();
     for h in hyps {
         if let HypProvenance::HoistEq { binder } = &h.prov {
             if let ExprNode::BinOp { op: crate::lean_ast::BinOp::Eq, lhs, rhs } = &h.prop.node {
                 if matches!(&lhs.node, ExprNode::Var(n) if n.as_str() == binder.as_str()) {
-                    out = subst_var(&out, binder.as_str(), rhs);
+                    substs.push((binder.as_str().to_string(), rhs.as_ref().clone()));
                 }
             }
         }
     }
-    crate::lean_ast::strip_transparent(&out)
+    apply_let_substs(e, &substs)
 }
 
 fn subst_var(e: &Expr, name: &str, val: &Expr) -> Expr {
@@ -400,6 +400,12 @@ pub fn author_v1(
     // textually equal the goal once the tmp lets are substituted. The
     // author applies the let-substs to every candidate and compares
     // pp texts — ExactHyp only when the match is exact.
+    if std::env::var("TACTUS_DEBUG_FORMC").is_ok() {
+        eprintln!(
+            "[formc] V1 core={}",
+            crate::lean_pp::pp_expr(core)
+        );
+    }
     if let Some(moves) = author_form_c(goal, core, &spine_moves, &hyps, &ant_props, &let_substs, shape, dts) {
         return Some((moves, ScriptForm::C));
     }
@@ -474,10 +480,25 @@ pub fn author_v1(
 /// different wrappers from different emission paths (call-site args vs
 /// the callee's instantiated ensures; antecedent props arrive with a
 /// `(P : Prop)` ascription) that would otherwise never compare equal.
+///
+/// The substitutions are applied TO A FIXPOINT, not in a single pass:
+/// hoist values mention earlier-bound names (`tmp19 := …(t)…` with
+/// `t := subrange …`), and a single ordered pass leaves the inserted
+/// values' inner names unexpanded on whichever side mentions them only
+/// indirectly — the goal side kept `t` while the candidate side
+/// expanded it, and textually-identical facts compared unequal
+/// (pmul_comm's 890 precondition). The hoist graph is acyclic
+/// (later binders reference earlier ones), so the fixpoint exists;
+/// the iteration cap is a belt-and-suspenders bound.
 fn apply_let_substs(e: &Expr, substs: &[(String, Expr)]) -> Expr {
     let mut out = e.clone();
-    for (name, val) in substs {
-        out = subst_var(&out, name, val);
+    for _ in 0..16 {
+        let next = substs.iter().fold(out.clone(), |cur, (name, val)| subst_var(&cur, name, val));
+        if crate::lean_pp::pp_expr(&next) == crate::lean_pp::pp_expr(&out) {
+            out = next;
+            break;
+        }
+        out = next;
     }
     crate::lean_ast::strip_transparent(&out)
 }
@@ -500,6 +521,15 @@ fn author_form_c(
 ) -> Option<Vec<Move>> {
     if spine_moves.is_empty() && hyps.is_empty() {
         return None;
+    }
+    let dbg = std::env::var("TACTUS_DEBUG_FORMC").is_ok();
+    if dbg {
+        eprintln!(
+            "[formc] ENTER core={} hyps={} ant={}",
+            crate::lean_pp::pp_expr(core),
+            hyps.len(),
+            ant_props.len()
+        );
     }
     // Normalization substs: the goal's own lets (wrap path) PLUS the
     // N1 hoist-equations (hoisted path — the tmp binders are binder
