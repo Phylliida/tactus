@@ -1,6 +1,27 @@
 # DESIGN — N3: Provenance-Driven Proof Scripts
 
 **Status:** DRAFT v0.1 (2026-07-19), for iteration with Danielle.
+**Infra review + pool experiment (2026-07-20):** the closer
+infrastructure audited against the transparency/predictability law.
+Already of the requested kind: the script author (computed matches —
+`ExactHyp` only when the emitter holds both texts), the Move
+vocabulary (named bounded steps, `FirstOf` the only backtracking),
+the certificate arc (quotient R1–R4, cancel, form G,
+denom-injectivity), the kernel decision procedures, and the
+census/span transparency layer. Noted debt (plan doc's Infra-debt
+section): `structural_rung`'s silent `take(3)` cases cap, default-scope
+failure legibility (no `proof {}` remedy message), broadcast-haves
+consumed by simp search (watch item). Lesson (24) — the pool
+experiment (`TACTUS_NONLIN_NO_POOL=1`): the congrArg pool arm is the
+workhorse, not search-debt — 132 obligations across ~45 fns fail
+without it. The menu-vs-tactic distinction: the deleted monomial menu
+was 8 enumerated branches tried in hope (unpredictable); the pool arm
+is ONE deterministic `nlinarith` call with a fixed, visible, computed
+fact set — the internal search lives inside nlinarith, same genus as
+omega's. It stays, with its caps (≤8 atoms, ≤12 haves, emission order)
+now documented at the emission site as part of the ladder's contract;
+the R-arms are the cap-free computed backstop. The env flag stays as
+an attribution tool.
 **Certificate-computation arc LANDED (2026-07-20):** quotient
 derivation + partial hoist + R3/R4 le-multipliers + denom-injectivity.
 Algebra: 107 → 112 verified, 86 → 76 errors. All 24 Rational impls

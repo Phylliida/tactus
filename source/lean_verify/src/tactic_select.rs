@@ -1565,6 +1565,16 @@ pub(crate) fn nonlin_ladder(goal: &Expr, binders: &[Binder]) -> String {
     // have's elaboration, killing the whole primary arm (surfaced by
     // the NONLIN hoist, which first let SUM-rhs hyps into the pool —
     // axiom_add_inverse_right, 2026-07-20).
+    //
+    // THE RULE (the ladder's statable contract): every Int equation
+    // hypothesis is also presented to nlinarith multiplied by each
+    // goal/hyp-mentioned Int atom, in emission order, up to 8 atoms
+    // (`multipliers.truncate(8)`) and 12 haves (`count >= 12`). The
+    // caps are a deliberate, documented budget boundary — the cap-free
+    // computed arms (R1–R4) stand behind them. Experiment
+    // (TACTUS_NONLIN_NO_POOL=1, 2026-07-20): this arm carries 132
+    // obligations across ~45 fns; it is the ladder's workhorse, one
+    // deterministic tactic call with visible inputs — not a menu.
     let mut pool: Vec<String> = hyps.iter().map(|h| h.name.clone()).collect();
     let mut pre: Vec<String> = Vec::new();
     let mut count = 0usize;
@@ -1592,7 +1602,20 @@ pub(crate) fn nonlin_ladder(goal: &Expr, binders: &[Binder]) -> String {
     }
     let pool_text = if pool.is_empty() { "[]".to_string() } else { format!("[{}]", pool.join(", ")) };
     let pre_text = if pre.is_empty() { String::new() } else { format!("{}; ", pre.join("; ")) };
-    let mut branches: Vec<String> = vec![format!("({}nlinarith {})", pre_text, pool_text)];
+    // EXPERIMENT (2026-07-20, Danielle's infra review): the pool arm is
+    // the last bounded-search component in the ladder — each Int-Eq hyp
+    // multiplied by each of ≤8 goal/atom atoms, capped at 12 haves,
+    // handed to nlinarith's internal certificate search. Whether the
+    // winner is inside the cap decides success, which is exactly the
+    // luck-bounded shape the quotient derivation replaced.
+    // TACTUS_NONLIN_NO_POOL=1 disables the arm so the corpus can name
+    // its true dependents; the computed arms (cancel, R1–R4) are the
+    // intended successors.
+    let mut branches: Vec<String> = if std::env::var("TACTUS_NONLIN_NO_POOL").is_err() {
+        vec![format!("({}nlinarith {})", pre_text, pool_text)]
+    } else {
+        Vec::new()
+    };
     // Cancel branch for equality goals with a positivity hyp.
     if let Some((d, lhs, rhs)) = cancel_target(goal, binders) {
         branches.push(format!(
