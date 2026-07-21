@@ -18,7 +18,7 @@ inductive lib.LeafList where
 @[simp] noncomputable def lib.LeafList.height (s : lib.LeafList) : Nat :=
   match s with | lib.LeafList.Nil => 1 | lib.LeafList.Cons _ val1 => 1 + lib.LeafList.height val1.deref
 termination_by sizeOf s
-decreasing_by all_goals (simp_all; omega)
+decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.LeafList.Nil.sizeOf_spec, lib.LeafList.Cons.sizeOf_spec]; omega)
 inductive lib.BinderIdList where
   | Nil
   | Cons (val0 : Int) (val1 : Tactus.Box lib.BinderIdList)
@@ -34,7 +34,7 @@ inductive lib.BinderIdList where
 @[simp] noncomputable def lib.BinderIdList.height (s : lib.BinderIdList) : Nat :=
   match s with | lib.BinderIdList.Nil => 1 | lib.BinderIdList.Cons _ val1 => 1 + lib.BinderIdList.height val1.deref
 termination_by sizeOf s
-decreasing_by all_goals (simp_all; omega)
+decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.BinderIdList.Nil.sizeOf_spec, lib.BinderIdList.Cons.sizeOf_spec]; omega)
 inductive lib.BinderList where
   | Nil
   | Cons (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.BinderList)
@@ -52,7 +52,7 @@ inductive lib.BinderList where
 @[simp] noncomputable def lib.BinderList.height (s : lib.BinderList) : Nat :=
   match s with | lib.BinderList.Nil => 1 | lib.BinderList.Cons _ _ val2 => 1 + lib.BinderList.height val2.deref
 termination_by sizeOf s
-decreasing_by all_goals (simp_all; omega)
+decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.BinderList.Nil.sizeOf_spec, lib.BinderList.Cons.sizeOf_spec]; omega)
 inductive lib.ParamBoundList where
   | Nil
   | NoBound (val0 : Tactus.Box lib.ParamBoundList)
@@ -75,19 +75,32 @@ inductive lib.ParamBoundList where
 @[simp] noncomputable def lib.ParamBoundList.height (s : lib.ParamBoundList) : Nat :=
   match s with | lib.ParamBoundList.Nil => 1 | lib.ParamBoundList.NoBound val0 => 1 + lib.ParamBoundList.height val0.deref | lib.ParamBoundList.Bound _ _ val2 => 1 + lib.ParamBoundList.height val2.deref
 termination_by sizeOf s
-decreasing_by all_goals (simp_all; omega)
+decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.ParamBoundList.Nil.sizeOf_spec, lib.ParamBoundList.NoBound.sizeOf_spec, lib.ParamBoundList.Bound.sizeOf_spec]; omega)
 inductive lib.RetBind where
   | RetNone
   | RetLet (val0 : Int) (val1 : Int)
+  | RetLetH (val0 : Int) (val1 : Int) (val2 : Int) (val3 : Int) (val4 : Int)
   deriving Inhabited
 @[simp] noncomputable def lib.RetBind.isRetNone (x : lib.RetBind) : Prop :=
   match x with | lib.RetBind.RetNone => True | _ => False
 @[simp] noncomputable def lib.RetBind.isRetLet (x : lib.RetBind) : Prop :=
   match x with | lib.RetBind.RetLet _ _ => True | _ => False
+@[simp] noncomputable def lib.RetBind.isRetLetH (x : lib.RetBind) : Prop :=
+  match x with | lib.RetBind.RetLetH _ _ _ _ _ => True | _ => False
 @[simp] noncomputable def lib.RetBind.RetLet_val0 (x : lib.RetBind) : Int :=
   match x with | lib.RetBind.RetLet val0 _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.RetBind.RetLet_val1 (x : lib.RetBind) : Int :=
   match x with | lib.RetBind.RetLet _ val1 => val1 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.RetBind.RetLetH_val0 (x : lib.RetBind) : Int :=
+  match x with | lib.RetBind.RetLetH val0 _ _ _ _ => val0 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.RetBind.RetLetH_val1 (x : lib.RetBind) : Int :=
+  match x with | lib.RetBind.RetLetH _ val1 _ _ _ => val1 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.RetBind.RetLetH_val2 (x : lib.RetBind) : Int :=
+  match x with | lib.RetBind.RetLetH _ _ val2 _ _ => val2 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.RetBind.RetLetH_val3 (x : lib.RetBind) : Int :=
+  match x with | lib.RetBind.RetLetH _ _ _ val3 _ => val3 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.RetBind.RetLetH_val4 (x : lib.RetBind) : Int :=
+  match x with | lib.RetBind.RetLetH _ _ _ _ val4 => val4 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.RetBind.height (_ : lib.RetBind) : Nat :=
   1
 inductive lib.TypData where
@@ -292,15 +305,15 @@ mutual
 @[simp] noncomputable def lib.RawExp.height (s : lib.RawExp) : Nat :=
   match s with | lib.RawExp.Var _ _ => 1 | lib.RawExp.Lit _ _ => 1 | lib.RawExp.LitBool _ => 1 | lib.RawExp.Clip _ val1 => 1 + lib.RawExp.height val1.deref | lib.RawExp.BinOp _ _ val2 val3 => 1 + lib.RawExp.height val2.deref + lib.RawExp.height val3.deref | lib.RawExp.Call _ _ val2 _ => 1 + lib.RawExp.height val2.deref | lib.RawExp.Field _ _ val2 => 1 + lib.RawExp.height val2.deref | lib.RawExp.HasType _ val1 => 1 + lib.RawExp.height val1.deref | lib.RawExp.Deref val0 => 1 + lib.RawExp.height val0.deref | lib.RawExp.Let _ val1 val2 => 1 + lib.RawExp.height val1.deref + lib.RawExp.height val2.deref | lib.RawExp.Not val0 => 1 + lib.RawExp.height val0.deref | lib.RawExp.Span _ val1 => 1 + lib.RawExp.height val1.deref | lib.RawExp.Ite _ val1 val2 val3 => 1 + lib.RawExp.height val1.deref + lib.RawExp.height val2.deref + lib.RawExp.height val3.deref | lib.RawExp.MatchR val0 val1 _ => 1 + lib.RawExp.height val0.deref + lib.RawArmList.height val1.deref | lib.RawExp.CallN _ _ val2 => 1 + lib.RawList.height val2.deref | lib.RawExp.ForallR _ _ val2 => 1 + lib.RawExp.height val2.deref | lib.RawExp.ExistsR _ _ val2 => 1 + lib.RawExp.height val2.deref
 termination_by sizeOf s
-decreasing_by all_goals (simp_all; omega)
+decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.RawExp.Var.sizeOf_spec, lib.RawExp.Lit.sizeOf_spec, lib.RawExp.LitBool.sizeOf_spec, lib.RawExp.Clip.sizeOf_spec, lib.RawExp.BinOp.sizeOf_spec, lib.RawExp.Call.sizeOf_spec, lib.RawExp.Field.sizeOf_spec, lib.RawExp.HasType.sizeOf_spec, lib.RawExp.Deref.sizeOf_spec, lib.RawExp.Let.sizeOf_spec, lib.RawExp.Not.sizeOf_spec, lib.RawExp.Span.sizeOf_spec, lib.RawExp.Ite.sizeOf_spec, lib.RawExp.MatchR.sizeOf_spec, lib.RawExp.CallN.sizeOf_spec, lib.RawExp.ForallR.sizeOf_spec, lib.RawExp.ExistsR.sizeOf_spec]; omega)
 @[simp] noncomputable def lib.RawArmList.height (s : lib.RawArmList) : Nat :=
   match s with | lib.RawArmList.Nil => 1 | lib.RawArmList.Cons _ _ val2 val3 => 1 + lib.RawExp.height val2.deref + lib.RawArmList.height val3.deref
 termination_by sizeOf s
-decreasing_by all_goals (simp_all; omega)
+decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.RawArmList.Nil.sizeOf_spec, lib.RawArmList.Cons.sizeOf_spec]; omega)
 @[simp] noncomputable def lib.RawList.height (s : lib.RawList) : Nat :=
   match s with | lib.RawList.Nil => 1 | lib.RawList.Cons val0 val1 => 1 + lib.RawExp.height val0.deref + lib.RawList.height val1.deref
 termination_by sizeOf s
-decreasing_by all_goals (simp_all; omega)
+decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.RawList.Nil.sizeOf_spec, lib.RawList.Cons.sizeOf_spec]; omega)
 end
 
 inductive lib.RawExpList where
@@ -318,24 +331,27 @@ inductive lib.RawExpList where
 @[simp] noncomputable def lib.RawExpList.height (s : lib.RawExpList) : Nat :=
   match s with | lib.RawExpList.Nil => 1 | lib.RawExpList.Cons _ val1 => 1 + lib.RawExpList.height val1.deref
 termination_by sizeOf s
-decreasing_by all_goals (simp_all; omega)
+decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.RawExpList.Nil.sizeOf_spec, lib.RawExpList.Cons.sizeOf_spec]; omega)
 inductive lib.FrameList where
   | FNil
   | FBind (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
-  | FHyp (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
+  | FHyp (val0 : Int) (val1 : Int) (val2 : Int) (val3 : Tactus.Box lib.FrameList)
   | FLet (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
   | FLetH (val0 : Int) (val1 : Int) (val2 : Int) (val3 : Int) (val4 : Int) (val5 : Tactus.Box lib.FrameList)
+  | FLetR (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
   deriving Inhabited
 @[simp] noncomputable def lib.FrameList.isFNil (x : lib.FrameList) : Prop :=
   match x with | lib.FrameList.FNil => True | _ => False
 @[simp] noncomputable def lib.FrameList.isFBind (x : lib.FrameList) : Prop :=
   match x with | lib.FrameList.FBind _ _ _ => True | _ => False
 @[simp] noncomputable def lib.FrameList.isFHyp (x : lib.FrameList) : Prop :=
-  match x with | lib.FrameList.FHyp _ _ _ => True | _ => False
+  match x with | lib.FrameList.FHyp _ _ _ _ => True | _ => False
 @[simp] noncomputable def lib.FrameList.isFLet (x : lib.FrameList) : Prop :=
   match x with | lib.FrameList.FLet _ _ _ => True | _ => False
 @[simp] noncomputable def lib.FrameList.isFLetH (x : lib.FrameList) : Prop :=
   match x with | lib.FrameList.FLetH _ _ _ _ _ _ => True | _ => False
+@[simp] noncomputable def lib.FrameList.isFLetR (x : lib.FrameList) : Prop :=
+  match x with | lib.FrameList.FLetR _ _ _ => True | _ => False
 @[simp] noncomputable def lib.FrameList.FBind_val0 (x : lib.FrameList) : Int :=
   match x with | lib.FrameList.FBind val0 _ _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.FrameList.FBind_val1 (x : lib.FrameList) : Int :=
@@ -343,11 +359,13 @@ inductive lib.FrameList where
 @[simp] noncomputable def lib.FrameList.FBind_val2 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
   match x with | lib.FrameList.FBind _ _ val2 => val2 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.FrameList.FHyp_val0 (x : lib.FrameList) : Int :=
-  match x with | lib.FrameList.FHyp val0 _ _ => val0 | _ => Classical.ofNonempty
+  match x with | lib.FrameList.FHyp val0 _ _ _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.FrameList.FHyp_val1 (x : lib.FrameList) : Int :=
-  match x with | lib.FrameList.FHyp _ val1 _ => val1 | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.FrameList.FHyp_val2 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
-  match x with | lib.FrameList.FHyp _ _ val2 => val2 | _ => Classical.ofNonempty
+  match x with | lib.FrameList.FHyp _ val1 _ _ => val1 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FHyp_val2 (x : lib.FrameList) : Int :=
+  match x with | lib.FrameList.FHyp _ _ val2 _ => val2 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FHyp_val3 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
+  match x with | lib.FrameList.FHyp _ _ _ val3 => val3 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.FrameList.FLet_val0 (x : lib.FrameList) : Int :=
   match x with | lib.FrameList.FLet val0 _ _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.FrameList.FLet_val1 (x : lib.FrameList) : Int :=
@@ -366,29 +384,41 @@ inductive lib.FrameList where
   match x with | lib.FrameList.FLetH _ _ _ _ val4 _ => val4 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.FrameList.FLetH_val5 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
   match x with | lib.FrameList.FLetH _ _ _ _ _ val5 => val5 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FLetR_val0 (x : lib.FrameList) : Int :=
+  match x with | lib.FrameList.FLetR val0 _ _ => val0 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FLetR_val1 (x : lib.FrameList) : Int :=
+  match x with | lib.FrameList.FLetR _ val1 _ => val1 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FLetR_val2 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
+  match x with | lib.FrameList.FLetR _ _ val2 => val2 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.FrameList.height (s : lib.FrameList) : Nat :=
-  match s with | lib.FrameList.FNil => 1 | lib.FrameList.FBind _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FHyp _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FLet _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FLetH _ _ _ _ _ val5 => 1 + lib.FrameList.height val5.deref
+  match s with | lib.FrameList.FNil => 1 | lib.FrameList.FBind _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FHyp _ _ _ val3 => 1 + lib.FrameList.height val3.deref | lib.FrameList.FLet _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FLetH _ _ _ _ _ val5 => 1 + lib.FrameList.height val5.deref | lib.FrameList.FLetR _ _ val2 => 1 + lib.FrameList.height val2.deref
 termination_by sizeOf s
-decreasing_by all_goals (simp_all; omega)
+decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.FrameList.FNil.sizeOf_spec, lib.FrameList.FBind.sizeOf_spec, lib.FrameList.FHyp.sizeOf_spec, lib.FrameList.FLet.sizeOf_spec, lib.FrameList.FLetH.sizeOf_spec, lib.FrameList.FLetR.sizeOf_spec]; omega)
 inductive lib.StmData where
-  | Assert (val0 : lib.RawExp) (val1 : Int)
-  | Assume (val0 : Int)
+  | Assert (val0 : lib.RawExp) (val1 : Int) (val2 : Int) (val3 : Int)
+  | Assume (val0 : Int) (val1 : Int) (val2 : Int)
   | Assign (val0 : Int) (val1 : Int)
+  | AssignH (val0 : Int) (val1 : Int) (val2 : Int) (val3 : Int) (val4 : Int)
+  | AssignR (val0 : Int) (val1 : Int)
   | Call (reqs : Tactus.Box lib.RawExpList) (post : Tactus.Box lib.FrameList)
   | DeadEnd (val0 : Tactus.Box lib.StmData)
   | Ret (val0 : Tactus.Box lib.RawExpList) (val1 : lib.RetBind)
-  | If (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.StmData) (val3 : Tactus.Box lib.StmData)
+  | If (val0 : Int) (val1 : Int) (val2 : Int) (val3 : Int) (val4 : Int) (val5 : Tactus.Box lib.StmData) (val6 : Tactus.Box lib.StmData)
   | Loop (inv_hyps : Tactus.Box lib.BinderList) (inv_obligs : Tactus.Box lib.RawExpList) (binders : Tactus.Box lib.BinderList) (binder_bounds : Tactus.Box lib.ParamBoundList) (cond_name : Int) (cond_ann : Int) (neg_cond_ann : Int) (d_old_name : Int) (d_old_val : Int) (decrease_oblig : lib.RawExp) (body : Tactus.Box lib.StmData)
   | AssertQueryNl (val0 : Tactus.Box lib.StmData)
   | Skip
   | Seq (val0 : Tactus.Box lib.StmData) (val1 : Tactus.Box lib.StmData)
   deriving Inhabited
 @[simp] noncomputable def lib.StmData.isAssert (x : lib.StmData) : Prop :=
-  match x with | lib.StmData.Assert _ _ => True | _ => False
+  match x with | lib.StmData.Assert _ _ _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isAssume (x : lib.StmData) : Prop :=
-  match x with | lib.StmData.Assume _ => True | _ => False
+  match x with | lib.StmData.Assume _ _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isAssign (x : lib.StmData) : Prop :=
   match x with | lib.StmData.Assign _ _ => True | _ => False
+@[simp] noncomputable def lib.StmData.isAssignH (x : lib.StmData) : Prop :=
+  match x with | lib.StmData.AssignH _ _ _ _ _ => True | _ => False
+@[simp] noncomputable def lib.StmData.isAssignR (x : lib.StmData) : Prop :=
+  match x with | lib.StmData.AssignR _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isCall (x : lib.StmData) : Prop :=
   match x with | lib.StmData.Call _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isDeadEnd (x : lib.StmData) : Prop :=
@@ -396,7 +426,7 @@ inductive lib.StmData where
 @[simp] noncomputable def lib.StmData.isRet (x : lib.StmData) : Prop :=
   match x with | lib.StmData.Ret _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isIf (x : lib.StmData) : Prop :=
-  match x with | lib.StmData.If _ _ _ _ => True | _ => False
+  match x with | lib.StmData.If _ _ _ _ _ _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isLoop (x : lib.StmData) : Prop :=
   match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isAssertQueryNl (x : lib.StmData) : Prop :=
@@ -406,15 +436,37 @@ inductive lib.StmData where
 @[simp] noncomputable def lib.StmData.isSeq (x : lib.StmData) : Prop :=
   match x with | lib.StmData.Seq _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.Assert_val0 (x : lib.StmData) : lib.RawExp :=
-  match x with | lib.StmData.Assert val0 _ => val0 | _ => Classical.ofNonempty
+  match x with | lib.StmData.Assert val0 _ _ _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Assert_val1 (x : lib.StmData) : Int :=
-  match x with | lib.StmData.Assert _ val1 => val1 | _ => Classical.ofNonempty
+  match x with | lib.StmData.Assert _ val1 _ _ => val1 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.Assert_val2 (x : lib.StmData) : Int :=
+  match x with | lib.StmData.Assert _ _ val2 _ => val2 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.Assert_val3 (x : lib.StmData) : Int :=
+  match x with | lib.StmData.Assert _ _ _ val3 => val3 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Assume_val0 (x : lib.StmData) : Int :=
-  match x with | lib.StmData.Assume val0 => val0 | _ => Classical.ofNonempty
+  match x with | lib.StmData.Assume val0 _ _ => val0 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.Assume_val1 (x : lib.StmData) : Int :=
+  match x with | lib.StmData.Assume _ val1 _ => val1 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.Assume_val2 (x : lib.StmData) : Int :=
+  match x with | lib.StmData.Assume _ _ val2 => val2 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Assign_val0 (x : lib.StmData) : Int :=
   match x with | lib.StmData.Assign val0 _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Assign_val1 (x : lib.StmData) : Int :=
   match x with | lib.StmData.Assign _ val1 => val1 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.AssignH_val0 (x : lib.StmData) : Int :=
+  match x with | lib.StmData.AssignH val0 _ _ _ _ => val0 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.AssignH_val1 (x : lib.StmData) : Int :=
+  match x with | lib.StmData.AssignH _ val1 _ _ _ => val1 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.AssignH_val2 (x : lib.StmData) : Int :=
+  match x with | lib.StmData.AssignH _ _ val2 _ _ => val2 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.AssignH_val3 (x : lib.StmData) : Int :=
+  match x with | lib.StmData.AssignH _ _ _ val3 _ => val3 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.AssignH_val4 (x : lib.StmData) : Int :=
+  match x with | lib.StmData.AssignH _ _ _ _ val4 => val4 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.AssignR_val0 (x : lib.StmData) : Int :=
+  match x with | lib.StmData.AssignR val0 _ => val0 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.AssignR_val1 (x : lib.StmData) : Int :=
+  match x with | lib.StmData.AssignR _ val1 => val1 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Call_reqs (x : lib.StmData) : Tactus.Box lib.RawExpList :=
   match x with | lib.StmData.Call reqs _ => reqs | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Call_post (x : lib.StmData) : Tactus.Box lib.FrameList :=
@@ -426,13 +478,19 @@ inductive lib.StmData where
 @[simp] noncomputable def lib.StmData.Ret_val1 (x : lib.StmData) : lib.RetBind :=
   match x with | lib.StmData.Ret _ val1 => val1 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.If_val0 (x : lib.StmData) : Int :=
-  match x with | lib.StmData.If val0 _ _ _ => val0 | _ => Classical.ofNonempty
+  match x with | lib.StmData.If val0 _ _ _ _ _ _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.If_val1 (x : lib.StmData) : Int :=
-  match x with | lib.StmData.If _ val1 _ _ => val1 | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.StmData.If_val2 (x : lib.StmData) : Tactus.Box lib.StmData :=
-  match x with | lib.StmData.If _ _ val2 _ => val2 | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.StmData.If_val3 (x : lib.StmData) : Tactus.Box lib.StmData :=
-  match x with | lib.StmData.If _ _ _ val3 => val3 | _ => Classical.ofNonempty
+  match x with | lib.StmData.If _ val1 _ _ _ _ _ => val1 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.If_val2 (x : lib.StmData) : Int :=
+  match x with | lib.StmData.If _ _ val2 _ _ _ _ => val2 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.If_val3 (x : lib.StmData) : Int :=
+  match x with | lib.StmData.If _ _ _ val3 _ _ _ => val3 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.If_val4 (x : lib.StmData) : Int :=
+  match x with | lib.StmData.If _ _ _ _ val4 _ _ => val4 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.If_val5 (x : lib.StmData) : Tactus.Box lib.StmData :=
+  match x with | lib.StmData.If _ _ _ _ _ val5 _ => val5 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.If_val6 (x : lib.StmData) : Tactus.Box lib.StmData :=
+  match x with | lib.StmData.If _ _ _ _ _ _ val6 => val6 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_inv_hyps (x : lib.StmData) : Tactus.Box lib.BinderList :=
   match x with | lib.StmData.Loop inv_hyps _ _ _ _ _ _ _ _ _ _ => inv_hyps | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_inv_obligs (x : lib.StmData) : Tactus.Box lib.RawExpList :=
@@ -462,9 +520,9 @@ inductive lib.StmData where
 @[simp] noncomputable def lib.StmData.Seq_val1 (x : lib.StmData) : Tactus.Box lib.StmData :=
   match x with | lib.StmData.Seq _ val1 => val1 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.height (s : lib.StmData) : Nat :=
-  match s with | lib.StmData.Assert _ _ => 1 | lib.StmData.Assume _ => 1 | lib.StmData.Assign _ _ => 1 | lib.StmData.Call _ _ => 1 | lib.StmData.DeadEnd val0 => 1 + lib.StmData.height val0.deref | lib.StmData.Ret _ _ => 1 | lib.StmData.If _ _ val2 val3 => 1 + lib.StmData.height val2.deref + lib.StmData.height val3.deref | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ body => 1 + lib.StmData.height body.deref | lib.StmData.AssertQueryNl val0 => 1 + lib.StmData.height val0.deref | lib.StmData.Skip => 1 | lib.StmData.Seq val0 val1 => 1 + lib.StmData.height val0.deref + lib.StmData.height val1.deref
+  match s with | lib.StmData.Assert _ _ _ _ => 1 | lib.StmData.Assume _ _ _ => 1 | lib.StmData.Assign _ _ => 1 | lib.StmData.AssignH _ _ _ _ _ => 1 | lib.StmData.AssignR _ _ => 1 | lib.StmData.Call _ _ => 1 | lib.StmData.DeadEnd val0 => 1 + lib.StmData.height val0.deref | lib.StmData.Ret _ _ => 1 | lib.StmData.If _ _ _ _ _ val5 val6 => 1 + lib.StmData.height val5.deref + lib.StmData.height val6.deref | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ body => 1 + lib.StmData.height body.deref | lib.StmData.AssertQueryNl val0 => 1 + lib.StmData.height val0.deref | lib.StmData.Skip => 1 | lib.StmData.Seq val0 val1 => 1 + lib.StmData.height val0.deref + lib.StmData.height val1.deref
 termination_by sizeOf s
-decreasing_by all_goals (simp_all; omega)
+decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.StmData.Assert.sizeOf_spec, lib.StmData.Assume.sizeOf_spec, lib.StmData.Assign.sizeOf_spec, lib.StmData.AssignH.sizeOf_spec, lib.StmData.AssignR.sizeOf_spec, lib.StmData.Call.sizeOf_spec, lib.StmData.DeadEnd.sizeOf_spec, lib.StmData.Ret.sizeOf_spec, lib.StmData.If.sizeOf_spec, lib.StmData.Loop.sizeOf_spec, lib.StmData.AssertQueryNl.sizeOf_spec, lib.StmData.Skip.sizeOf_spec, lib.StmData.Seq.sizeOf_spec]; omega)
 inductive lib.CastKind where
   | IntToNat
   | NatToInt
@@ -619,15 +677,15 @@ mutual
 @[simp] noncomputable def lib.ExprData.height (s : lib.ExprData) : Nat :=
   match s with | lib.ExprData.Atom _ => 1 | lib.ExprData.Lit _ => 1 | lib.ExprData.LitBool _ => 1 | lib.ExprData.Cast _ val1 => 1 + lib.ExprData.height val1.deref | lib.ExprData.BinOp _ val1 val2 => 1 + lib.ExprData.height val1.deref + lib.ExprData.height val2.deref | lib.ExprData.App _ val1 => 1 + lib.ExprData.height val1.deref | lib.ExprData.FieldProj val0 _ => 1 + lib.ExprData.height val0.deref | lib.ExprData.SpanMark _ val1 => 1 + lib.ExprData.height val1.deref | lib.ExprData.Let _ val1 val2 => 1 + lib.ExprData.height val1.deref + lib.ExprData.height val2.deref | lib.ExprData.Not val0 => 1 + lib.ExprData.height val0.deref | lib.ExprData.Ite val0 val1 val2 => 1 + lib.ExprData.height val0.deref + lib.ExprData.height val1.deref + lib.ExprData.height val2.deref | lib.ExprData.Match val0 val1 => 1 + lib.ExprData.height val0.deref + lib.ArmList.height val1.deref | lib.ExprData.AppN _ val1 => 1 + lib.ExprList.height val1.deref | lib.ExprData.Forall _ _ val2 => 1 + lib.ExprData.height val2.deref | lib.ExprData.Exists _ _ val2 => 1 + lib.ExprData.height val2.deref
 termination_by sizeOf s
-decreasing_by all_goals (simp_all; omega)
+decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.ExprData.Atom.sizeOf_spec, lib.ExprData.Lit.sizeOf_spec, lib.ExprData.LitBool.sizeOf_spec, lib.ExprData.Cast.sizeOf_spec, lib.ExprData.BinOp.sizeOf_spec, lib.ExprData.App.sizeOf_spec, lib.ExprData.FieldProj.sizeOf_spec, lib.ExprData.SpanMark.sizeOf_spec, lib.ExprData.Let.sizeOf_spec, lib.ExprData.Not.sizeOf_spec, lib.ExprData.Ite.sizeOf_spec, lib.ExprData.Match.sizeOf_spec, lib.ExprData.AppN.sizeOf_spec, lib.ExprData.Forall.sizeOf_spec, lib.ExprData.Exists.sizeOf_spec]; omega)
 @[simp] noncomputable def lib.ArmList.height (s : lib.ArmList) : Nat :=
   match s with | lib.ArmList.Nil => 1 | lib.ArmList.Cons _ _ val2 val3 => 1 + lib.ExprData.height val2.deref + lib.ArmList.height val3.deref
 termination_by sizeOf s
-decreasing_by all_goals (simp_all; omega)
+decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.ArmList.Nil.sizeOf_spec, lib.ArmList.Cons.sizeOf_spec]; omega)
 @[simp] noncomputable def lib.ExprList.height (s : lib.ExprList) : Nat :=
   match s with | lib.ExprList.Nil => 1 | lib.ExprList.Cons val0 val1 => 1 + lib.ExprData.height val0.deref + lib.ExprList.height val1.deref
 termination_by sizeOf s
-decreasing_by all_goals (simp_all; omega)
+decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.ExprList.Nil.sizeOf_spec, lib.ExprList.Cons.sizeOf_spec]; omega)
 end
 
 inductive lib.ParamList where
@@ -647,7 +705,7 @@ inductive lib.ParamList where
 @[simp] noncomputable def lib.ParamList.height (s : lib.ParamList) : Nat :=
   match s with | lib.ParamList.Nil => 1 | lib.ParamList.Cons _ _ val2 => 1 + lib.ParamList.height val2.deref
 termination_by sizeOf s
-decreasing_by all_goals (simp_all; omega)
+decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.ParamList.Nil.sizeOf_spec, lib.ParamList.Cons.sizeOf_spec]; omega)
 inductive lib.TypList where
   | Nil
   | Cons (val0 : lib.TypData) (val1 : Tactus.Box lib.TypList)
@@ -663,7 +721,7 @@ inductive lib.TypList where
 @[simp] noncomputable def lib.TypList.height (s : lib.TypList) : Nat :=
   match s with | lib.TypList.Nil => 1 | lib.TypList.Cons _ val1 => 1 + lib.TypList.height val1.deref
 termination_by sizeOf s
-decreasing_by all_goals (simp_all; omega)
+decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.TypList.Nil.sizeOf_spec, lib.TypList.Cons.sizeOf_spec]; omega)
 inductive lib.CtorList where
   | Nil
   | Cons (val0 : Int) (val1 : lib.TypList) (val2 : Tactus.Box lib.CtorList)
@@ -681,7 +739,7 @@ inductive lib.CtorList where
 @[simp] noncomputable def lib.CtorList.height (s : lib.CtorList) : Nat :=
   match s with | lib.CtorList.Nil => 1 | lib.CtorList.Cons _ _ val2 => 1 + lib.CtorList.height val2.deref
 termination_by sizeOf s
-decreasing_by all_goals (simp_all; omega)
+decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.CtorList.Nil.sizeOf_spec, lib.CtorList.Cons.sizeOf_spec]; omega)
 structure lib.DefData where
   name : Int
   params : lib.ParamList
@@ -750,7 +808,7 @@ inductive lib.GoalData where
 @[simp] noncomputable def lib.GoalData.height (s : lib.GoalData) : Nat :=
   match s with | lib.GoalData.Leaf _ => 1 | lib.GoalData.Imp _ val1 => 1 + lib.GoalData.height val1.deref | lib.GoalData.All _ _ val2 => 1 + lib.GoalData.height val2.deref | lib.GoalData.Let _ _ val2 => 1 + lib.GoalData.height val2.deref | lib.GoalData.LeafE _ => 1
 termination_by sizeOf s
-decreasing_by all_goals (simp_all; omega)
+decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.GoalData.Leaf.sizeOf_spec, lib.GoalData.Imp.sizeOf_spec, lib.GoalData.All.sizeOf_spec, lib.GoalData.Let.sizeOf_spec, lib.GoalData.LeafE.sizeOf_spec]; omega)
 inductive lib.GoalList where
   | Nil
   | Cons (val0 : Tactus.Box lib.GoalData) (val1 : Tactus.Box lib.GoalList)
@@ -766,7 +824,7 @@ inductive lib.GoalList where
 @[simp] noncomputable def lib.GoalList.height (s : lib.GoalList) : Nat :=
   match s with | lib.GoalList.Nil => 1 | lib.GoalList.Cons _ val1 => 1 + lib.GoalList.height val1.deref
 termination_by sizeOf s
-decreasing_by all_goals (simp_all; omega)
+decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.GoalList.Nil.sizeOf_spec, lib.GoalList.Cons.sizeOf_spec]; omega)
 structure lib.FnCtxData where
   typ_params : lib.BinderList
   params : lib.BinderList

@@ -136,13 +136,21 @@ pub enum ParamBoundList {
 pub enum RetBind {
     RetNone,
     RetLet(u64, u64),
+    /// (ret binder id, typ leaf, value leaf, eq-name leaf, eq-prop leaf) —
+    /// the HOISTABLE return-value binding (bootstrap-74 slice 2). Production
+    /// hoists a typed non-Bool `let r := e` into the binder pair
+    /// `(r : T) (_h_r_hoist1 : r = e)`; `ret_frame` appends an `FLetH`.
+    /// In wrap mode (the gate tripped) it renders `Let(r, e)` exactly like
+    /// `RetLet`, so the two are interchangeable whenever the goal wraps.
+    RetLetH(u64, u64, u64, u64, u64),
 }
 
 // ── Statements: the Wp-input mirror (stage-A subset) ────────────────
 
 pub enum StmData {
-    /// StmX::Assert — (annotated obligation `RawExp`, bare hyp leaf). The
-    /// GOAL this assert emits closes the ANNOTATED obligation
+    /// StmX::Assert — (annotated obligation `RawExp`, hyp NAME leaf, bare
+    /// hyp leaf, poison bit). The GOAL this assert emits closes the
+    /// ANNOTATED obligation
     /// (`/- @rust:LOC -/ prop`, production's `span_mark` render) via
     /// `close_e` → `LeafE(render_exp(ob))` (W6d.1b: the obligation slot is
     /// now the DEEP raw-SST mirror, not an opaque `u64`); the forward HYP it
@@ -154,11 +162,34 @@ pub enum StmData {
     /// (bare) for the SAME assert (finding-1). Fixtures with an opaque
     /// obligation use `atom_ob(id)` (= `Var(id, TyBool)`, renders to
     /// `Atom(id)`) so the deep spine matches the stage-A ids by construction.
-    Assert(RawExp, u64),
-    /// StmX::Assume.
-    Assume(u64),
-    /// StmX::Assign — (dest local leaf, rhs leaf).
+    /// The hyp NAME (`_h_hoist_i`, bootstrap-74 slice 2) is the serializer's
+    /// mirror of production's hyp ordinal; the POISON bit (1) marks a prop
+    /// whose text mentions a residue-let name — production's hoist_all
+    /// bails the whole goal to wrap mode then (the model's leaves are
+    /// opaque, so the serializer computes the mark).
+    Assert(RawExp, u64, u64, u64),
+    /// StmX::Assume — (hyp NAME leaf, prop leaf, poison bit). Same
+    /// naming/poison discipline as `Assert`.
+    Assume(u64, u64, u64),
+    /// StmX::Assign — (dest local leaf, rhs leaf). Plain form: a let that
+    /// is NOT hoistable — typ-less, or (slice-2 collapse) a hoistable let
+    /// whose equation prop mentions a residue name. Poisoned-collapse is
+    /// LOSSLESS: poison forces the whole goal into wrap mode, where the
+    /// hoist payload (typ/eq leaves) is discarded anyway.
     Assign(u64, u64),
+    /// StmX::Assign, HOISTABLE (bootstrap-74 slice 2) — (dest leaf, typ
+    /// leaf, rhs leaf, eq-name leaf, eq-prop leaf): a typed non-Bool
+    /// `x = e` that production's `hoist_all` lifts to the binder pair
+    /// `(x : T) (_h_x_hoist1 : x = e)`. Becomes an `FLetH` frame; wrap
+    /// mode renders it `Let(x, e)` exactly like `Assign`.
+    AssignH(u64, u64, u64, u64, u64),
+    /// StmX::Assign, RESIDUE (bootstrap-74 slice 2) — (dest leaf, rhs
+    /// leaf): a BOOL-typed `x = e` (an if-condition temp like
+    /// `tmp__1 := s < 2000`). Production keeps Bool lets in GOAL POSITION
+    /// (the "residue") while the other frames hoist — hoisting them as
+    /// propositional equations loops simp (the nested_if maxRecDepth
+    /// regression). Becomes an `FLetR` frame.
+    AssignR(u64, u64),
     /// StmX::Call — the requires OBLIGATIONS (`reqs`, a `RawExpList` of DEEP
     /// obligations closed via `close_each_e`; W6d.1b-ii) instantiated at the
     /// call's actual args, and the entire POST-CALL FRAME (`post`) the
@@ -186,8 +217,9 @@ pub enum StmData {
     /// postcondition (`RetBind`, finding-4). refWp closes each ensures under
     /// the frame extended by the return binding.
     Ret(Box<RawExpList>, RetBind),
-    /// StmX::If — (cond leaf, ¬cond leaf, then, else); absent else = Skip.
-    /// Both leaves are ANNOTATED (span_mark'd), byte-matching production's
+    /// StmX::If — (cond leaf, cond-hyp NAME leaf, ¬cond leaf, ¬cond-hyp
+    /// NAME leaf, cond poison bit, then, else); absent else = Skip.
+    /// Both prop leaves are ANNOTATED (span_mark'd), byte-matching production's
     /// `Wp::Branch`: the then-branch hyp is `cond_marked =
     /// span_mark(loc, Hypothesis(BranchCondition), cond)`, the else-branch
     /// hyp is `not(cond_marked)` (`sst_to_lean::walk_obligations`). The
@@ -196,8 +228,12 @@ pub enum StmData {
     /// interns to the SAME text as production's `BranchCondition` mark —
     /// bootstrap-17). The `cond` leaf is the then-branch hyp; `¬cond` is
     /// BOTH the else-branch hyp AND the fall-through continuation hyp when
-    /// the then-branch DIVERGES (`frame_after`, DESIGN §2.4.1).
-    If(u64, u64, Box<StmData>, Box<StmData>),
+    /// the then-branch DIVERGES (`frame_after`, DESIGN §2.4.1). The name
+    /// leaves are the serializer's `_h_hoist_i` mirror (bootstrap-74 slice
+    /// 2); the poison bit covers BOTH hyps (`c` and `¬c` mention the same
+    /// names) — a cond mentioning a residue let (e.g. `if tmp__1`) forces
+    /// whole-goal wrap.
+    If(u64, u64, u64, u64, u64, Box<StmData>, Box<StmData>),
     /// StmX::Loop — the maintain/use telescopes production builds around a
     /// loop (finding-3). Production havocs the modified locals, re-quantifies
     /// them as NAMED ∀-binders (`push_mod_var_frames` +
@@ -524,17 +560,24 @@ pub enum FrameList {
     FNil,
     /// (binder id, typ leaf, tail) — ∀-binder in the spine.
     FBind(u64, u64, Box<FrameList>),
-    /// (name leaf, hyp leaf, tail) — an implication hypothesis in the
-    /// spine. The NAME is rendering payload for N1-hoist mode
-    /// (production emits hyps as named theorem binders `(_h_hoist_i :
-    /// P)`, bootstrap-74); wrap-mode rendering (`Imp`) and the
-    /// semantic layer ignore it. Sites without a serializer-supplied
-    /// name carry 0 (never rendered in wrap mode).
-    FHyp(u64, u64, Box<FrameList>),
+    /// (name leaf, hyp leaf, POISON bit, tail) — an implication
+    /// hypothesis in the spine. The NAME is rendering payload for
+    /// N1-hoist mode (production emits hyps as named theorem binders
+    /// `(_h_hoist_i : P)`, bootstrap-74); wrap-mode rendering (`Imp`)
+    /// and the semantic layer ignore it. Sites without a
+    /// serializer-supplied name carry 0 (never rendered in wrap mode).
+    /// POISON (bootstrap-74 slice 2): 1 marks a prop whose text mentions
+    /// a residue-let (`FLetR`) name — production's `hoist_all` bail
+    /// check (`lexpr_mentions_var` over the rendered types) then returns
+    /// None and the WHOLE goal wraps. The model's leaves are opaque ids,
+    /// so the serializer computes the mark textually; the wrap gate is
+    /// `has_plain_flet(f) == 1 || has_poisoned_hyp(f) == 1`.
+    FHyp(u64, u64, u64, Box<FrameList>),
     /// (binder id, value leaf, tail) — a let-binding in the spine.
     /// Post-N1 (bootstrap-74): a PLAIN FLet marks a NON-hoistable let
-    /// (Bool-typed or typ-less — production's hoist_all None cases);
-    /// its presence in a frame list is the wrap-mode gate.
+    /// (typ-less — production's hoist_all None case — or a hoistable
+    /// let poisoned by a residue mention, collapsed losslessly); its
+    /// presence in a frame list is one half of the wrap-mode gate.
     FLet(u64, u64, Box<FrameList>),
     /// (binder id, typ leaf, value leaf, eq-name leaf, eq-prop leaf,
     /// tail) — a HOISTABLE let (bootstrap-74 N1 mirror). In hoist mode
@@ -544,6 +587,16 @@ pub enum FrameList {
     /// `Let(x, v)` exactly like FLet. The typ/eq leaves are serializer
     /// renderings (production's exact texts, interned).
     FLetH(u64, u64, u64, u64, u64, Box<FrameList>),
+    /// (binder id, value leaf, tail) — a RESIDUE let (bootstrap-74
+    /// slice 2): a BOOL-typed let (an if-condition temp). Production
+    /// keeps Bool lets in GOAL POSITION while the other frames hoist —
+    /// hoisting them as propositional equations loops simp. In hoist
+    /// mode an FLetR is SKIPPED by the binder telescope and folded as a
+    /// goal-position `Let(x, v)` around the leaf (frame order: earliest
+    /// residue outermost); in wrap mode it renders `Let(x, v)` exactly
+    /// like FLet. It NEVER forces wrap mode by itself — but an `FHyp`
+    /// whose prop mentions its name is poisoned, which does.
+    FLetR(u64, u64, Box<FrameList>),
 }
 
 pub type CtxFrame = FrameList;
@@ -618,9 +671,10 @@ pub open spec fn frame_len(f: FrameList) -> nat
     match f {
         FrameList::FNil => 0,
         FrameList::FBind(_id, _typ, t) => 1 + frame_len(*t),
-        FrameList::FHyp(_hn, _h, t) => 1 + frame_len(*t),
+        FrameList::FHyp(_hn, _h, _p, t) => 1 + frame_len(*t),
         FrameList::FLetH(_x, _ty, _v, _en, _ep, t) => 1 + frame_len(*t),
         FrameList::FLet(_id, _v, t) => 1 + frame_len(*t),
+        FrameList::FLetR(_id, _v, t) => 1 + frame_len(*t),
     }
 }
 
@@ -629,9 +683,11 @@ pub open spec fn stm_size(s: StmData) -> nat
     decreases s
 {
     match s {
-        StmData::Assert(_o, _h) => 1,
-        StmData::Assume(_e) => 1,
+        StmData::Assert(_o, _hn, _h, _hp) => 1,
+        StmData::Assume(_hn, _e, _hp) => 1,
         StmData::Assign(_d, _r) => 1,
+        StmData::AssignH(_x, _ty, _v, _en, _ep) => 1,
+        StmData::AssignR(_x, _v) => 1,
         // 1 + |reqs| (a RawExpList) + frame_len(post) (the FrameList delta) —
         // mirrors the serializer's `stm_size_of` token count: stmt heads +
         // RawExpList `Cons` (reqs) + FrameList `FBind`/`FHyp`/`FLet` (post).
@@ -639,7 +695,7 @@ pub open spec fn stm_size(s: StmData) -> nat
         StmData::DeadEnd(b) => 1 + stm_size(*b),
         StmData::AssertQueryNl(b) => 1 + stm_size(*b),
         StmData::Ret(es, _rb) => 1 + raw_exp_list_len(*es),
-        StmData::If(_c, _nc, t, e) => 1 + stm_size(*t) + stm_size(*e),
+        StmData::If(_c, _cn, _nc, _ncn, _cp, t, e) => 1 + stm_size(*t) + stm_size(*e),
         StmData::Loop { inv_hyps, inv_obligs, binders, binder_bounds: _, cond_name: _, cond_ann: _, neg_cond_ann: _, d_old_name: _, d_old_val: _, decrease_oblig: _, body } =>
             // Mirrors the serializer's `stm_size_of` token count, which sums
             // stmt heads + LeafList/BinderList/RawExpList `Cons` — `inv_hyps`
@@ -1831,8 +1887,8 @@ by { decide }
 proof fn skeleton_kernel_computes()
     ensures
         stm_size(StmData::Seq(
-            Box::new(StmData::Assert(atom_ob(0), 0)),
-            Box::new(StmData::If(1, 2, Box::new(StmData::Skip),
+            Box::new(StmData::Assert(atom_ob(0), 0, 0, 0)),
+            Box::new(StmData::If(1, 0, 2, 0, 0, Box::new(StmData::Skip),
                 Box::new(StmData::Ret(Box::new(RawExpList::Nil), RetBind::RetNone)))),
         )) == 5,
         goal_size(GoalData::Imp(7, Box::new(GoalData::All(8, 9, Box::new(GoalData::Leaf(10)))))) == 3,
@@ -1888,9 +1944,10 @@ pub open spec fn frame_append(f: FrameList, g: FrameList) -> FrameList
     match f {
         FrameList::FNil => g,
         FrameList::FBind(id, typ, t) => FrameList::FBind(id, typ, Box::new(frame_append(*t, g))),
-        FrameList::FHyp(hn, h, t) => FrameList::FHyp(hn, h, Box::new(frame_append(*t, g))),
+        FrameList::FHyp(hn, h, p, t) => FrameList::FHyp(hn, h, p, Box::new(frame_append(*t, g))),
         FrameList::FLetH(x, ty, v, en, ep, t) => FrameList::FLetH(x, ty, v, en, ep, Box::new(frame_append(*t, g))),
         FrameList::FLet(id, v, t) => FrameList::FLet(id, v, Box::new(frame_append(*t, g))),
+        FrameList::FLetR(id, v, t) => FrameList::FLetR(id, v, Box::new(frame_append(*t, g))),
     }
 }
 
@@ -1901,7 +1958,7 @@ pub open spec fn hyps_of_leaves(l: LeafList) -> FrameList
 {
     match l {
         LeafList::Nil => FrameList::FNil,
-        LeafList::Cons(h, t) => FrameList::FHyp(0, h, Box::new(hyps_of_leaves(*t))),
+        LeafList::Cons(h, t) => FrameList::FHyp(0, h, 0, Box::new(hyps_of_leaves(*t))),
     }
 }
 
@@ -1924,9 +1981,10 @@ pub open spec fn close(f: FrameList, obligation: u64) -> GoalData
     match f {
         FrameList::FNil => GoalData::Leaf(obligation),
         FrameList::FBind(id, typ, t) => GoalData::All(id, typ, Box::new(close(*t, obligation))),
-        FrameList::FHyp(_hn, h, t) => GoalData::Imp(h, Box::new(close(*t, obligation))),
+        FrameList::FHyp(_hn, h, _p, t) => GoalData::Imp(h, Box::new(close(*t, obligation))),
         FrameList::FLetH(id, _ty, v, _en, _ep, t) => GoalData::Let(id, v, Box::new(close(*t, obligation))),
         FrameList::FLet(id, v, t) => GoalData::Let(id, v, Box::new(close(*t, obligation))),
+        FrameList::FLetR(id, v, t) => GoalData::Let(id, v, Box::new(close(*t, obligation))),
     }
 }
 
@@ -1939,13 +1997,15 @@ pub open spec fn close(f: FrameList, obligation: u64) -> GoalData
 // (the architecture decision: a symmetric deepen is FORCED — `goals_eq`
 // compares `LeafE` against `LeafE`, never `LeafE` against `Leaf`).
 #[verifier::structural_decreases]
-// The N1 all-or-nothing gate (bootstrap-74): production's `hoist_all`
+// The N1 wrap gate, first half (bootstrap-74): production's `hoist_all`
 // returns None — whole goal renders old-style — iff ANY let frame is
-// non-hoistable. The mirror: any plain `FLet` in the list.
-// nat-valued (1 = a plain FLet is present), NOT bool: the dispatchers
-// branch on `== 1`, which emits with Nat.decEq and stays
+// typ-less (or a hoistable-but-poisoned let, which the serializer
+// collapses to plain FLet losslessly). The mirror: any plain `FLet` in
+// the list. nat-valued (1 = a plain FLet is present), NOT bool: the
+// dispatchers branch on `== 1`, which emits with Nat.decEq and stays
 // kernel-computable for `decide` (the file's has_let/binder_has_id
 // idiom — a bool gate emits Classical.propDecidable and sticks).
+// A RESIDUE let (`FLetR`) is NOT plain — it never forces wrap.
 #[verifier::structural_decreases]
 pub open spec fn has_plain_flet(f: FrameList) -> nat
     decreases f
@@ -1953,15 +2013,41 @@ pub open spec fn has_plain_flet(f: FrameList) -> nat
     match f {
         FrameList::FNil => 0,
         FrameList::FBind(_x, _ty, t) => has_plain_flet(*t),
-        FrameList::FHyp(_n, _h, t) => has_plain_flet(*t),
+        FrameList::FHyp(_n, _h, _p, t) => has_plain_flet(*t),
         FrameList::FLet(_x, _v, _t) => 1,
         FrameList::FLetH(_x, _ty, _v, _en, _ep, t) => has_plain_flet(*t),
+        FrameList::FLetR(_x, _v, t) => has_plain_flet(*t),
     }
+}
+
+// The N1 wrap gate, second half (bootstrap-74 slice 2): any POISONED
+// hyp — a prop whose text mentions a residue-let name, marked by the
+// serializer — forces whole-goal wrap (production's `hoist_all` bail
+// check on binder types mentioning residue names). Same nat idiom.
+#[verifier::structural_decreases]
+pub open spec fn has_poisoned_hyp(f: FrameList) -> nat
+    decreases f
+{
+    match f {
+        FrameList::FNil => 0,
+        FrameList::FBind(_x, _ty, t) => has_poisoned_hyp(*t),
+        FrameList::FHyp(_n, _h, p, t) => if p == 1 { 1 } else { has_poisoned_hyp(*t) },
+        FrameList::FLet(_x, _v, t) => has_poisoned_hyp(*t),
+        FrameList::FLetH(_x, _ty, _v, _en, _ep, t) => has_poisoned_hyp(*t),
+        FrameList::FLetR(_x, _v, t) => has_poisoned_hyp(*t),
+    }
+}
+
+// The combined wrap gate: the whole goal renders old-style (wrap) iff
+// any frame forces it — a plain FLet (typ-less/poison-collapsed let) or
+// a poisoned hyp. Mirrors `hoist_all` returning None.
+pub open spec fn gate_wrap(f: FrameList) -> nat {
+    if has_plain_flet(f) == 1 || has_poisoned_hyp(f) == 1 { 1 } else { 0 }
 }
 
 // Wrap-mode rendering (production's goal-position wrap — the pre-N1
 // shape, still used whenever the gate trips): hyps are anonymous
-// implications, lets (both kinds) are goal-position Lets.
+// implications, lets (all three kinds) are goal-position Lets.
 #[verifier::structural_decreases]
 pub open spec fn close_e_wrap(f: FrameList, ob: RawExp) -> GoalData
     decreases f
@@ -1969,36 +2055,61 @@ pub open spec fn close_e_wrap(f: FrameList, ob: RawExp) -> GoalData
     match f {
         FrameList::FNil => GoalData::LeafE(render_exp(ob)),
         FrameList::FBind(id, typ, t) => GoalData::All(id, typ, Box::new(close_e_wrap(*t, ob))),
-        FrameList::FHyp(_hn, h, t) => GoalData::Imp(h, Box::new(close_e_wrap(*t, ob))),
+        FrameList::FHyp(_hn, h, _p, t) => GoalData::Imp(h, Box::new(close_e_wrap(*t, ob))),
         FrameList::FLet(id, v, t) => GoalData::Let(id, v, Box::new(close_e_wrap(*t, ob))),
         FrameList::FLetH(id, _ty, v, _en, _ep, t) => GoalData::Let(id, v, Box::new(close_e_wrap(*t, ob))),
+        FrameList::FLetR(id, v, t) => GoalData::Let(id, v, Box::new(close_e_wrap(*t, ob))),
     }
 }
 
-// Hoist-mode rendering (production's hoist_all): every frame becomes a
-// theorem-level binder — hyps NAMED (`All(name, prop)`, the finding-2
-// FBind-encoding), hoistable lets the pair `All(x, typ) ∘
-// All(eq_name, eq_prop)`. A plain FLet cannot occur under the gate;
-// its arm renders Let for totality (unreachable when dispatched).
+// Hoist-mode rendering (production's hoist_all), TWO-PHASE exactly as
+// production builds it: phase 1 (`close_e_tel`) folds every non-residue
+// frame into the theorem-level binder telescope — hyps NAMED
+// (`All(name, prop)`, the finding-2 FBind-encoding), hoistable lets the
+// pair `All(x, typ) ∘ All(eq_name, eq_prop)` — SKIPPING residue lets;
+// phase 2 (`residue_fold_e`) folds the residue (Bool) lets as
+// goal-position `Let`s around the leaf, frame order (the earliest
+// residue let is outermost, matching production's `.rev()` fold). A
+// plain FLet cannot occur under the gate; its arm renders Let for
+// totality (unreachable when dispatched).
 #[verifier::structural_decreases]
-pub open spec fn close_e_hoist(f: FrameList, ob: RawExp) -> GoalData
+pub open spec fn close_e_tel(f: FrameList, g: GoalData) -> GoalData
     decreases f
 {
     match f {
-        FrameList::FNil => GoalData::LeafE(render_exp(ob)),
-        FrameList::FBind(id, typ, t) => GoalData::All(id, typ, Box::new(close_e_hoist(*t, ob))),
-        FrameList::FHyp(hn, h, t) => GoalData::All(hn, h, Box::new(close_e_hoist(*t, ob))),
-        FrameList::FLet(id, v, t) => GoalData::Let(id, v, Box::new(close_e_hoist(*t, ob))),
+        FrameList::FNil => g,
+        FrameList::FBind(id, typ, t) => GoalData::All(id, typ, Box::new(close_e_tel(*t, g))),
+        FrameList::FHyp(hn, h, _p, t) => GoalData::All(hn, h, Box::new(close_e_tel(*t, g))),
+        FrameList::FLet(id, v, t) => GoalData::Let(id, v, Box::new(close_e_tel(*t, g))),
         FrameList::FLetH(id, ty, _v, en, ep, t) =>
-            GoalData::All(id, ty, Box::new(GoalData::All(en, ep, Box::new(close_e_hoist(*t, ob))))),
+            GoalData::All(id, ty, Box::new(GoalData::All(en, ep, Box::new(close_e_tel(*t, g))))),
+        FrameList::FLetR(_id, _v, t) => close_e_tel(*t, g),
     }
+}
+
+#[verifier::structural_decreases]
+pub open spec fn residue_fold_e(f: FrameList, g: GoalData) -> GoalData
+    decreases f
+{
+    match f {
+        FrameList::FNil => g,
+        FrameList::FLetR(id, v, t) => GoalData::Let(id, v, Box::new(residue_fold_e(*t, g))),
+        FrameList::FBind(_id, _typ, t) => residue_fold_e(*t, g),
+        FrameList::FHyp(_hn, _h, _p, t) => residue_fold_e(*t, g),
+        FrameList::FLet(_id, _v, t) => residue_fold_e(*t, g),
+        FrameList::FLetH(_id, _ty, _v, _en, _ep, t) => residue_fold_e(*t, g),
+    }
+}
+
+pub open spec fn close_e_hoist(f: FrameList, ob: RawExp) -> GoalData {
+    close_e_tel(f, residue_fold_e(f, GoalData::LeafE(render_exp(ob))))
 }
 
 // The gated dispatcher — the ONE rendering entry point (all callers
 // unchanged). Mode is decided ONCE over the whole frame list, exactly
 // as production inspects all frames before hoisting (§hoist_all).
 pub open spec fn close_e(f: FrameList, ob: RawExp) -> GoalData {
-    if has_plain_flet(f) == 1 { close_e_wrap(f, ob) } else { close_e_hoist(f, ob) }
+    if gate_wrap(f) == 1 { close_e_wrap(f, ob) } else { close_e_hoist(f, ob) }
 }
 
 // W6d.1b: the bare-atom obligation. An obligation leaf that carries no deep
@@ -2075,7 +2186,7 @@ pub open spec fn havoc_lets(f: FrameList, mods: BinderList) -> FrameList
     match f {
         FrameList::FNil => FrameList::FNil,
         FrameList::FBind(id, typ, t) => FrameList::FBind(id, typ, Box::new(havoc_lets(*t, mods))),
-        FrameList::FHyp(hn, h, t) => FrameList::FHyp(hn, h, Box::new(havoc_lets(*t, mods))),
+        FrameList::FHyp(hn, h, p, t) => FrameList::FHyp(hn, h, p, Box::new(havoc_lets(*t, mods))),
         FrameList::FLet(id, v, t) =>
             if binder_has_id(mods, id) == 1 {
                 havoc_lets(*t, mods)
@@ -2087,6 +2198,12 @@ pub open spec fn havoc_lets(f: FrameList, mods: BinderList) -> FrameList
                 havoc_lets(*t, mods)
             } else {
                 FrameList::FLetH(id, ty, v, en, ep, Box::new(havoc_lets(*t, mods)))
+            },
+        FrameList::FLetR(id, v, t) =>
+            if binder_has_id(mods, id) == 1 {
+                havoc_lets(*t, mods)
+            } else {
+                FrameList::FLetR(id, v, Box::new(havoc_lets(*t, mods)))
             },
     }
 }
@@ -2152,9 +2269,10 @@ pub open spec fn has_let(f: FrameList) -> nat
     match f {
         FrameList::FNil => 0,
         FrameList::FBind(_id, _typ, t) => has_let(*t),
-        FrameList::FHyp(_hn, _h, t) => has_let(*t),
+        FrameList::FHyp(_hn, _h, _p, t) => has_let(*t),
         FrameList::FLet(_id, _v, _t) => 1,
         FrameList::FLetH(_id, _ty, _v, _en, _ep, _t) => 1,
+        FrameList::FLetR(_id, _v, _t) => 1,
     }
 }
 
@@ -2168,7 +2286,7 @@ pub open spec fn binderprops_to_hyps(b: BinderList) -> FrameList
 {
     match b {
         BinderList::Nil => FrameList::FNil,
-        BinderList::Cons(name, prop, t) => FrameList::FHyp(name, prop, Box::new(binderprops_to_hyps(*t))),
+        BinderList::Cons(name, prop, t) => FrameList::FHyp(name, prop, 0, Box::new(binderprops_to_hyps(*t))),
     }
 }
 
@@ -2183,7 +2301,7 @@ pub open spec fn seed_binders_hyp_bounds(binders: BinderList, bounds: ParamBound
         BinderList::Nil => FrameList::FNil,
         BinderList::Cons(id, typ, t) => match bounds {
             ParamBoundList::Bound(_hname, prop, bt) =>
-                FrameList::FBind(id, typ, Box::new(FrameList::FHyp(0, prop, Box::new(seed_binders_hyp_bounds(*t, *bt))))),
+                FrameList::FBind(id, typ, Box::new(FrameList::FHyp(0, prop, 0, Box::new(seed_binders_hyp_bounds(*t, *bt))))),
             ParamBoundList::NoBound(bt) =>
                 FrameList::FBind(id, typ, Box::new(seed_binders_hyp_bounds(*t, *bt))),
             ParamBoundList::Nil =>
@@ -2222,7 +2340,7 @@ pub open spec fn loop_maintain_frame(
         frame_append(hv,
             frame_append(seed_binders_hyp_bounds(binders, binder_bounds),
                 frame_append(binderprops_to_hyps(inv_hyps),
-                    frame_append(FrameList::FHyp(0, cond_ann, Box::new(FrameList::FNil)),
+                    frame_append(FrameList::FHyp(0, cond_ann, 0, Box::new(FrameList::FNil)),
                         d_old))))
     }
 }
@@ -2248,7 +2366,7 @@ pub open spec fn loop_use_frame(
         frame_append(hv,
             frame_append(seed_binders_hyp_bounds(binders, binder_bounds),
                 frame_append(binderprops_to_hyps(inv_hyps),
-                    FrameList::FHyp(0, neg_cond_ann, Box::new(FrameList::FNil)))))
+                    FrameList::FHyp(0, neg_cond_ann, 0, Box::new(FrameList::FNil)))))
     }
 }
 
@@ -2286,7 +2404,7 @@ pub open spec fn diverges(s: StmData) -> nat
         StmData::DeadEnd(_b) => 1,           // `false` context: control does not continue
         StmData::Seq(a, b) =>
             if diverges(*a) == 1 || diverges(*b) == 1 { 1 } else { 0 },
-        StmData::If(_c, _nc, t, e) =>
+        StmData::If(_c, _cn, _nc, _ncn, _cp, t, e) =>
             if diverges(*t) == 1 && diverges(*e) == 1 { 1 } else { 0 },
         _ => 0,
     }
@@ -2303,9 +2421,10 @@ pub open spec fn strip_hyps(f: FrameList) -> FrameList
     match f {
         FrameList::FNil => FrameList::FNil,
         FrameList::FBind(x, ty, t) => FrameList::FBind(x, ty, Box::new(strip_hyps(*t))),
-        FrameList::FHyp(_hn, _h, t) => strip_hyps(*t),
+        FrameList::FHyp(_hn, _h, _p, t) => strip_hyps(*t),
         FrameList::FLet(x, v, t) => FrameList::FLet(x, v, Box::new(strip_hyps(*t))),
         FrameList::FLetH(x, ty, v, en, ep, t) => FrameList::FLetH(x, ty, v, en, ep, Box::new(strip_hyps(*t))),
+        FrameList::FLetR(x, v, t) => FrameList::FLetR(x, v, Box::new(strip_hyps(*t))),
     }
 }
 
@@ -2317,9 +2436,12 @@ pub open spec fn frame_after(f: FrameList, s: StmData) -> FrameList
     decreases s
 {
     match s {
-        StmData::Assert(_o, h) => frame_append(f, FrameList::FHyp(0, h, Box::new(FrameList::FNil))),
-        StmData::Assume(e) => frame_append(f, FrameList::FHyp(0, e, Box::new(FrameList::FNil))),
+        StmData::Assert(_o, hn, h, hp) => frame_append(f, FrameList::FHyp(hn, h, hp, Box::new(FrameList::FNil))),
+        StmData::Assume(hn, e, hp) => frame_append(f, FrameList::FHyp(hn, e, hp, Box::new(FrameList::FNil))),
         StmData::Assign(x, rhs) => frame_append(f, FrameList::FLet(x, rhs, Box::new(FrameList::FNil))),
+        StmData::AssignH(x, ty, v, en, ep) =>
+            frame_append(f, FrameList::FLetH(x, ty, v, en, ep, Box::new(FrameList::FNil))),
+        StmData::AssignR(x, v) => frame_append(f, FrameList::FLetR(x, v, Box::new(FrameList::FNil))),
         // Pass-through: append the serializer-transcribed post-call frame
         // verbatim (the ∀-path or #128 ret-eq shape both live in `post`).
         StmData::Call { reqs: _, post } => frame_append(f, *post),
@@ -2332,9 +2454,9 @@ pub open spec fn frame_after(f: FrameList, s: StmData) -> FrameList
         // `nc` leaf — production's `not(cond_marked)`, §2.4.1). Guarded by
         // `diverges(then) && is_skip(else)`; the general two-way join stays
         // `f` (honest-fail, documented caveat).
-        StmData::If(_c, nc, t, e) =>
+        StmData::If(_c, _cn, nc, ncn, cp, t, e) =>
             if diverges(*t) == 1 && is_skip(*e) == 1 {
-                frame_append(f, FrameList::FHyp(0, nc, Box::new(FrameList::FNil)))
+                frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil)))
             } else {
                 f
             },
@@ -2365,6 +2487,8 @@ pub open spec fn ret_frame(f: FrameList, rb: RetBind) -> FrameList {
         RetBind::RetNone => f,
         RetBind::RetLet(name, val) =>
             frame_append(f, FrameList::FLet(name, val, Box::new(FrameList::FNil))),
+        RetBind::RetLetH(name, ty, val, en, ep) =>
+            frame_append(f, FrameList::FLetH(name, ty, val, en, ep, Box::new(FrameList::FNil))),
     }
 }
 
@@ -2374,18 +2498,20 @@ pub open spec fn wp_stm(f: FrameList, s: StmData) -> GoalList
     decreases s
 {
     match s {
-        StmData::Assert(o, _h) =>
+        StmData::Assert(o, _hn, _h, _hp) =>
             GoalList::Cons(Box::new(close_e(f, o)), Box::new(GoalList::Nil)),
-        StmData::Assume(_e) => GoalList::Nil,
+        StmData::Assume(_hn, _e, _hp) => GoalList::Nil,
         StmData::Assign(_x, _rhs) => GoalList::Nil,
+        StmData::AssignH(_x, _ty, _v, _en, _ep) => GoalList::Nil,
+        StmData::AssignR(_x, _v) => GoalList::Nil,
         StmData::Call { reqs, post: _ } => close_each_e(f, *reqs),
         StmData::DeadEnd(b) => wp_stm(f, *b),
         StmData::AssertQueryNl(b) => wp_stm(strip_hyps(f), *b),
         StmData::Ret(es, rb) => close_each_e(ret_frame(f, rb), *es),
-        StmData::If(c, nc, t, e) =>
+        StmData::If(c, cn, nc, ncn, cp, t, e) =>
             goals_append(
-                wp_stm(frame_append(f, FrameList::FHyp(0, c, Box::new(FrameList::FNil))), *t),
-                wp_stm(frame_append(f, FrameList::FHyp(0, nc, Box::new(FrameList::FNil))), *e)),
+                wp_stm(frame_append(f, FrameList::FHyp(cn, c, cp, Box::new(FrameList::FNil))), *t),
+                wp_stm(frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e)),
         StmData::Loop { inv_hyps, inv_obligs, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann: _, d_old_name, d_old_val, decrease_oblig, body } => {
             // Maintain telescope (finding-3 + bootstrap-16): havoc pre-loop
             // lets for the modified locals, re-quantify them + bounds,
@@ -2597,7 +2723,7 @@ by { decide }
 
 proof fn probe_wp_stm()
     ensures
-        goal_count(wp_stm(FrameList::FNil, StmData::Assert(atom_ob(9), 9))) == 1,
+        goal_count(wp_stm(FrameList::FNil, StmData::Assert(atom_ob(9), 0, 9, 0))) == 1,
         goal_count(wp_stm(FrameList::FNil, StmData::Skip)) == 0
 by { decide }
 
@@ -2609,7 +2735,7 @@ proof fn probe_ref_wp()
             param_bounds: ParamBoundList::Nil,
             reqs: BinderList::Nil,
             enss: LeafList::Nil,
-        }, StmData::Assert(atom_ob(9), 9))) == 1
+        }, StmData::Assert(atom_ob(9), 0, 9, 0))) == 1
 by { decide }
 
 // ── W2a: end-to-end refWp unit examples (against hand-computed goals) ──
@@ -2630,7 +2756,7 @@ proof fn ref_wp_seed_and_assert()
                     reqs: BinderList::Nil,
                     enss: LeafList::Nil,
                 },
-                StmData::Assert(atom_ob(9), 9),
+                StmData::Assert(atom_ob(9), 0, 9, 0),
             ),
             GoalList::Cons(
                 Box::new(GoalData::All(0, 1, Box::new(GoalData::All(19, 2, Box::new(GoalData::LeafE(ExprData::Atom(9))))))),
@@ -2670,7 +2796,7 @@ proof fn ref_wp_seq_threads_frame()
                     reqs: BinderList::Nil,
                     enss: LeafList::Nil,
                 },
-                StmData::Seq(Box::new(StmData::Assert(atom_ob(9), 9)), Box::new(StmData::Assert(atom_ob(10), 10))),
+                StmData::Seq(Box::new(StmData::Assert(atom_ob(9), 0, 9, 0)), Box::new(StmData::Assert(atom_ob(10), 0, 10, 0))),
             ),
             GoalList::Cons(
                 Box::new(GoalData::All(0, 1, Box::new(GoalData::All(19, 2, Box::new(GoalData::LeafE(ExprData::Atom(9))))))),
@@ -2704,7 +2830,7 @@ proof fn ref_wp_add_capped_seed_spine()
                     reqs: BinderList::Cons(8, 7, Box::new(BinderList::Cons(10, 9, Box::new(BinderList::Nil)))),
                     enss: LeafList::Cons(11, Box::new(LeafList::Nil)),
                 },
-                StmData::Assert(atom_ob(15), 14),
+                StmData::Assert(atom_ob(15), 0, 14, 0),
             ),
             GoalList::Cons(
                 Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2,
@@ -2805,11 +2931,11 @@ proof fn ref_wp_sum_to_loop()
                         d_old_val: 28,
                         decrease_oblig: atom_ob(39),
                         body: Box::new(
-                            StmData::Seq(Box::new(StmData::Assert(atom_ob(18), 17)), Box::new(
-                            StmData::Seq(Box::new(StmData::Assume(17)), Box::new(
+                            StmData::Seq(Box::new(StmData::Assert(atom_ob(18), 0, 17, 0)), Box::new(
+                            StmData::Seq(Box::new(StmData::Assume(0, 17, 0)), Box::new(
                             StmData::Seq(Box::new(StmData::Assign(9, 19)), Box::new(
-                            StmData::Seq(Box::new(StmData::Assert(atom_ob(21), 20)), Box::new(
-                            StmData::Seq(Box::new(StmData::Assume(20)), Box::new(
+                            StmData::Seq(Box::new(StmData::Assert(atom_ob(21), 0, 20, 0)), Box::new(
+                            StmData::Seq(Box::new(StmData::Assume(0, 20, 0)), Box::new(
                             StmData::Assign(11, 22)))))))))))),
                     }),
                     Box::new(StmData::Ret(Box::new(RawExpList::Cons(Box::new(atom_ob(7)), Box::new(RawExpList::Nil))),
@@ -2932,16 +3058,16 @@ proof fn ref_wp_if_fallthrough_divergence()
         // DIVERGING then (`Ret` inside) + Skip else ⇒ continuation sees ¬cond.
         goals_eq(
             wp_stm(
-                FrameList::FHyp(0, 34, Box::new(FrameList::FNil)),
+                FrameList::FHyp(0, 34, 0, Box::new(FrameList::FNil)),
                 StmData::Seq(
-                    Box::new(StmData::If(36, 37,
+                    Box::new(StmData::If(36, 0, 37, 0, 0,
                         Box::new(StmData::Seq(
                             Box::new(StmData::Ret(
                                 Box::new(RawExpList::Cons(Box::new(atom_ob(7)), Box::new(RawExpList::Nil))),
                                 RetBind::RetLet(8, 9))),
                             Box::new(StmData::Skip))),
                         Box::new(StmData::Skip))),
-                    Box::new(StmData::Assert(atom_ob(40), 39)))),
+                    Box::new(StmData::Assert(atom_ob(40), 0, 39, 0)))),
             GoalList::Cons(
                 Box::new(GoalData::Imp(34, Box::new(GoalData::Imp(36,
                     Box::new(GoalData::Let(8, 9, Box::new(GoalData::LeafE(ExprData::Atom(7))))))))),
@@ -2954,12 +3080,12 @@ proof fn ref_wp_if_fallthrough_divergence()
         // continuation assert closes under the bare pre-if frame `[34]`.
         goals_eq(
             wp_stm(
-                FrameList::FHyp(0, 34, Box::new(FrameList::FNil)),
+                FrameList::FHyp(0, 34, 0, Box::new(FrameList::FNil)),
                 StmData::Seq(
-                    Box::new(StmData::If(36, 37,
+                    Box::new(StmData::If(36, 0, 37, 0, 0,
                         Box::new(StmData::Skip),
                         Box::new(StmData::Skip))),
-                    Box::new(StmData::Assert(atom_ob(40), 39)))),
+                    Box::new(StmData::Assert(atom_ob(40), 0, 39, 0)))),
             GoalList::Cons(
                 Box::new(GoalData::All(0, 34, Box::new(GoalData::LeafE(ExprData::Atom(40))))),
                 Box::new(GoalList::Nil)),
@@ -2993,7 +3119,7 @@ by { decide }
 // Mutation-kill: refWp's goal 0 (then-branch postcond) binds `let tmp__3 := 0`
 // (val leaf 11 from the cloned then-branch); a goal 0 expecting `:= 99` fails.
 pub open spec fn cd19_ctx() -> FnCtxData { FnCtxData { typ_params: BinderList::Nil, params: BinderList::Cons(0, 1, Box::new(BinderList::Nil)), param_bounds: ParamBoundList::Bound(3, 2, Box::new(ParamBoundList::Nil)), reqs: BinderList::Nil, enss: LeafList::Cons(4, Box::new(LeafList::Nil)) } }
-pub open spec fn cd19_sst() -> StmData { StmData::Seq(Box::new(StmData::Assign(7, 0)), Box::new(StmData::If(8, 9, Box::new(StmData::Seq(Box::new(StmData::Assign(10, 11)), Box::new(StmData::Ret(Box::new(RawExpList::Cons(Box::new(atom_ob(5)), Box::new(RawExpList::Nil))), RetBind::RetLet(6, 10))))), Box::new(StmData::Seq(Box::new(StmData::Seq(Box::new(StmData::Seq(Box::new(StmData::Assert(atom_ob(13), 12)), Box::new(StmData::Seq(Box::new(StmData::Assume(12)), Box::new(StmData::Seq(Box::new(StmData::Assign(14, 15)), Box::new(StmData::Seq(Box::new(StmData::Assert(atom_ob(17), 16)), Box::new(StmData::Call { reqs: Box::new(RawExpList::Nil), post: Box::new(FrameList::FHyp(0, 20, Box::new(FrameList::FLet(18, 19, Box::new(FrameList::FNil))))) }))))))))), Box::new(StmData::Assign(10, 18)))), Box::new(StmData::Ret(Box::new(RawExpList::Cons(Box::new(atom_ob(5)), Box::new(RawExpList::Nil))), RetBind::RetLet(6, 10)))))))) }
+pub open spec fn cd19_sst() -> StmData { StmData::Seq(Box::new(StmData::Assign(7, 0)), Box::new(StmData::If(8, 0, 9, 0, 0, Box::new(StmData::Seq(Box::new(StmData::Assign(10, 11)), Box::new(StmData::Ret(Box::new(RawExpList::Cons(Box::new(atom_ob(5)), Box::new(RawExpList::Nil))), RetBind::RetLet(6, 10))))), Box::new(StmData::Seq(Box::new(StmData::Seq(Box::new(StmData::Seq(Box::new(StmData::Assert(atom_ob(13), 0, 12, 0)), Box::new(StmData::Seq(Box::new(StmData::Assume(0, 12, 0)), Box::new(StmData::Seq(Box::new(StmData::Assign(14, 15)), Box::new(StmData::Seq(Box::new(StmData::Assert(atom_ob(17), 0, 16, 0)), Box::new(StmData::Call { reqs: Box::new(RawExpList::Nil), post: Box::new(FrameList::FHyp(0, 20, 0, Box::new(FrameList::FLet(18, 19, Box::new(FrameList::FNil))))) }))))))))), Box::new(StmData::Assign(10, 18)))), Box::new(StmData::Ret(Box::new(RawExpList::Cons(Box::new(atom_ob(5)), Box::new(RawExpList::Nil))), RetBind::RetLet(6, 10)))))))) }
 pub open spec fn cd19_goals() -> GoalList { GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(8, Box::new(GoalData::Let(10, 11, Box::new(GoalData::Let(6, 10, Box::new(GoalData::LeafE(ExprData::Atom(5))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(9, Box::new(GoalData::LeafE(ExprData::Atom(13))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(9, Box::new(GoalData::Imp(12, Box::new(GoalData::Imp(12, Box::new(GoalData::Let(14, 15, Box::new(GoalData::LeafE(ExprData::Atom(17))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(9, Box::new(GoalData::Imp(12, Box::new(GoalData::Imp(12, Box::new(GoalData::Let(14, 15, Box::new(GoalData::Imp(16, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(18, 19, Box::new(GoalData::Let(10, 18, Box::new(GoalData::Let(6, 10, Box::new(GoalData::LeafE(ExprData::Atom(5))))))))))))))))))))))))))), Box::new(GoalList::Nil)))))))) }
 
 proof fn ref_wp_if_twoway_join()
@@ -3038,14 +3164,14 @@ proof fn ref_wp_call_pass_through()
         // RET-EQ post: no ∀; E_bound hyp then a `let a := 2*x`.
         goals_eq(
             wp_stm(
-                FrameList::FHyp(0, 100, Box::new(FrameList::FNil)),
+                FrameList::FHyp(0, 100, 0, Box::new(FrameList::FNil)),
                 StmData::Seq(
                     Box::new(StmData::Call {
                         reqs: Box::new(RawExpList::Cons(Box::new(atom_ob(7)), Box::new(RawExpList::Nil))),
-                        post: Box::new(FrameList::FHyp(0, 9,
+                        post: Box::new(FrameList::FHyp(0, 9, 0,
                             Box::new(FrameList::FLet(8, 10, Box::new(FrameList::FNil))))),
                     }),
-                    Box::new(StmData::Assert(atom_ob(11), 12)))),
+                    Box::new(StmData::Assert(atom_ob(11), 0, 12, 0)))),
             GoalList::Cons(
                 Box::new(GoalData::All(0, 100, Box::new(GoalData::LeafE(ExprData::Atom(7))))),
                 Box::new(GoalList::Cons(
@@ -3056,15 +3182,15 @@ proof fn ref_wp_call_pass_through()
         // ∀-PATH post: quantify the result, then ret_bound → ens hyps.
         goals_eq(
             wp_stm(
-                FrameList::FHyp(0, 100, Box::new(FrameList::FNil)),
+                FrameList::FHyp(0, 100, 0, Box::new(FrameList::FNil)),
                 StmData::Seq(
                     Box::new(StmData::Call {
                         reqs: Box::new(RawExpList::Cons(Box::new(atom_ob(7)), Box::new(RawExpList::Nil))),
                         post: Box::new(FrameList::FBind(8, 1,
-                            Box::new(FrameList::FHyp(0, 9,
-                                Box::new(FrameList::FHyp(0, 13, Box::new(FrameList::FNil))))))),
+                            Box::new(FrameList::FHyp(0, 9, 0,
+                                Box::new(FrameList::FHyp(0, 13, 0, Box::new(FrameList::FNil))))))),
                     }),
-                    Box::new(StmData::Assert(atom_ob(11), 12)))),
+                    Box::new(StmData::Assert(atom_ob(11), 0, 12, 0)))),
             GoalList::Cons(
                 Box::new(GoalData::All(0, 100, Box::new(GoalData::LeafE(ExprData::Atom(7))))),
                 Box::new(GoalList::Cons(
@@ -3077,14 +3203,14 @@ proof fn ref_wp_call_pass_through()
         // must NOT match — the bridge is sensitive to the transcribed E.
         goals_eq(
             wp_stm(
-                FrameList::FHyp(0, 100, Box::new(FrameList::FNil)),
+                FrameList::FHyp(0, 100, 0, Box::new(FrameList::FNil)),
                 StmData::Seq(
                     Box::new(StmData::Call {
                         reqs: Box::new(RawExpList::Cons(Box::new(atom_ob(7)), Box::new(RawExpList::Nil))),
-                        post: Box::new(FrameList::FHyp(0, 9,
+                        post: Box::new(FrameList::FHyp(0, 9, 0,
                             Box::new(FrameList::FLet(8, 10, Box::new(FrameList::FNil))))),
                     }),
-                    Box::new(StmData::Assert(atom_ob(11), 12)))),
+                    Box::new(StmData::Assert(atom_ob(11), 0, 12, 0)))),
             GoalList::Cons(
                 Box::new(GoalData::All(0, 100, Box::new(GoalData::LeafE(ExprData::Atom(7))))),
                 Box::new(GoalList::Cons(
@@ -3190,7 +3316,7 @@ proof fn amended_shapes_kernel_compute()
         param_bound_len(ParamBoundList::Bound(4, 5,
             Box::new(ParamBoundList::NoBound(Box::new(ParamBoundList::Nil))))) == 2,
         frame_len(FrameList::FBind(1, 2,
-            Box::new(FrameList::FHyp(0, 3, Box::new(FrameList::FLet(4, 5, Box::new(FrameList::FNil))))))) == 3,
+            Box::new(FrameList::FHyp(0, 3, 0, Box::new(FrameList::FLet(4, 5, Box::new(FrameList::FNil))))))) == 3,
         // FnCtxData projection: 2 value params.
         fnctx_arity(FnCtxData {
             typ_params: BinderList::Cons(0, 100, Box::new(BinderList::Nil)),
@@ -3278,7 +3404,7 @@ pub open spec fn obligs_safe(he: HeOracle, l: RawExpList, st: St) -> bool
 }
 
 /// Frame-telescope interpretation, continuation = "the deep obligation
-/// `o` holds at the inner state" (FBind→∀, FHyp→→, FLet→let). The
+/// `o` holds at the inner state" (FBind→∀, FHyp→→, FLet/FLetR→let). The
 /// defunctionalized form of hand-Lean
 /// `closeSem f st (fun st' => he (render_exp o) st')`.
 #[verifier::structural_decreases]
@@ -3289,35 +3415,73 @@ pub open spec fn close_sem_e_wrap(hp: HpOracle, he: HeOracle, lv: LvOracle, f: F
         FrameList::FNil => he(render_exp(o), st),
         FrameList::FBind(x, _ty, t) =>
             forall|n: int| #[trigger] close_sem_e_wrap(hp, he, lv, *t, upd(st, x, n), o),
-        FrameList::FHyp(_hn, h, t) => hp(h, st) ==> close_sem_e_wrap(hp, he, lv, *t, st, o),
+        FrameList::FHyp(_hn, h, _p, t) => hp(h, st) ==> close_sem_e_wrap(hp, he, lv, *t, st, o),
         FrameList::FLet(x, v, t) => close_sem_e_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), o),
         FrameList::FLetH(x, _ty, v, _en, _ep, t) => close_sem_e_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), o),
+        FrameList::FLetR(x, v, t) => close_sem_e_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), o),
     }
 }
 
-// Hoist-mode semantics — parallels close_e_hoist arm-for-arm so
-// holds(close_e_hoist …) == close_sem_e_hoist … is a mechanical
-// induction: named hyps and let-pairs read as ∀-binders (the abstract
-// FBind reading; the adequacy layer recovers the dependent-product
-// meaning, exactly as it already does for the reqs binders).
+// Hoist-mode semantics — TWO-PHASE, paralleling close_e_tel /
+// residue_fold_e arm-for-arm so holds(close_e_hoist …) ==
+// close_sem_e_hoist … is a mechanical induction: the telescope phase
+// reads named hyps and let-pairs as ∀-binders (the abstract FBind
+// reading; the adequacy layer recovers the dependent-product meaning,
+// exactly as it already does for the reqs binders) and SKIPS residue
+// lets; the residue phase then folds each residue let as a state update
+// (the goal-position-Let reading), in frame order. `f0` is the whole
+// frame list, carried so the residue phase can walk it at the
+// telescope's end.
+//
+// EVALUATION-CONTEXT NOTE (the adequacy-layer invariant, same class as
+// the 0-sentinel collision note): the residue phase evaluates each
+// `lv(v, st)` with `st` holding ALL telescope upds — including binders
+// that come AFTER the residue let in frame order. Production evaluates
+// the residue value in the earlier context. The two readings coincide
+// precisely because a residue let's value text mentions only
+// EARLIER-bound names (production's textual scoping — invisible here,
+// leaves are opaque ids) and freshening keeps binder ids distinct, so
+// the extra upds are no-ops on the value's free names. The weave
+// (rendering ≡ semantics) is internally consistent regardless; the
+// scoping invariant is what the adequacy layer relies on to read the
+// abstract model as the real Lean meaning.
 #[verifier::structural_decreases]
-pub open spec fn close_sem_e_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, o: RawExp) -> bool
+pub open spec fn close_sem_e_tel(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, f0: FrameList, st: St, o: RawExp) -> bool
+    decreases f
+{
+    match f {
+        FrameList::FNil => close_sem_e_res(hp, he, lv, f0, st, o),
+        FrameList::FBind(x, _ty, t) =>
+            forall|n: int| #[trigger] close_sem_e_tel(hp, he, lv, *t, f0, upd(st, x, n), o),
+        FrameList::FHyp(hn, _h, _p, t) =>
+            forall|n: int| #[trigger] close_sem_e_tel(hp, he, lv, *t, f0, upd(st, hn, n), o),
+        FrameList::FLet(x, v, t) => close_sem_e_tel(hp, he, lv, *t, f0, upd(st, x, lv(v, st)), o),
+        FrameList::FLetH(x, _ty, _v, en, _ep, t) =>
+            forall|a: int, b: int| #[trigger] close_sem_e_tel(hp, he, lv, *t, f0, upd(upd(st, x, a), en, b), o),
+        FrameList::FLetR(_x, _v, t) => close_sem_e_tel(hp, he, lv, *t, f0, st, o),
+    }
+}
+
+#[verifier::structural_decreases]
+pub open spec fn close_sem_e_res(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, o: RawExp) -> bool
     decreases f
 {
     match f {
         FrameList::FNil => he(render_exp(o), st),
-        FrameList::FBind(x, _ty, t) =>
-            forall|n: int| #[trigger] close_sem_e_hoist(hp, he, lv, *t, upd(st, x, n), o),
-        FrameList::FHyp(hn, _h, t) =>
-            forall|n: int| #[trigger] close_sem_e_hoist(hp, he, lv, *t, upd(st, hn, n), o),
-        FrameList::FLet(x, v, t) => close_sem_e_hoist(hp, he, lv, *t, upd(st, x, lv(v, st)), o),
-        FrameList::FLetH(x, _ty, _v, en, _ep, t) =>
-            forall|a: int, b: int| #[trigger] close_sem_e_hoist(hp, he, lv, *t, upd(upd(st, x, a), en, b), o),
+        FrameList::FLetR(x, v, t) => close_sem_e_res(hp, he, lv, *t, upd(st, x, lv(v, st)), o),
+        FrameList::FBind(_x, _ty, t) => close_sem_e_res(hp, he, lv, *t, st, o),
+        FrameList::FHyp(_hn, _h, _p, t) => close_sem_e_res(hp, he, lv, *t, st, o),
+        FrameList::FLet(_x, _v, t) => close_sem_e_res(hp, he, lv, *t, st, o),
+        FrameList::FLetH(_x, _ty, _v, _en, _ep, t) => close_sem_e_res(hp, he, lv, *t, st, o),
     }
 }
 
+pub open spec fn close_sem_e_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, o: RawExp) -> bool {
+    close_sem_e_tel(hp, he, lv, f, f, st, o)
+}
+
 pub open spec fn close_sem_e(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, o: RawExp) -> bool {
-    if has_plain_flet(f) == 1 { close_sem_e_wrap(hp, he, lv, f, st, o) } else { close_sem_e_hoist(hp, he, lv, f, st, o) }
+    if gate_wrap(f) == 1 { close_sem_e_wrap(hp, he, lv, f, st, o) } else { close_sem_e_hoist(hp, he, lv, f, st, o) }
 }
 
 /// Frame-telescope interpretation, continuation = "every obligation in
@@ -3331,30 +3495,53 @@ pub open spec fn close_sem_obligs_wrap(hp: HpOracle, he: HeOracle, lv: LvOracle,
         FrameList::FNil => obligs_safe(he, l, st),
         FrameList::FBind(x, _ty, t) =>
             forall|n: int| #[trigger] close_sem_obligs_wrap(hp, he, lv, *t, upd(st, x, n), l),
-        FrameList::FHyp(_hn, h, t) => hp(h, st) ==> close_sem_obligs_wrap(hp, he, lv, *t, st, l),
+        FrameList::FHyp(_hn, h, _p, t) => hp(h, st) ==> close_sem_obligs_wrap(hp, he, lv, *t, st, l),
         FrameList::FLet(x, v, t) => close_sem_obligs_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), l),
         FrameList::FLetH(x, _ty, v, _en, _ep, t) => close_sem_obligs_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), l),
+        FrameList::FLetR(x, v, t) => close_sem_obligs_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), l),
+    }
+}
+
+// Hoist-mode obligs semantics — the same two-phase split as
+// close_sem_e_hoist (telescope skips residue lets; residue phase folds
+// them as state updates), with the `obligs_safe` continuation.
+#[verifier::structural_decreases]
+pub open spec fn close_sem_obligs_tel(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, f0: FrameList, st: St, l: RawExpList) -> bool
+    decreases f
+{
+    match f {
+        FrameList::FNil => close_sem_obligs_res(hp, he, lv, f0, st, l),
+        FrameList::FBind(x, _ty, t) =>
+            forall|n: int| #[trigger] close_sem_obligs_tel(hp, he, lv, *t, f0, upd(st, x, n), l),
+        FrameList::FHyp(hn, _h, _p, t) =>
+            forall|n: int| #[trigger] close_sem_obligs_tel(hp, he, lv, *t, f0, upd(st, hn, n), l),
+        FrameList::FLet(x, v, t) => close_sem_obligs_tel(hp, he, lv, *t, f0, upd(st, x, lv(v, st)), l),
+        FrameList::FLetH(x, _ty, _v, en, _ep, t) =>
+            forall|a: int, b: int| #[trigger] close_sem_obligs_tel(hp, he, lv, *t, f0, upd(upd(st, x, a), en, b), l),
+        FrameList::FLetR(_x, _v, t) => close_sem_obligs_tel(hp, he, lv, *t, f0, st, l),
     }
 }
 
 #[verifier::structural_decreases]
-pub open spec fn close_sem_obligs_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, l: RawExpList) -> bool
+pub open spec fn close_sem_obligs_res(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, l: RawExpList) -> bool
     decreases f
 {
     match f {
         FrameList::FNil => obligs_safe(he, l, st),
-        FrameList::FBind(x, _ty, t) =>
-            forall|n: int| #[trigger] close_sem_obligs_hoist(hp, he, lv, *t, upd(st, x, n), l),
-        FrameList::FHyp(hn, _h, t) =>
-            forall|n: int| #[trigger] close_sem_obligs_hoist(hp, he, lv, *t, upd(st, hn, n), l),
-        FrameList::FLet(x, v, t) => close_sem_obligs_hoist(hp, he, lv, *t, upd(st, x, lv(v, st)), l),
-        FrameList::FLetH(x, _ty, _v, en, _ep, t) =>
-            forall|a: int, b: int| #[trigger] close_sem_obligs_hoist(hp, he, lv, *t, upd(upd(st, x, a), en, b), l),
+        FrameList::FLetR(x, v, t) => close_sem_obligs_res(hp, he, lv, *t, upd(st, x, lv(v, st)), l),
+        FrameList::FBind(_x, _ty, t) => close_sem_obligs_res(hp, he, lv, *t, st, l),
+        FrameList::FHyp(_hn, _h, _p, t) => close_sem_obligs_res(hp, he, lv, *t, st, l),
+        FrameList::FLet(_x, _v, t) => close_sem_obligs_res(hp, he, lv, *t, st, l),
+        FrameList::FLetH(_x, _ty, _v, _en, _ep, t) => close_sem_obligs_res(hp, he, lv, *t, st, l),
     }
 }
 
+pub open spec fn close_sem_obligs_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, l: RawExpList) -> bool {
+    close_sem_obligs_tel(hp, he, lv, f, f, st, l)
+}
+
 pub open spec fn close_sem_obligs(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, l: RawExpList) -> bool {
-    if has_plain_flet(f) == 1 { close_sem_obligs_wrap(hp, he, lv, f, st, l) } else { close_sem_obligs_hoist(hp, he, lv, f, st, l) }
+    if gate_wrap(f) == 1 { close_sem_obligs_wrap(hp, he, lv, f, st, l) } else { close_sem_obligs_hoist(hp, he, lv, f, st, l) }
 }
 
 /// Operational safety — FRAME-CARRYING (the W5c lift, probe24): mirrors
@@ -3369,16 +3556,18 @@ pub open spec fn exec_safe_f(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameL
     decreases s
 {
     match s {
-        StmData::Assert(o, _h) => close_sem_e(hp, he, lv, f, st, o),
-        StmData::Assume(_e) => true,
+        StmData::Assert(o, _hn, _h, _hp) => close_sem_e(hp, he, lv, f, st, o),
+        StmData::Assume(_hn, _e, _hp) => true,
         StmData::Assign(_x, _rhs) => true,
+        StmData::AssignH(_x, _ty, _v, _en, _ep) => true,
+        StmData::AssignR(_x, _v) => true,
         StmData::Call { reqs, post: _ } => close_sem_obligs(hp, he, lv, f, st, *reqs),
         StmData::DeadEnd(b) => exec_safe_f(hp, he, lv, f, *b, st),
         StmData::AssertQueryNl(b) => exec_safe_f(hp, he, lv, strip_hyps(f), *b, st),
         StmData::Ret(es, rb) => close_sem_obligs(hp, he, lv, ret_frame(f, rb), st, *es),
-        StmData::If(c, nc, t, e) =>
-            exec_safe_f(hp, he, lv, frame_append(f, FrameList::FHyp(0, c, Box::new(FrameList::FNil))), *t, st)
-                && exec_safe_f(hp, he, lv, frame_append(f, FrameList::FHyp(0, nc, Box::new(FrameList::FNil))), *e, st),
+        StmData::If(c, cn, nc, ncn, cp, t, e) =>
+            exec_safe_f(hp, he, lv, frame_append(f, FrameList::FHyp(cn, c, cp, Box::new(FrameList::FNil))), *t, st)
+                && exec_safe_f(hp, he, lv, frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e, st),
         StmData::Loop { inv_hyps, inv_obligs, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann: _, d_old_name, d_old_val, decrease_oblig, body } => {
             let mframe = loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, d_old_name, d_old_val);
             let endf = frame_after(mframe, *body);
@@ -3451,12 +3640,12 @@ pub proof fn u_cse_nil(hp: HpOracle, he: HeOracle, lv: LvOracle, o: RawExp)
 // Dispatch pins first.
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all [lib.close_sem_e])")]
 pub proof fn u_cse_wrap_mode(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp)
-    ensures has_plain_flet(f) == 1 ==> forall|st: St| #[trigger] close_sem_e(hp, he, lv, f, st, o)
+    ensures gate_wrap(f) == 1 ==> forall|st: St| #[trigger] close_sem_e(hp, he, lv, f, st, o)
         == close_sem_e_wrap(hp, he, lv, f, st, o)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all [lib.close_sem_e])")]
 pub proof fn u_cse_hoist_mode(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp)
-    ensures has_plain_flet(f) != 1 ==> forall|st: St| #[trigger] close_sem_e(hp, he, lv, f, st, o)
+    ensures gate_wrap(f) != 1 ==> forall|st: St| #[trigger] close_sem_e(hp, he, lv, f, st, o)
         == close_sem_e_hoist(hp, he, lv, f, st, o)
 {}
 
@@ -3472,8 +3661,8 @@ pub proof fn u_csew_bind(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u
         == (forall|n: int| #[trigger] close_sem_e_wrap(hp, he, lv, *t, upd(st, x, n), o))
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_csew_hyp(hp: HpOracle, he: HeOracle, lv: LvOracle, n: u64, h: u64, t: Box<FrameList>, o: RawExp)
-    ensures forall|st: St| #[trigger] close_sem_e_wrap(hp, he, lv, FrameList::FHyp(n, h, t), st, o)
+pub proof fn u_csew_hyp(hp: HpOracle, he: HeOracle, lv: LvOracle, n: u64, h: u64, p: u64, t: Box<FrameList>, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_wrap(hp, he, lv, FrameList::FHyp(n, h, p, t), st, o)
         == (hp(h, st) ==> close_sem_e_wrap(hp, he, lv, *t, st, o))
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
@@ -3486,32 +3675,80 @@ pub proof fn u_csew_leth(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u
     ensures forall|st: St| #[trigger] close_sem_e_wrap(hp, he, lv, FrameList::FLetH(x, ty, v, en, ep, t), st, o)
         == close_sem_e_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), o)
 {}
-
-// close_sem_e_hoist one-step unfolds.
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_cseh_nil(hp: HpOracle, he: HeOracle, lv: LvOracle, o: RawExp)
-    ensures forall|st: St| #[trigger] close_sem_e_hoist(hp, he, lv, FrameList::FNil, st, o)
+pub proof fn u_csew_letr(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, v: u64, t: Box<FrameList>, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_wrap(hp, he, lv, FrameList::FLetR(x, v, t), st, o)
+        == close_sem_e_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), o)
+{}
+
+// close_sem_e_hoist = tel ∘ res (two-phase). One-step unfolds are
+// per-PHASE: hoist-level cons unfolds would have to commute the residue
+// walk past the head frame (true but not rfl — the phase pins are the
+// rewrite rules the soundness proofs use).
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_cseh_unfold(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_hoist(hp, he, lv, f, st, o)
+        == close_sem_e_tel(hp, he, lv, f, f, st, o)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_cset_nil(hp: HpOracle, he: HeOracle, lv: LvOracle, f0: FrameList, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_tel(hp, he, lv, FrameList::FNil, f0, st, o)
+        == close_sem_e_res(hp, he, lv, f0, st, o)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_cset_bind(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u64, t: Box<FrameList>, f0: FrameList, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_tel(hp, he, lv, FrameList::FBind(x, ty, t), f0, st, o)
+        == (forall|n: int| #[trigger] close_sem_e_tel(hp, he, lv, *t, f0, upd(st, x, n), o))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_cset_hyp(hp: HpOracle, he: HeOracle, lv: LvOracle, n: u64, h: u64, p: u64, t: Box<FrameList>, f0: FrameList, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_tel(hp, he, lv, FrameList::FHyp(n, h, p, t), f0, st, o)
+        == (forall|v: int| #[trigger] close_sem_e_tel(hp, he, lv, *t, f0, upd(st, n, v), o))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_cset_let(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, v: u64, t: Box<FrameList>, f0: FrameList, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_tel(hp, he, lv, FrameList::FLet(x, v, t), f0, st, o)
+        == close_sem_e_tel(hp, he, lv, *t, f0, upd(st, x, lv(v, st)), o)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_cset_leth(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u64, v: u64, en: u64, ep: u64, t: Box<FrameList>, f0: FrameList, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_tel(hp, he, lv, FrameList::FLetH(x, ty, v, en, ep, t), f0, st, o)
+        == (forall|a: int, b: int| #[trigger] close_sem_e_tel(hp, he, lv, *t, f0, upd(upd(st, x, a), en, b), o))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_cset_letr(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, v: u64, t: Box<FrameList>, f0: FrameList, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_tel(hp, he, lv, FrameList::FLetR(x, v, t), f0, st, o)
+        == close_sem_e_tel(hp, he, lv, *t, f0, st, o)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_cser_nil(hp: HpOracle, he: HeOracle, lv: LvOracle, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_res(hp, he, lv, FrameList::FNil, st, o)
         == he(render_exp(o), st)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_cseh_bind(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u64, t: Box<FrameList>, o: RawExp)
-    ensures forall|st: St| #[trigger] close_sem_e_hoist(hp, he, lv, FrameList::FBind(x, ty, t), st, o)
-        == (forall|n: int| #[trigger] close_sem_e_hoist(hp, he, lv, *t, upd(st, x, n), o))
+pub proof fn u_cser_letr(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, v: u64, t: Box<FrameList>, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_res(hp, he, lv, FrameList::FLetR(x, v, t), st, o)
+        == close_sem_e_res(hp, he, lv, *t, upd(st, x, lv(v, st)), o)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_cseh_hyp(hp: HpOracle, he: HeOracle, lv: LvOracle, n: u64, h: u64, t: Box<FrameList>, o: RawExp)
-    ensures forall|st: St| #[trigger] close_sem_e_hoist(hp, he, lv, FrameList::FHyp(n, h, t), st, o)
-        == (forall|v: int| #[trigger] close_sem_e_hoist(hp, he, lv, *t, upd(st, n, v), o))
+pub proof fn u_cser_bind(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u64, t: Box<FrameList>, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_res(hp, he, lv, FrameList::FBind(x, ty, t), st, o)
+        == close_sem_e_res(hp, he, lv, *t, st, o)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_cseh_let(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, v: u64, t: Box<FrameList>, o: RawExp)
-    ensures forall|st: St| #[trigger] close_sem_e_hoist(hp, he, lv, FrameList::FLet(x, v, t), st, o)
-        == close_sem_e_hoist(hp, he, lv, *t, upd(st, x, lv(v, st)), o)
+pub proof fn u_cser_hyp(hp: HpOracle, he: HeOracle, lv: LvOracle, n: u64, h: u64, p: u64, t: Box<FrameList>, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_res(hp, he, lv, FrameList::FHyp(n, h, p, t), st, o)
+        == close_sem_e_res(hp, he, lv, *t, st, o)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_cseh_leth(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u64, v: u64, en: u64, ep: u64, t: Box<FrameList>, o: RawExp)
-    ensures forall|st: St| #[trigger] close_sem_e_hoist(hp, he, lv, FrameList::FLetH(x, ty, v, en, ep, t), st, o)
-        == (forall|a: int, b: int| #[trigger] close_sem_e_hoist(hp, he, lv, *t, upd(upd(st, x, a), en, b), o))
+pub proof fn u_cser_let(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, v: u64, t: Box<FrameList>, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_res(hp, he, lv, FrameList::FLet(x, v, t), st, o)
+        == close_sem_e_res(hp, he, lv, *t, st, o)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_cser_leth(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u64, v: u64, en: u64, ep: u64, t: Box<FrameList>, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_res(hp, he, lv, FrameList::FLetH(x, ty, v, en, ep, t), st, o)
+        == close_sem_e_res(hp, he, lv, *t, st, o)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
 pub proof fn u_cso_nil(hp: HpOracle, he: HeOracle, lv: LvOracle, l: RawExpList)
@@ -3521,12 +3758,12 @@ pub proof fn u_cso_nil(hp: HpOracle, he: HeOracle, lv: LvOracle, l: RawExpList)
 // Post-N1 dispatch + per-mode cso pins (same shape as the cse family).
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all [lib.close_sem_obligs])")]
 pub proof fn u_cso_wrap_mode(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, l: RawExpList)
-    ensures has_plain_flet(f) == 1 ==> forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, f, st, l)
+    ensures gate_wrap(f) == 1 ==> forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, f, st, l)
         == close_sem_obligs_wrap(hp, he, lv, f, st, l)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all [lib.close_sem_obligs])")]
 pub proof fn u_cso_hoist_mode(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, l: RawExpList)
-    ensures has_plain_flet(f) != 1 ==> forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, f, st, l)
+    ensures gate_wrap(f) != 1 ==> forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, f, st, l)
         == close_sem_obligs_hoist(hp, he, lv, f, st, l)
 {}
 
@@ -3541,8 +3778,8 @@ pub proof fn u_csow_bind(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u
         == (forall|n: int| #[trigger] close_sem_obligs_wrap(hp, he, lv, *t, upd(st, x, n), l))
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_csow_hyp(hp: HpOracle, he: HeOracle, lv: LvOracle, n: u64, h: u64, t: Box<FrameList>, l: RawExpList)
-    ensures forall|st: St| #[trigger] close_sem_obligs_wrap(hp, he, lv, FrameList::FHyp(n, h, t), st, l)
+pub proof fn u_csow_hyp(hp: HpOracle, he: HeOracle, lv: LvOracle, n: u64, h: u64, p: u64, t: Box<FrameList>, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_wrap(hp, he, lv, FrameList::FHyp(n, h, p, t), st, l)
         == (hp(h, st) ==> close_sem_obligs_wrap(hp, he, lv, *t, st, l))
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
@@ -3555,44 +3792,99 @@ pub proof fn u_csow_leth(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u
     ensures forall|st: St| #[trigger] close_sem_obligs_wrap(hp, he, lv, FrameList::FLetH(x, ty, v, en, ep, t), st, l)
         == close_sem_obligs_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), l)
 {}
-
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_csoh_nil(hp: HpOracle, he: HeOracle, lv: LvOracle, l: RawExpList)
-    ensures forall|st: St| #[trigger] close_sem_obligs_hoist(hp, he, lv, FrameList::FNil, st, l)
+pub proof fn u_csow_letr(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, v: u64, t: Box<FrameList>, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_wrap(hp, he, lv, FrameList::FLetR(x, v, t), st, l)
+        == close_sem_obligs_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), l)
+{}
+
+// Hoist-mode obligs: the tel/res two-phase pins (mirror of the cse
+// family above, with the obligs_safe continuation).
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csoh_unfold(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_hoist(hp, he, lv, f, st, l)
+        == close_sem_obligs_tel(hp, he, lv, f, f, st, l)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csot_nil(hp: HpOracle, he: HeOracle, lv: LvOracle, f0: FrameList, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_tel(hp, he, lv, FrameList::FNil, f0, st, l)
+        == close_sem_obligs_res(hp, he, lv, f0, st, l)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csot_bind(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u64, t: Box<FrameList>, f0: FrameList, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_tel(hp, he, lv, FrameList::FBind(x, ty, t), f0, st, l)
+        == (forall|n: int| #[trigger] close_sem_obligs_tel(hp, he, lv, *t, f0, upd(st, x, n), l))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csot_hyp(hp: HpOracle, he: HeOracle, lv: LvOracle, n: u64, h: u64, p: u64, t: Box<FrameList>, f0: FrameList, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_tel(hp, he, lv, FrameList::FHyp(n, h, p, t), f0, st, l)
+        == (forall|v: int| #[trigger] close_sem_obligs_tel(hp, he, lv, *t, f0, upd(st, n, v), l))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csot_let(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, v: u64, t: Box<FrameList>, f0: FrameList, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_tel(hp, he, lv, FrameList::FLet(x, v, t), f0, st, l)
+        == close_sem_obligs_tel(hp, he, lv, *t, f0, upd(st, x, lv(v, st)), l)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csot_leth(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u64, v: u64, en: u64, ep: u64, t: Box<FrameList>, f0: FrameList, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_tel(hp, he, lv, FrameList::FLetH(x, ty, v, en, ep, t), f0, st, l)
+        == (forall|a: int, b: int| #[trigger] close_sem_obligs_tel(hp, he, lv, *t, f0, upd(upd(st, x, a), en, b), l))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csot_letr(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, v: u64, t: Box<FrameList>, f0: FrameList, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_tel(hp, he, lv, FrameList::FLetR(x, v, t), f0, st, l)
+        == close_sem_obligs_tel(hp, he, lv, *t, f0, st, l)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csor_nil(hp: HpOracle, he: HeOracle, lv: LvOracle, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_res(hp, he, lv, FrameList::FNil, st, l)
         == obligs_safe(he, l, st)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_csoh_bind(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u64, t: Box<FrameList>, l: RawExpList)
-    ensures forall|st: St| #[trigger] close_sem_obligs_hoist(hp, he, lv, FrameList::FBind(x, ty, t), st, l)
-        == (forall|n: int| #[trigger] close_sem_obligs_hoist(hp, he, lv, *t, upd(st, x, n), l))
+pub proof fn u_csor_letr(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, v: u64, t: Box<FrameList>, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_res(hp, he, lv, FrameList::FLetR(x, v, t), st, l)
+        == close_sem_obligs_res(hp, he, lv, *t, upd(st, x, lv(v, st)), l)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_csoh_hyp(hp: HpOracle, he: HeOracle, lv: LvOracle, n: u64, h: u64, t: Box<FrameList>, l: RawExpList)
-    ensures forall|st: St| #[trigger] close_sem_obligs_hoist(hp, he, lv, FrameList::FHyp(n, h, t), st, l)
-        == (forall|v: int| #[trigger] close_sem_obligs_hoist(hp, he, lv, *t, upd(st, n, v), l))
+pub proof fn u_csor_bind(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u64, t: Box<FrameList>, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_res(hp, he, lv, FrameList::FBind(x, ty, t), st, l)
+        == close_sem_obligs_res(hp, he, lv, *t, st, l)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_csoh_let(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, v: u64, t: Box<FrameList>, l: RawExpList)
-    ensures forall|st: St| #[trigger] close_sem_obligs_hoist(hp, he, lv, FrameList::FLet(x, v, t), st, l)
-        == close_sem_obligs_hoist(hp, he, lv, *t, upd(st, x, lv(v, st)), l)
+pub proof fn u_csor_hyp(hp: HpOracle, he: HeOracle, lv: LvOracle, n: u64, h: u64, p: u64, t: Box<FrameList>, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_res(hp, he, lv, FrameList::FHyp(n, h, p, t), st, l)
+        == close_sem_obligs_res(hp, he, lv, *t, st, l)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_csoh_leth(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u64, v: u64, en: u64, ep: u64, t: Box<FrameList>, l: RawExpList)
-    ensures forall|st: St| #[trigger] close_sem_obligs_hoist(hp, he, lv, FrameList::FLetH(x, ty, v, en, ep, t), st, l)
-        == (forall|a: int, b: int| #[trigger] close_sem_obligs_hoist(hp, he, lv, *t, upd(upd(st, x, a), en, b), l))
+pub proof fn u_csor_let(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, v: u64, t: Box<FrameList>, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_res(hp, he, lv, FrameList::FLet(x, v, t), st, l)
+        == close_sem_obligs_res(hp, he, lv, *t, st, l)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_esf_assert(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp, h: u64)
-    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Assert(o, h), st)
+pub proof fn u_csor_leth(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u64, v: u64, en: u64, ep: u64, t: Box<FrameList>, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_res(hp, he, lv, FrameList::FLetH(x, ty, v, en, ep, t), st, l)
+        == close_sem_obligs_res(hp, he, lv, *t, st, l)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_esf_assert(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp, hn: u64, h: u64, hpz: u64)
+    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Assert(o, hn, h, hpz), st)
         == close_sem_e(hp, he, lv, f, st, o)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_esf_assume(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, e: u64)
-    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Assume(e), st) == true
+pub proof fn u_esf_assume(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, hn: u64, e: u64, hpz: u64)
+    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Assume(hn, e, hpz), st) == true
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
 pub proof fn u_esf_assign(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, x: u64, rhs: u64)
     ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Assign(x, rhs), st) == true
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_esf_assignh(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, x: u64, ty: u64, v: u64, en: u64, ep: u64)
+    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::AssignH(x, ty, v, en, ep), st) == true
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_esf_assignr(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, x: u64, v: u64)
+    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::AssignR(x, v), st) == true
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
 pub proof fn u_esf_call(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, reqs: Box<RawExpList>, post: Box<FrameList>)
@@ -3614,10 +3906,10 @@ pub proof fn u_esf_ret(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, e
         == close_sem_obligs(hp, he, lv, ret_frame(f, rb), st, *es)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_esf_if(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, c: u64, nc: u64, t: Box<StmData>, e: Box<StmData>)
-    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::If(c, nc, t, e), st)
-        == (exec_safe_f(hp, he, lv, frame_append(f, FrameList::FHyp(0, c, Box::new(FrameList::FNil))), *t, st)
-            && exec_safe_f(hp, he, lv, frame_append(f, FrameList::FHyp(0, nc, Box::new(FrameList::FNil))), *e, st))
+pub proof fn u_esf_if(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, c: u64, cn: u64, nc: u64, ncn: u64, cp: u64, t: Box<StmData>, e: Box<StmData>)
+    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::If(c, cn, nc, ncn, cp, t, e), st)
+        == (exec_safe_f(hp, he, lv, frame_append(f, FrameList::FHyp(cn, c, cp, Box::new(FrameList::FNil))), *t, st)
+            && exec_safe_f(hp, he, lv, frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e, st))
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
 pub proof fn u_esf_loop(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList,
@@ -3666,14 +3958,37 @@ pub proof fn u_gate_nil()
 pub proof fn u_gate_bind(x: u64, ty: u64, t: Box<FrameList>)
     ensures has_plain_flet(FrameList::FBind(x, ty, t)) == has_plain_flet(*t)
 {}
-pub proof fn u_gate_hyp(n: u64, h: u64, t: Box<FrameList>)
-    ensures has_plain_flet(FrameList::FHyp(n, h, t)) == has_plain_flet(*t)
+pub proof fn u_gate_hyp(n: u64, h: u64, p: u64, t: Box<FrameList>)
+    ensures has_plain_flet(FrameList::FHyp(n, h, p, t)) == has_plain_flet(*t)
 {}
 pub proof fn u_gate_let(x: u64, v: u64, t: Box<FrameList>)
     ensures has_plain_flet(FrameList::FLet(x, v, t)) == 1
 {}
 pub proof fn u_gate_leth(x: u64, ty: u64, v: u64, en: u64, ep: u64, t: Box<FrameList>)
     ensures has_plain_flet(FrameList::FLetH(x, ty, v, en, ep, t)) == has_plain_flet(*t)
+{}
+pub proof fn u_gate_letr(x: u64, v: u64, t: Box<FrameList>)
+    ensures has_plain_flet(FrameList::FLetR(x, v, t)) == has_plain_flet(*t)
+{}
+
+// Poison-gate one-step pins.
+pub proof fn u_gatep_nil()
+    ensures has_poisoned_hyp(FrameList::FNil) == 0
+{}
+pub proof fn u_gatep_bind(x: u64, ty: u64, t: Box<FrameList>)
+    ensures has_poisoned_hyp(FrameList::FBind(x, ty, t)) == has_poisoned_hyp(*t)
+{}
+pub proof fn u_gatep_hyp(n: u64, h: u64, p: u64, t: Box<FrameList>)
+    ensures has_poisoned_hyp(FrameList::FHyp(n, h, p, t)) == (if p == 1 { 1 } else { has_poisoned_hyp(*t) })
+{}
+pub proof fn u_gatep_let(x: u64, v: u64, t: Box<FrameList>)
+    ensures has_poisoned_hyp(FrameList::FLet(x, v, t)) == has_poisoned_hyp(*t)
+{}
+pub proof fn u_gatep_leth(x: u64, ty: u64, v: u64, en: u64, ep: u64, t: Box<FrameList>)
+    ensures has_poisoned_hyp(FrameList::FLetH(x, ty, v, en, ep, t)) == has_poisoned_hyp(*t)
+{}
+pub proof fn u_gatep_letr(x: u64, v: u64, t: Box<FrameList>)
+    ensures has_poisoned_hyp(FrameList::FLetR(x, v, t)) == has_poisoned_hyp(*t)
 {}
 
 // Dispatch pins (conditional): which mode fn the dispatcher selects.
@@ -3682,10 +3997,10 @@ pub proof fn u_gate_leth(x: u64, ty: u64, v: u64, en: u64, ep: u64, t: Box<Frame
 // precondition VCs the Link discharge spine cannot yet compose —
 // implication-form pins keep every caller straight-line.
 pub proof fn u_ce_wrap_mode(f: FrameList, ob: RawExp)
-    ensures has_plain_flet(f) == 1 ==> close_e(f, ob) == close_e_wrap(f, ob)
+    ensures gate_wrap(f) == 1 ==> close_e(f, ob) == close_e_wrap(f, ob)
 {}
 pub proof fn u_ce_hoist_mode(f: FrameList, ob: RawExp)
-    ensures has_plain_flet(f) != 1 ==> close_e(f, ob) == close_e_hoist(f, ob)
+    ensures gate_wrap(f) != 1 ==> close_e(f, ob) == close_e_hoist(f, ob)
 {}
 
 // close_e_wrap one-step unfolds.
@@ -3695,8 +4010,8 @@ pub proof fn u_cew_nil(ob: RawExp)
 pub proof fn u_cew_bind(x: u64, ty: u64, t: Box<FrameList>, ob: RawExp)
     ensures close_e_wrap(FrameList::FBind(x, ty, t), ob) == GoalData::All(x, ty, Box::new(close_e_wrap(*t, ob)))
 {}
-pub proof fn u_cew_hyp(n: u64, h: u64, t: Box<FrameList>, ob: RawExp)
-    ensures close_e_wrap(FrameList::FHyp(n, h, t), ob) == GoalData::Imp(h, Box::new(close_e_wrap(*t, ob)))
+pub proof fn u_cew_hyp(n: u64, h: u64, p: u64, t: Box<FrameList>, ob: RawExp)
+    ensures close_e_wrap(FrameList::FHyp(n, h, p, t), ob) == GoalData::Imp(h, Box::new(close_e_wrap(*t, ob)))
 {}
 pub proof fn u_cew_let(x: u64, v: u64, t: Box<FrameList>, ob: RawExp)
     ensures close_e_wrap(FrameList::FLet(x, v, t), ob) == GoalData::Let(x, v, Box::new(close_e_wrap(*t, ob)))
@@ -3704,23 +4019,53 @@ pub proof fn u_cew_let(x: u64, v: u64, t: Box<FrameList>, ob: RawExp)
 pub proof fn u_cew_leth(x: u64, ty: u64, v: u64, en: u64, ep: u64, t: Box<FrameList>, ob: RawExp)
     ensures close_e_wrap(FrameList::FLetH(x, ty, v, en, ep, t), ob) == GoalData::Let(x, v, Box::new(close_e_wrap(*t, ob)))
 {}
+pub proof fn u_cew_letr(x: u64, v: u64, t: Box<FrameList>, ob: RawExp)
+    ensures close_e_wrap(FrameList::FLetR(x, v, t), ob) == GoalData::Let(x, v, Box::new(close_e_wrap(*t, ob)))
+{}
 
-// close_e_hoist one-step unfolds.
-pub proof fn u_ceh_nil(ob: RawExp)
-    ensures close_e_hoist(FrameList::FNil, ob) == GoalData::LeafE(render_exp(ob))
+// close_e_hoist = close_e_tel ∘ residue_fold_e (two-phase, mirroring
+// production's binder pass + residue fold). One-step unfolds are
+// per-PHASE (see the semantic pin note).
+pub proof fn u_ceh_unfold(f: FrameList, ob: RawExp)
+    ensures close_e_hoist(f, ob)
+        == close_e_tel(f, residue_fold_e(f, GoalData::LeafE(render_exp(ob))))
 {}
-pub proof fn u_ceh_bind(x: u64, ty: u64, t: Box<FrameList>, ob: RawExp)
-    ensures close_e_hoist(FrameList::FBind(x, ty, t), ob) == GoalData::All(x, ty, Box::new(close_e_hoist(*t, ob)))
+pub proof fn u_cet_nil(g: GoalData)
+    ensures close_e_tel(FrameList::FNil, g) == g
 {}
-pub proof fn u_ceh_hyp(n: u64, h: u64, t: Box<FrameList>, ob: RawExp)
-    ensures close_e_hoist(FrameList::FHyp(n, h, t), ob) == GoalData::All(n, h, Box::new(close_e_hoist(*t, ob)))
+pub proof fn u_cet_bind(x: u64, ty: u64, t: Box<FrameList>, g: GoalData)
+    ensures close_e_tel(FrameList::FBind(x, ty, t), g) == GoalData::All(x, ty, Box::new(close_e_tel(*t, g)))
 {}
-pub proof fn u_ceh_let(x: u64, v: u64, t: Box<FrameList>, ob: RawExp)
-    ensures close_e_hoist(FrameList::FLet(x, v, t), ob) == GoalData::Let(x, v, Box::new(close_e_hoist(*t, ob)))
+pub proof fn u_cet_hyp(n: u64, h: u64, p: u64, t: Box<FrameList>, g: GoalData)
+    ensures close_e_tel(FrameList::FHyp(n, h, p, t), g) == GoalData::All(n, h, Box::new(close_e_tel(*t, g)))
 {}
-pub proof fn u_ceh_leth(x: u64, ty: u64, v: u64, en: u64, ep: u64, t: Box<FrameList>, ob: RawExp)
-    ensures close_e_hoist(FrameList::FLetH(x, ty, v, en, ep, t), ob)
-        == GoalData::All(x, ty, Box::new(GoalData::All(en, ep, Box::new(close_e_hoist(*t, ob)))))
+pub proof fn u_cet_let(x: u64, v: u64, t: Box<FrameList>, g: GoalData)
+    ensures close_e_tel(FrameList::FLet(x, v, t), g) == GoalData::Let(x, v, Box::new(close_e_tel(*t, g)))
+{}
+pub proof fn u_cet_leth(x: u64, ty: u64, v: u64, en: u64, ep: u64, t: Box<FrameList>, g: GoalData)
+    ensures close_e_tel(FrameList::FLetH(x, ty, v, en, ep, t), g)
+        == GoalData::All(x, ty, Box::new(GoalData::All(en, ep, Box::new(close_e_tel(*t, g)))))
+{}
+pub proof fn u_cet_letr(x: u64, v: u64, t: Box<FrameList>, g: GoalData)
+    ensures close_e_tel(FrameList::FLetR(x, v, t), g) == close_e_tel(*t, g)
+{}
+pub proof fn u_cer_nil(g: GoalData)
+    ensures residue_fold_e(FrameList::FNil, g) == g
+{}
+pub proof fn u_cer_letr(x: u64, v: u64, t: Box<FrameList>, g: GoalData)
+    ensures residue_fold_e(FrameList::FLetR(x, v, t), g) == GoalData::Let(x, v, Box::new(residue_fold_e(*t, g)))
+{}
+pub proof fn u_cer_bind(x: u64, ty: u64, t: Box<FrameList>, g: GoalData)
+    ensures residue_fold_e(FrameList::FBind(x, ty, t), g) == residue_fold_e(*t, g)
+{}
+pub proof fn u_cer_hyp(n: u64, h: u64, p: u64, t: Box<FrameList>, g: GoalData)
+    ensures residue_fold_e(FrameList::FHyp(n, h, p, t), g) == residue_fold_e(*t, g)
+{}
+pub proof fn u_cer_let(x: u64, v: u64, t: Box<FrameList>, g: GoalData)
+    ensures residue_fold_e(FrameList::FLet(x, v, t), g) == residue_fold_e(*t, g)
+{}
+pub proof fn u_cer_leth(x: u64, ty: u64, v: u64, en: u64, ep: u64, t: Box<FrameList>, g: GoalData)
+    ensures residue_fold_e(FrameList::FLetH(x, ty, v, en, ep, t), g) == residue_fold_e(*t, g)
 {}
 pub proof fn u_cce_nil(f: FrameList)
     ensures close_each_e(f, RawExpList::Nil) == GoalList::Nil
@@ -3736,15 +4081,21 @@ pub proof fn u_gapp_cons(h: Box<GoalData>, t: Box<GoalList>, b: GoalList)
     ensures goals_append(GoalList::Cons(h, t), b)
         == GoalList::Cons(h, Box::new(goals_append(*t, b)))
 {}
-pub proof fn u_wp_assert(f: FrameList, o: RawExp, h: u64)
-    ensures wp_stm(f, StmData::Assert(o, h))
+pub proof fn u_wp_assert(f: FrameList, o: RawExp, hn: u64, h: u64, hpz: u64)
+    ensures wp_stm(f, StmData::Assert(o, hn, h, hpz))
         == GoalList::Cons(Box::new(close_e(f, o)), Box::new(GoalList::Nil))
 {}
-pub proof fn u_wp_assume(f: FrameList, e: u64)
-    ensures wp_stm(f, StmData::Assume(e)) == GoalList::Nil
+pub proof fn u_wp_assume(f: FrameList, hn: u64, e: u64, hpz: u64)
+    ensures wp_stm(f, StmData::Assume(hn, e, hpz)) == GoalList::Nil
 {}
 pub proof fn u_wp_assign(f: FrameList, x: u64, rhs: u64)
     ensures wp_stm(f, StmData::Assign(x, rhs)) == GoalList::Nil
+{}
+pub proof fn u_wp_assignh(f: FrameList, x: u64, ty: u64, v: u64, en: u64, ep: u64)
+    ensures wp_stm(f, StmData::AssignH(x, ty, v, en, ep)) == GoalList::Nil
+{}
+pub proof fn u_wp_assignr(f: FrameList, x: u64, v: u64)
+    ensures wp_stm(f, StmData::AssignR(x, v)) == GoalList::Nil
 {}
 pub proof fn u_wp_call(f: FrameList, reqs: Box<RawExpList>, post: Box<FrameList>)
     ensures wp_stm(f, StmData::Call { reqs, post }) == close_each_e(f, *reqs)
@@ -3758,11 +4109,11 @@ pub proof fn u_wp_aqnl(f: FrameList, b: Box<StmData>)
 pub proof fn u_wp_ret(f: FrameList, es: Box<RawExpList>, rb: RetBind)
     ensures wp_stm(f, StmData::Ret(es, rb)) == close_each_e(ret_frame(f, rb), *es)
 {}
-pub proof fn u_wp_if(f: FrameList, c: u64, nc: u64, t: Box<StmData>, e: Box<StmData>)
-    ensures wp_stm(f, StmData::If(c, nc, t, e))
+pub proof fn u_wp_if(f: FrameList, c: u64, cn: u64, nc: u64, ncn: u64, cp: u64, t: Box<StmData>, e: Box<StmData>)
+    ensures wp_stm(f, StmData::If(c, cn, nc, ncn, cp, t, e))
         == goals_append(
-            wp_stm(frame_append(f, FrameList::FHyp(0, c, Box::new(FrameList::FNil))), *t),
-            wp_stm(frame_append(f, FrameList::FHyp(0, nc, Box::new(FrameList::FNil))), *e))
+            wp_stm(frame_append(f, FrameList::FHyp(cn, c, cp, Box::new(FrameList::FNil))), *t),
+            wp_stm(frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e))
 {}
 pub proof fn u_wp_loop(f: FrameList,
     inv_hyps: Box<BinderList>, inv_obligs: Box<RawExpList>, binders: Box<BinderList>,
@@ -3813,10 +4164,10 @@ pub proof fn holds_close_e_wrap(hp: HpOracle, he: HeOracle, lv: LvOracle, f: Fra
             u_csew_bind(hp, he, lv, x, ty, t, o);
             holds_close_e_wrap(hp, he, lv, *t, o);              // IH (st-generic)
         }
-        FrameList::FHyp(hn, h, t) => {
-            u_cew_hyp(hn, h, t, o);
+        FrameList::FHyp(hn, h, p, t) => {
+            u_cew_hyp(hn, h, p, t, o);
             u_holds_imp(hp, he, lv, h, Box::new(close_e_wrap(*t, o)));
-            u_csew_hyp(hp, he, lv, hn, h, t, o);
+            u_csew_hyp(hp, he, lv, hn, h, p, t, o);
             holds_close_e_wrap(hp, he, lv, *t, o);              // IH (st-generic)
         }
         FrameList::FLet(x, v, t) => {
@@ -3831,59 +4182,141 @@ pub proof fn holds_close_e_wrap(hp: HpOracle, he: HeOracle, lv: LvOracle, f: Fra
             u_csew_leth(hp, he, lv, x, ty, v, en, ep, t, o);
             holds_close_e_wrap(hp, he, lv, *t, o);              // IH (st-generic)
         }
+        FrameList::FLetR(x, v, t) => {
+            u_cew_letr(x, v, t, o);
+            u_holds_let(hp, he, lv, x, v, Box::new(close_e_wrap(*t, o)));
+            u_csew_letr(hp, he, lv, x, v, t, o);
+            holds_close_e_wrap(hp, he, lv, *t, o);              // IH (st-generic)
+        }
     }
 }
 
-// Hoist-mode analog: named hyps and let-pairs are ∀-binders on BOTH the
-// rendering side (close_e_hoist emits All) and the semantic side
-// (close_sem_e_hoist reads ∀-upd) — the FLetH arm applies the All
-// unfold TWICE for the binder pair.
+// Hoist-mode analog, TWO-PHASE (bootstrap-74 slice 2): close_e_hoist =
+// close_e_tel ∘ residue_fold_e, so the weave splits into a residue
+// lemma (the folded Lets read as state updates) and a telescope lemma
+// (named hyps and let-pairs are ∀-binders on BOTH sides — the FLetH arm
+// applies the All unfold TWICE for the binder pair). The telescope
+// lemma's continuation is the residue-folded leaf, so it inducts with
+// f0 (the whole frame list) FIXED.
+
+// Residue phase: holds of the residue-folded leaf == the residue
+// semantic walk. FLetR's Let reads via u_holds_let; every other frame
+// is skipped by BOTH sides.
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
 #[verifier::structural_decreases]
-pub proof fn holds_close_e_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp)
+pub proof fn holds_residue_fold(hp: HpOracle, he: HeOracle, lv: LvOracle, f0: FrameList, o: RawExp)
     ensures forall|st: St|
-        #[trigger] holds(hp, he, lv, close_e_hoist(f, o), st) == close_sem_e_hoist(hp, he, lv, f, st, o)
+        #[trigger] holds(hp, he, lv, residue_fold_e(f0, GoalData::LeafE(render_exp(o))), st)
+            == close_sem_e_res(hp, he, lv, f0, st, o)
+    decreases f0
+{
+    match f0 {
+        FrameList::FNil => {
+            u_cer_nil(GoalData::LeafE(render_exp(o)));
+            u_holds_leafe(hp, he, lv, render_exp(o));
+            u_cser_nil(hp, he, lv, o);
+        }
+        FrameList::FLetR(x, v, t) => {
+            u_cer_letr(x, v, t, GoalData::LeafE(render_exp(o)));
+            u_holds_let(hp, he, lv, x, v, Box::new(residue_fold_e(*t, GoalData::LeafE(render_exp(o)))));
+            u_cser_letr(hp, he, lv, x, v, t, o);
+            holds_residue_fold(hp, he, lv, *t, o);              // IH (st-generic)
+        }
+        FrameList::FBind(x, ty, t) => {
+            u_cer_bind(x, ty, t, GoalData::LeafE(render_exp(o)));
+            u_cser_bind(hp, he, lv, x, ty, t, o);
+            holds_residue_fold(hp, he, lv, *t, o);              // IH (st-generic)
+        }
+        FrameList::FHyp(hn, h, p, t) => {
+            u_cer_hyp(hn, h, p, t, GoalData::LeafE(render_exp(o)));
+            u_cser_hyp(hp, he, lv, hn, h, p, t, o);
+            holds_residue_fold(hp, he, lv, *t, o);              // IH (st-generic)
+        }
+        FrameList::FLet(x, v, t) => {
+            u_cer_let(x, v, t, GoalData::LeafE(render_exp(o)));
+            u_cser_let(hp, he, lv, x, v, t, o);
+            holds_residue_fold(hp, he, lv, *t, o);              // IH (st-generic)
+        }
+        FrameList::FLetH(x, ty, v, en, ep, t) => {
+            u_cer_leth(x, ty, v, en, ep, t, GoalData::LeafE(render_exp(o)));
+            u_cser_leth(hp, he, lv, x, ty, v, en, ep, t, o);
+            holds_residue_fold(hp, he, lv, *t, o);              // IH (st-generic)
+        }
+    }
+}
+
+// Telescope phase: holds of the telescope wrapped around the
+// residue-folded leaf == the telescope semantic walk (which hands off
+// to the residue walk at FNil — the holds_residue_fold lemma).
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
+#[verifier::structural_decreases]
+pub proof fn holds_close_tel(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, f0: FrameList, o: RawExp)
+    ensures forall|st: St|
+        #[trigger] holds(hp, he, lv, close_e_tel(f, residue_fold_e(f0, GoalData::LeafE(render_exp(o)))), st)
+            == close_sem_e_tel(hp, he, lv, f, f0, st, o)
     decreases f
 {
     match f {
         FrameList::FNil => {
-            u_ceh_nil(o);
-            u_holds_leafe(hp, he, lv, render_exp(o));
-            u_cseh_nil(hp, he, lv, o);
+            u_cet_nil(residue_fold_e(f0, GoalData::LeafE(render_exp(o))));
+            u_cset_nil(hp, he, lv, f0, o);
+            holds_residue_fold(hp, he, lv, f0, o);
         }
         FrameList::FBind(x, ty, t) => {
-            u_ceh_bind(x, ty, t, o);
-            u_holds_all_binder(hp, he, lv, x, ty, Box::new(close_e_hoist(*t, o)));
-            u_cseh_bind(hp, he, lv, x, ty, t, o);
-            holds_close_e_hoist(hp, he, lv, *t, o);             // IH (st-generic)
+            u_cet_bind(x, ty, t, residue_fold_e(f0, GoalData::LeafE(render_exp(o))));
+            u_holds_all_binder(hp, he, lv, x, ty,
+                Box::new(close_e_tel(*t, residue_fold_e(f0, GoalData::LeafE(render_exp(o))))));
+            u_cset_bind(hp, he, lv, x, ty, t, f0, o);
+            holds_close_tel(hp, he, lv, *t, f0, o);              // IH (st-generic)
         }
-        FrameList::FHyp(hn, h, t) => {
-            u_ceh_hyp(hn, h, t, o);
-            u_holds_all_binder(hp, he, lv, hn, h, Box::new(close_e_hoist(*t, o)));
-            u_cseh_hyp(hp, he, lv, hn, h, t, o);
-            holds_close_e_hoist(hp, he, lv, *t, o);             // IH (st-generic)
+        FrameList::FHyp(hn, h, p, t) => {
+            u_cet_hyp(hn, h, p, t, residue_fold_e(f0, GoalData::LeafE(render_exp(o))));
+            u_holds_all_binder(hp, he, lv, hn, h,
+                Box::new(close_e_tel(*t, residue_fold_e(f0, GoalData::LeafE(render_exp(o))))));
+            u_cset_hyp(hp, he, lv, hn, h, p, t, f0, o);
+            holds_close_tel(hp, he, lv, *t, f0, o);              // IH (st-generic)
         }
         FrameList::FLet(x, v, t) => {
-            u_ceh_let(x, v, t, o);
-            u_holds_let(hp, he, lv, x, v, Box::new(close_e_hoist(*t, o)));
-            u_cseh_let(hp, he, lv, x, v, t, o);
-            holds_close_e_hoist(hp, he, lv, *t, o);             // IH (st-generic)
+            u_cet_let(x, v, t, residue_fold_e(f0, GoalData::LeafE(render_exp(o))));
+            u_holds_let(hp, he, lv, x, v,
+                Box::new(close_e_tel(*t, residue_fold_e(f0, GoalData::LeafE(render_exp(o))))));
+            u_cset_let(hp, he, lv, x, v, t, f0, o);
+            holds_close_tel(hp, he, lv, *t, f0, o);              // IH (st-generic)
         }
         FrameList::FLetH(x, ty, v, en, ep, t) => {
-            u_ceh_leth(x, ty, v, en, ep, t, o);
+            u_cet_leth(x, ty, v, en, ep, t, residue_fold_e(f0, GoalData::LeafE(render_exp(o))));
             u_holds_all_binder(hp, he, lv, x, ty,
-                Box::new(GoalData::All(en, ep, Box::new(close_e_hoist(*t, o)))));
-            u_holds_all_binder(hp, he, lv, en, ep, Box::new(close_e_hoist(*t, o)));
-            u_cseh_leth(hp, he, lv, x, ty, v, en, ep, t, o);
-            holds_close_e_hoist(hp, he, lv, *t, o);             // IH (st-generic)
+                Box::new(GoalData::All(en, ep,
+                    Box::new(close_e_tel(*t, residue_fold_e(f0, GoalData::LeafE(render_exp(o))))))));
+            u_holds_all_binder(hp, he, lv, en, ep,
+                Box::new(close_e_tel(*t, residue_fold_e(f0, GoalData::LeafE(render_exp(o))))));
+            u_cset_leth(hp, he, lv, x, ty, v, en, ep, t, f0, o);
+            holds_close_tel(hp, he, lv, *t, f0, o);              // IH (st-generic)
+        }
+        FrameList::FLetR(x, v, t) => {
+            u_cet_letr(x, v, t, residue_fold_e(f0, GoalData::LeafE(render_exp(o))));
+            u_cset_letr(hp, he, lv, x, v, t, f0, o);
+            holds_close_tel(hp, he, lv, *t, f0, o);              // IH (st-generic)
         }
     }
+}
+
+// The composed hoist weave: close_e_hoist unfolds to the two-phase
+// composition, and holds_close_tel at f0 := f closes it.
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
+pub proof fn holds_close_e_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp)
+    ensures forall|st: St|
+        #[trigger] holds(hp, he, lv, close_e_hoist(f, o), st) == close_sem_e_hoist(hp, he, lv, f, st, o)
+{
+    u_ceh_unfold(f, o);
+    u_cseh_unfold(hp, he, lv, f, o);
+    holds_close_tel(hp, he, lv, f, f, o);
 }
 
 // The gated dispatcher — ORIGINAL statement, so every downstream caller
 // (wp_stm_sound, holds_all_close_each_e) is untouched. Mode decided once
 // over the whole frame list, mirroring production's hoist_all.
-#[verifier::tactus_tactic("first | tactus_auto | (intros <;> by_cases _hgate : lib.has_plain_flet f = 1 <;> simp_all)")]
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> by_cases _hgate : lib.gate_wrap f = 1 <;> simp_all)")]
 pub proof fn holds_close_e(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp)
     ensures forall|st: St|
         #[trigger] holds(hp, he, lv, close_e(f, o), st) == close_sem_e(hp, he, lv, f, st, o)
@@ -3942,8 +4375,8 @@ pub proof fn cso_nil_true_wrap(hp: HpOracle, he: HeOracle, lv: LvOracle, f: Fram
             u_csow_bind(hp, he, lv, x, ty, t, RawExpList::Nil);
             cso_nil_true_wrap(hp, he, lv, *t);                  // IH (st-generic)
         }
-        FrameList::FHyp(hn, h, t) => {
-            u_csow_hyp(hp, he, lv, hn, h, t, RawExpList::Nil);
+        FrameList::FHyp(hn, h, p, t) => {
+            u_csow_hyp(hp, he, lv, hn, h, p, t, RawExpList::Nil);
             cso_nil_true_wrap(hp, he, lv, *t);                  // IH (st-generic)
         }
         FrameList::FLet(x, v, t) => {
@@ -3954,40 +4387,92 @@ pub proof fn cso_nil_true_wrap(hp: HpOracle, he: HeOracle, lv: LvOracle, f: Fram
             u_csow_leth(hp, he, lv, x, ty, v, en, ep, t, RawExpList::Nil);
             cso_nil_true_wrap(hp, he, lv, *t);                  // IH (st-generic)
         }
+        FrameList::FLetR(x, v, t) => {
+            u_csow_letr(hp, he, lv, x, v, t, RawExpList::Nil);
+            cso_nil_true_wrap(hp, he, lv, *t);                  // IH (st-generic)
+        }
+    }
+}
+
+// Hoist side, TWO-PHASE: tel-phase triviality inducts with f0 fixed and
+// hands off to the res-phase lemma at FNil.
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
+#[verifier::structural_decreases]
+pub proof fn cso_nil_true_res(hp: HpOracle, he: HeOracle, lv: LvOracle, f0: FrameList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_res(hp, he, lv, f0, st, RawExpList::Nil) == true
+    decreases f0
+{
+    match f0 {
+        FrameList::FNil => {
+            u_csor_nil(hp, he, lv, RawExpList::Nil);
+            u_obligs_nil(he);
+        }
+        FrameList::FLetR(x, v, t) => {
+            u_csor_letr(hp, he, lv, x, v, t, RawExpList::Nil);
+            cso_nil_true_res(hp, he, lv, *t);                   // IH (st-generic)
+        }
+        FrameList::FBind(x, ty, t) => {
+            u_csor_bind(hp, he, lv, x, ty, t, RawExpList::Nil);
+            cso_nil_true_res(hp, he, lv, *t);                   // IH (st-generic)
+        }
+        FrameList::FHyp(hn, h, p, t) => {
+            u_csor_hyp(hp, he, lv, hn, h, p, t, RawExpList::Nil);
+            cso_nil_true_res(hp, he, lv, *t);                   // IH (st-generic)
+        }
+        FrameList::FLet(x, v, t) => {
+            u_csor_let(hp, he, lv, x, v, t, RawExpList::Nil);
+            cso_nil_true_res(hp, he, lv, *t);                   // IH (st-generic)
+        }
+        FrameList::FLetH(x, ty, v, en, ep, t) => {
+            u_csor_leth(hp, he, lv, x, ty, v, en, ep, t, RawExpList::Nil);
+            cso_nil_true_res(hp, he, lv, *t);                   // IH (st-generic)
+        }
     }
 }
 
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
 #[verifier::structural_decreases]
-pub proof fn cso_nil_true_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList)
-    ensures forall|st: St| #[trigger] close_sem_obligs_hoist(hp, he, lv, f, st, RawExpList::Nil) == true
+pub proof fn cso_nil_true_tel(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, f0: FrameList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_tel(hp, he, lv, f, f0, st, RawExpList::Nil) == true
     decreases f
 {
     match f {
         FrameList::FNil => {
-            u_csoh_nil(hp, he, lv, RawExpList::Nil);
-            u_obligs_nil(he);
+            u_csot_nil(hp, he, lv, f0, RawExpList::Nil);
+            cso_nil_true_res(hp, he, lv, f0);
         }
         FrameList::FBind(x, ty, t) => {
-            u_csoh_bind(hp, he, lv, x, ty, t, RawExpList::Nil);
-            cso_nil_true_hoist(hp, he, lv, *t);                 // IH (st-generic)
+            u_csot_bind(hp, he, lv, x, ty, t, f0, RawExpList::Nil);
+            cso_nil_true_tel(hp, he, lv, *t, f0);               // IH (st-generic)
         }
-        FrameList::FHyp(hn, h, t) => {
-            u_csoh_hyp(hp, he, lv, hn, h, t, RawExpList::Nil);
-            cso_nil_true_hoist(hp, he, lv, *t);                 // IH (st-generic)
+        FrameList::FHyp(hn, h, p, t) => {
+            u_csot_hyp(hp, he, lv, hn, h, p, t, f0, RawExpList::Nil);
+            cso_nil_true_tel(hp, he, lv, *t, f0);               // IH (st-generic)
         }
         FrameList::FLet(x, v, t) => {
-            u_csoh_let(hp, he, lv, x, v, t, RawExpList::Nil);
-            cso_nil_true_hoist(hp, he, lv, *t);                 // IH (st-generic)
+            u_csot_let(hp, he, lv, x, v, t, f0, RawExpList::Nil);
+            cso_nil_true_tel(hp, he, lv, *t, f0);               // IH (st-generic)
         }
         FrameList::FLetH(x, ty, v, en, ep, t) => {
-            u_csoh_leth(hp, he, lv, x, ty, v, en, ep, t, RawExpList::Nil);
-            cso_nil_true_hoist(hp, he, lv, *t);                 // IH (st-generic)
+            u_csot_leth(hp, he, lv, x, ty, v, en, ep, t, f0, RawExpList::Nil);
+            cso_nil_true_tel(hp, he, lv, *t, f0);               // IH (st-generic)
+        }
+        FrameList::FLetR(x, v, t) => {
+            u_csot_letr(hp, he, lv, x, v, t, f0, RawExpList::Nil);
+            cso_nil_true_tel(hp, he, lv, *t, f0);               // IH (st-generic)
         }
     }
 }
 
-#[verifier::tactus_tactic("first | tactus_auto | (intros <;> by_cases _hgate : lib.has_plain_flet f = 1 <;> simp_all (config := { zetaDelta := true }))")]
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
+pub proof fn cso_nil_true_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_hoist(hp, he, lv, f, st, RawExpList::Nil) == true
+{
+    u_csoh_unfold(hp, he, lv, f, RawExpList::Nil);
+    cso_nil_true_tel(hp, he, lv, f, f);
+}
+
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> by_cases _hgate : lib.gate_wrap f = 1 <;> simp_all (config := { zetaDelta := true }))")]
 pub proof fn cso_nil_true(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList)
     ensures forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, f, st, RawExpList::Nil) == true
 {
@@ -4020,10 +4505,10 @@ pub proof fn cso_cons_split_wrap(hp: HpOracle, he: HeOracle, lv: LvOracle, f: Fr
             u_csow_bind(hp, he, lv, x, ty, tl, *t);
             cso_cons_split_wrap(hp, he, lv, *tl, h, t);         // IH (st-generic)
         }
-        FrameList::FHyp(hn, hh, tl) => {
-            u_csow_hyp(hp, he, lv, hn, hh, tl, RawExpList::Cons(h, t));
-            u_csew_hyp(hp, he, lv, hn, hh, tl, *h);
-            u_csow_hyp(hp, he, lv, hn, hh, tl, *t);
+        FrameList::FHyp(hn, hh, p, tl) => {
+            u_csow_hyp(hp, he, lv, hn, hh, p, tl, RawExpList::Cons(h, t));
+            u_csew_hyp(hp, he, lv, hn, hh, p, tl, *h);
+            u_csow_hyp(hp, he, lv, hn, hh, p, tl, *t);
             cso_cons_split_wrap(hp, he, lv, *tl, h, t);         // IH (st-generic)
         }
         FrameList::FLet(x, v, tl) => {
@@ -4038,54 +4523,125 @@ pub proof fn cso_cons_split_wrap(hp: HpOracle, he: HeOracle, lv: LvOracle, f: Fr
             u_csow_leth(hp, he, lv, x, ty, v, en, ep, tl, *t);
             cso_cons_split_wrap(hp, he, lv, *tl, h, t);         // IH (st-generic)
         }
+        FrameList::FLetR(x, v, tl) => {
+            u_csow_letr(hp, he, lv, x, v, tl, RawExpList::Cons(h, t));
+            u_csew_letr(hp, he, lv, x, v, tl, *h);
+            u_csow_letr(hp, he, lv, x, v, tl, *t);
+            cso_cons_split_wrap(hp, he, lv, *tl, h, t);         // IH (st-generic)
+        }
     }
 }
 
-// Hoist analog: the ∧ distributes through the ∀-telescope exactly as
-// through FBind in the wrap proof (forall_and) — the FLetH arm's
-// two-variable ∀ splits the same way.
+// Hoist analog, TWO-PHASE: the ∧ distributes through the ∀-telescope
+// exactly as through FBind in the wrap proof (forall_and) — the FLetH
+// arm's two-variable ∀ splits the same way. Tel-phase induction with f0
+// fixed; the FNil arm is the res-phase split.
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc, forall_and]))")]
 #[verifier::structural_decreases]
-pub proof fn cso_cons_split_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, h: Box<RawExp>, t: Box<RawExpList>)
-    ensures forall|st: St| #[trigger] close_sem_obligs_hoist(hp, he, lv, f, st, RawExpList::Cons(h, t))
-        == (close_sem_e_hoist(hp, he, lv, f, st, *h) && close_sem_obligs_hoist(hp, he, lv, f, st, *t))
+pub proof fn cso_cons_split_res(hp: HpOracle, he: HeOracle, lv: LvOracle, f0: FrameList, h: Box<RawExp>, t: Box<RawExpList>)
+    ensures forall|st: St| #[trigger] close_sem_obligs_res(hp, he, lv, f0, st, RawExpList::Cons(h, t))
+        == (close_sem_e_res(hp, he, lv, f0, st, *h) && close_sem_obligs_res(hp, he, lv, f0, st, *t))
+    decreases f0
+{
+    match f0 {
+        FrameList::FNil => {
+            u_csor_nil(hp, he, lv, RawExpList::Cons(h, t));
+            u_obligs_cons(he, h, t);
+            u_cser_nil(hp, he, lv, *h);
+            u_csor_nil(hp, he, lv, *t);
+        }
+        FrameList::FLetR(x, v, tl) => {
+            u_csor_letr(hp, he, lv, x, v, tl, RawExpList::Cons(h, t));
+            u_cser_letr(hp, he, lv, x, v, tl, *h);
+            u_csor_letr(hp, he, lv, x, v, tl, *t);
+            cso_cons_split_res(hp, he, lv, *tl, h, t);          // IH (st-generic)
+        }
+        FrameList::FBind(x, ty, tl) => {
+            u_csor_bind(hp, he, lv, x, ty, tl, RawExpList::Cons(h, t));
+            u_cser_bind(hp, he, lv, x, ty, tl, *h);
+            u_csor_bind(hp, he, lv, x, ty, tl, *t);
+            cso_cons_split_res(hp, he, lv, *tl, h, t);          // IH (st-generic)
+        }
+        FrameList::FHyp(hn, hh, p, tl) => {
+            u_csor_hyp(hp, he, lv, hn, hh, p, tl, RawExpList::Cons(h, t));
+            u_cser_hyp(hp, he, lv, hn, hh, p, tl, *h);
+            u_csor_hyp(hp, he, lv, hn, hh, p, tl, *t);
+            cso_cons_split_res(hp, he, lv, *tl, h, t);          // IH (st-generic)
+        }
+        FrameList::FLet(x, v, tl) => {
+            u_csor_let(hp, he, lv, x, v, tl, RawExpList::Cons(h, t));
+            u_cser_let(hp, he, lv, x, v, tl, *h);
+            u_csor_let(hp, he, lv, x, v, tl, *t);
+            cso_cons_split_res(hp, he, lv, *tl, h, t);          // IH (st-generic)
+        }
+        FrameList::FLetH(x, ty, v, en, ep, tl) => {
+            u_csor_leth(hp, he, lv, x, ty, v, en, ep, tl, RawExpList::Cons(h, t));
+            u_cser_leth(hp, he, lv, x, ty, v, en, ep, tl, *h);
+            u_csor_leth(hp, he, lv, x, ty, v, en, ep, tl, *t);
+            cso_cons_split_res(hp, he, lv, *tl, h, t);          // IH (st-generic)
+        }
+    }
+}
+
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc, forall_and]))")]
+#[verifier::structural_decreases]
+pub proof fn cso_cons_split_tel(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, f0: FrameList, h: Box<RawExp>, t: Box<RawExpList>)
+    ensures forall|st: St| #[trigger] close_sem_obligs_tel(hp, he, lv, f, f0, st, RawExpList::Cons(h, t))
+        == (close_sem_e_tel(hp, he, lv, f, f0, st, *h) && close_sem_obligs_tel(hp, he, lv, f, f0, st, *t))
     decreases f
 {
     match f {
         FrameList::FNil => {
-            u_csoh_nil(hp, he, lv, RawExpList::Cons(h, t));
-            u_obligs_cons(he, h, t);
-            u_cseh_nil(hp, he, lv, *h);
-            u_csoh_nil(hp, he, lv, *t);
+            u_csot_nil(hp, he, lv, f0, RawExpList::Cons(h, t));
+            u_cset_nil(hp, he, lv, f0, *h);
+            u_csot_nil(hp, he, lv, f0, *t);
+            cso_cons_split_res(hp, he, lv, f0, h, t);
         }
         FrameList::FBind(x, ty, tl) => {
-            u_csoh_bind(hp, he, lv, x, ty, tl, RawExpList::Cons(h, t));
-            u_cseh_bind(hp, he, lv, x, ty, tl, *h);
-            u_csoh_bind(hp, he, lv, x, ty, tl, *t);
-            cso_cons_split_hoist(hp, he, lv, *tl, h, t);        // IH (st-generic)
+            u_csot_bind(hp, he, lv, x, ty, tl, f0, RawExpList::Cons(h, t));
+            u_cset_bind(hp, he, lv, x, ty, tl, f0, *h);
+            u_csot_bind(hp, he, lv, x, ty, tl, f0, *t);
+            cso_cons_split_tel(hp, he, lv, *tl, f0, h, t);      // IH (st-generic)
         }
-        FrameList::FHyp(hn, hh, tl) => {
-            u_csoh_hyp(hp, he, lv, hn, hh, tl, RawExpList::Cons(h, t));
-            u_cseh_hyp(hp, he, lv, hn, hh, tl, *h);
-            u_csoh_hyp(hp, he, lv, hn, hh, tl, *t);
-            cso_cons_split_hoist(hp, he, lv, *tl, h, t);        // IH (st-generic)
+        FrameList::FHyp(hn, hh, p, tl) => {
+            u_csot_hyp(hp, he, lv, hn, hh, p, tl, f0, RawExpList::Cons(h, t));
+            u_cset_hyp(hp, he, lv, hn, hh, p, tl, f0, *h);
+            u_csot_hyp(hp, he, lv, hn, hh, p, tl, f0, *t);
+            cso_cons_split_tel(hp, he, lv, *tl, f0, h, t);      // IH (st-generic)
         }
         FrameList::FLet(x, v, tl) => {
-            u_csoh_let(hp, he, lv, x, v, tl, RawExpList::Cons(h, t));
-            u_cseh_let(hp, he, lv, x, v, tl, *h);
-            u_csoh_let(hp, he, lv, x, v, tl, *t);
-            cso_cons_split_hoist(hp, he, lv, *tl, h, t);        // IH (st-generic)
+            u_csot_let(hp, he, lv, x, v, tl, f0, RawExpList::Cons(h, t));
+            u_cset_let(hp, he, lv, x, v, tl, f0, *h);
+            u_csot_let(hp, he, lv, x, v, tl, f0, *t);
+            cso_cons_split_tel(hp, he, lv, *tl, f0, h, t);      // IH (st-generic)
         }
         FrameList::FLetH(x, ty, v, en, ep, tl) => {
-            u_csoh_leth(hp, he, lv, x, ty, v, en, ep, tl, RawExpList::Cons(h, t));
-            u_cseh_leth(hp, he, lv, x, ty, v, en, ep, tl, *h);
-            u_csoh_leth(hp, he, lv, x, ty, v, en, ep, tl, *t);
-            cso_cons_split_hoist(hp, he, lv, *tl, h, t);        // IH (st-generic)
+            u_csot_leth(hp, he, lv, x, ty, v, en, ep, tl, f0, RawExpList::Cons(h, t));
+            u_cset_leth(hp, he, lv, x, ty, v, en, ep, tl, f0, *h);
+            u_csot_leth(hp, he, lv, x, ty, v, en, ep, tl, f0, *t);
+            cso_cons_split_tel(hp, he, lv, *tl, f0, h, t);      // IH (st-generic)
+        }
+        FrameList::FLetR(x, v, tl) => {
+            u_csot_letr(hp, he, lv, x, v, tl, f0, RawExpList::Cons(h, t));
+            u_cset_letr(hp, he, lv, x, v, tl, f0, *h);
+            u_csot_letr(hp, he, lv, x, v, tl, f0, *t);
+            cso_cons_split_tel(hp, he, lv, *tl, f0, h, t);      // IH (st-generic)
         }
     }
 }
 
-#[verifier::tactus_tactic("first | tactus_auto | (intros <;> by_cases _hgate : lib.has_plain_flet f = 1 <;> simp_all (config := { zetaDelta := true }))")]
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc, forall_and]))")]
+pub proof fn cso_cons_split_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, h: Box<RawExp>, t: Box<RawExpList>)
+    ensures forall|st: St| #[trigger] close_sem_obligs_hoist(hp, he, lv, f, st, RawExpList::Cons(h, t))
+        == (close_sem_e_hoist(hp, he, lv, f, st, *h) && close_sem_obligs_hoist(hp, he, lv, f, st, *t))
+{
+    u_csoh_unfold(hp, he, lv, f, RawExpList::Cons(h, t));
+    u_cseh_unfold(hp, he, lv, f, *h);
+    u_csoh_unfold(hp, he, lv, f, *t);
+    cso_cons_split_tel(hp, he, lv, f, f, h, t);
+}
+
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> by_cases _hgate : lib.gate_wrap f = 1 <;> simp_all (config := { zetaDelta := true }))")]
 pub proof fn cso_cons_split(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, h: Box<RawExp>, t: Box<RawExpList>)
     ensures forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, f, st, RawExpList::Cons(h, t))
         == (close_sem_e(hp, he, lv, f, st, *h) && close_sem_obligs(hp, he, lv, f, st, *t))
@@ -4151,22 +4707,32 @@ pub proof fn wp_stm_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList
     decreases s
 {
     match s {
-        StmData::Assert(o, h) => {
-            u_wp_assert(f, o, h);
+        StmData::Assert(o, hn, h, hpz) => {
+            u_wp_assert(f, o, hn, h, hpz);
             u_holds_all_cons(hp, he, lv, Box::new(close_e(f, o)), Box::new(GoalList::Nil));
             u_holds_all_nil(hp, he, lv);
             holds_close_e(hp, he, lv, f, o);
-            u_esf_assert(hp, he, lv, f, o, h);
+            u_esf_assert(hp, he, lv, f, o, hn, h, hpz);
         }
-        StmData::Assume(e) => {
-            u_wp_assume(f, e);
+        StmData::Assume(hn, e, hpz) => {
+            u_wp_assume(f, hn, e, hpz);
             u_holds_all_nil(hp, he, lv);
-            u_esf_assume(hp, he, lv, f, e);
+            u_esf_assume(hp, he, lv, f, hn, e, hpz);
         }
         StmData::Assign(x, rhs) => {
             u_wp_assign(f, x, rhs);
             u_holds_all_nil(hp, he, lv);
             u_esf_assign(hp, he, lv, f, x, rhs);
+        }
+        StmData::AssignH(x, ty, v, en, ep) => {
+            u_wp_assignh(f, x, ty, v, en, ep);
+            u_holds_all_nil(hp, he, lv);
+            u_esf_assignh(hp, he, lv, f, x, ty, v, en, ep);
+        }
+        StmData::AssignR(x, v) => {
+            u_wp_assignr(f, x, v);
+            u_holds_all_nil(hp, he, lv);
+            u_esf_assignr(hp, he, lv, f, x, v);
         }
         StmData::Call { reqs, post } => {
             u_wp_call(f, reqs, post);
@@ -4188,14 +4754,14 @@ pub proof fn wp_stm_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList
             holds_all_close_each_e(hp, he, lv, ret_frame(f, rb), *es, st);
             u_esf_ret(hp, he, lv, f, es, rb);
         }
-        StmData::If(c, nc, t, e) => {
-            u_wp_if(f, c, nc, t, e);
-            u_esf_if(hp, he, lv, f, c, nc, t, e);
+        StmData::If(c, cn, nc, ncn, cp, t, e) => {
+            u_wp_if(f, c, cn, nc, ncn, cp, t, e);
+            u_esf_if(hp, he, lv, f, c, cn, nc, ncn, cp, t, e);
             holds_all_append(hp, he, lv,
-                wp_stm(frame_append(f, FrameList::FHyp(0, c, Box::new(FrameList::FNil))), *t),
-                wp_stm(frame_append(f, FrameList::FHyp(0, nc, Box::new(FrameList::FNil))), *e), st);
-            wp_stm_sound(hp, he, lv, frame_append(f, FrameList::FHyp(0, c, Box::new(FrameList::FNil))), *t, st);   // IH
-            wp_stm_sound(hp, he, lv, frame_append(f, FrameList::FHyp(0, nc, Box::new(FrameList::FNil))), *e, st);  // IH
+                wp_stm(frame_append(f, FrameList::FHyp(cn, c, cp, Box::new(FrameList::FNil))), *t),
+                wp_stm(frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e), st);
+            wp_stm_sound(hp, he, lv, frame_append(f, FrameList::FHyp(cn, c, cp, Box::new(FrameList::FNil))), *t, st);   // IH
+            wp_stm_sound(hp, he, lv, frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e, st);  // IH
         }
         StmData::Loop { inv_hyps, inv_obligs, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, d_old_name, d_old_val, decrease_oblig, body } => {
             // NO `let mframe/endf` bindings and the IH comes FIRST: Rust lets
@@ -4263,8 +4829,8 @@ pub proof fn ref_wp_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, c: FnCtxData
 //    Data-only, probe32 empty shape. ──
 
 pub proof fn u_fa_assume(f: FrameList, e: u64)
-    ensures frame_after(f, StmData::Assume(e))
-        == frame_append(f, FrameList::FHyp(0, e, Box::new(FrameList::FNil)))
+    ensures frame_after(f, StmData::Assume(0, e, 0))
+        == frame_append(f, FrameList::FHyp(0, e, 0, Box::new(FrameList::FNil)))
 {}
 pub proof fn u_fa_deadend(f: FrameList, b: Box<StmData>)
     ensures frame_after(f, StmData::DeadEnd(b)) == f
@@ -4279,9 +4845,9 @@ pub proof fn u_fapp_fbind(x: u64, ty: u64, t: Box<FrameList>, g: FrameList)
     ensures frame_append(FrameList::FBind(x, ty, t), g)
         == FrameList::FBind(x, ty, Box::new(frame_append(*t, g)))
 {}
-pub proof fn u_fapp_fhyp(n: u64, h: u64, t: Box<FrameList>, g: FrameList)
-    ensures frame_append(FrameList::FHyp(n, h, t), g)
-        == FrameList::FHyp(n, h, Box::new(frame_append(*t, g)))
+pub proof fn u_fapp_fhyp(n: u64, h: u64, p: u64, t: Box<FrameList>, g: FrameList)
+    ensures frame_append(FrameList::FHyp(n, h, p, t), g)
+        == FrameList::FHyp(n, h, p, Box::new(frame_append(*t, g)))
 {}
 
 // ═════════════════════════════════════════════════════════════════════
@@ -4306,8 +4872,8 @@ pub proof fn u_fapp_fhyp(n: u64, h: u64, t: Box<FrameList>, g: FrameList)
 pub proof fn prophecy_sound(xfut: u64, ty: u64, resolve: u64, h: u64, obl: RawExp)
     ensures wp_stm(FrameList::FBind(xfut, ty, Box::new(FrameList::FNil)),
             StmData::Seq(
-                Box::new(StmData::Assume(resolve)),
-                Box::new(StmData::Assert(obl, h))))
+                Box::new(StmData::Assume(0, resolve, 0)),
+                Box::new(StmData::Assert(obl, 0, h, 0))))
         == GoalList::Cons(
             Box::new(GoalData::All(xfut, ty,
                 Box::new(GoalData::All(0, resolve,
@@ -4315,21 +4881,28 @@ pub proof fn prophecy_sound(xfut: u64, ty: u64, resolve: u64, h: u64, obl: RawEx
             Box::new(GoalList::Nil))
 {
     let f = FrameList::FBind(xfut, ty, Box::new(FrameList::FNil));
-    let fh = FrameList::FBind(xfut, ty, Box::new(FrameList::FHyp(0, resolve, Box::new(FrameList::FNil))));
-    u_wp_seq(f, Box::new(StmData::Assume(resolve)), Box::new(StmData::Assert(obl, h)));
-    u_wp_assume(f, resolve);
+    let fh = FrameList::FBind(xfut, ty, Box::new(FrameList::FHyp(0, resolve, 0, Box::new(FrameList::FNil))));
+    u_wp_seq(f, Box::new(StmData::Assume(0, resolve, 0)), Box::new(StmData::Assert(obl, 0, h, 0)));
+    u_wp_assume(f, 0, resolve, 0);
     u_fa_assume(f, resolve);
-    u_fapp_fbind(xfut, ty, Box::new(FrameList::FNil), FrameList::FHyp(0, resolve, Box::new(FrameList::FNil)));
-    u_fapp_fnil(FrameList::FHyp(0, resolve, Box::new(FrameList::FNil)));
-    u_wp_assert(fh, obl, h);
-    u_gapp_nil(wp_stm(fh, StmData::Assert(obl, h)));
-    u_gate_bind(xfut, ty, Box::new(FrameList::FHyp(0, resolve, Box::new(FrameList::FNil))));
-    u_gate_hyp(0, resolve, Box::new(FrameList::FNil));
+    u_fapp_fbind(xfut, ty, Box::new(FrameList::FNil), FrameList::FHyp(0, resolve, 0, Box::new(FrameList::FNil)));
+    u_fapp_fnil(FrameList::FHyp(0, resolve, 0, Box::new(FrameList::FNil)));
+    u_wp_assert(fh, obl, 0, h, 0);
+    u_gapp_nil(wp_stm(fh, StmData::Assert(obl, 0, h, 0)));
+    u_gate_bind(xfut, ty, Box::new(FrameList::FHyp(0, resolve, 0, Box::new(FrameList::FNil))));
+    u_gate_hyp(0, resolve, 0, Box::new(FrameList::FNil));
     u_gate_nil();
+    u_gatep_bind(xfut, ty, Box::new(FrameList::FHyp(0, resolve, 0, Box::new(FrameList::FNil))));
+    u_gatep_hyp(0, resolve, 0, Box::new(FrameList::FNil));
+    u_gatep_nil();
     u_ce_hoist_mode(fh, obl);
-    u_ceh_bind(xfut, ty, Box::new(FrameList::FHyp(0, resolve, Box::new(FrameList::FNil))), obl);
-    u_ceh_hyp(0, resolve, Box::new(FrameList::FNil), obl);
-    u_ceh_nil(obl);
+    u_ceh_unfold(fh, obl);
+    u_cer_bind(xfut, ty, Box::new(FrameList::FHyp(0, resolve, 0, Box::new(FrameList::FNil))), GoalData::LeafE(render_exp(obl)));
+    u_cer_hyp(0, resolve, 0, Box::new(FrameList::FNil), GoalData::LeafE(render_exp(obl)));
+    u_cer_nil(GoalData::LeafE(render_exp(obl)));
+    u_cet_bind(xfut, ty, Box::new(FrameList::FHyp(0, resolve, 0, Box::new(FrameList::FNil))), GoalData::LeafE(render_exp(obl)));
+    u_cet_hyp(0, resolve, 0, Box::new(FrameList::FNil), GoalData::LeafE(render_exp(obl)));
+    u_cet_nil(GoalData::LeafE(render_exp(obl)));
 }
 
 /// W5d DISCRIMINATOR (probe25 `prophecy_swapped_sound`) — STRUCTURAL:
@@ -4340,24 +4913,29 @@ pub proof fn prophecy_sound(xfut: u64, ty: u64, resolve: u64, h: u64, obl: RawEx
 pub proof fn prophecy_swapped_sound(xfut: u64, ty: u64, resolve: u64, h: u64, obl: RawExp)
     ensures wp_stm(FrameList::FBind(xfut, ty, Box::new(FrameList::FNil)),
             StmData::Seq(
-                Box::new(StmData::Assert(obl, h)),
-                Box::new(StmData::Assume(resolve))))
+                Box::new(StmData::Assert(obl, 0, h, 0)),
+                Box::new(StmData::Assume(0, resolve, 0))))
         == GoalList::Cons(
             Box::new(GoalData::All(xfut, ty,
                 Box::new(GoalData::LeafE(render_exp(obl))))),
             Box::new(GoalList::Nil))
 {
     let f = FrameList::FBind(xfut, ty, Box::new(FrameList::FNil));
-    u_wp_seq(f, Box::new(StmData::Assert(obl, h)), Box::new(StmData::Assume(resolve)));
-    u_wp_assert(f, obl, h);
-    u_wp_assume(frame_after(f, StmData::Assert(obl, h)), resolve);
+    u_wp_seq(f, Box::new(StmData::Assert(obl, 0, h, 0)), Box::new(StmData::Assume(0, resolve, 0)));
+    u_wp_assert(f, obl, 0, h, 0);
+    u_wp_assume(frame_after(f, StmData::Assert(obl, 0, h, 0)), 0, resolve, 0);
     u_gapp_cons(Box::new(close_e(f, obl)), Box::new(GoalList::Nil), GoalList::Nil);
     u_gapp_nil(GoalList::Nil);
     u_gate_bind(xfut, ty, Box::new(FrameList::FNil));
     u_gate_nil();
+    u_gatep_bind(xfut, ty, Box::new(FrameList::FNil));
+    u_gatep_nil();
     u_ce_hoist_mode(f, obl);
-    u_ceh_bind(xfut, ty, Box::new(FrameList::FNil), obl);
-    u_ceh_nil(obl);
+    u_ceh_unfold(f, obl);
+    u_cer_bind(xfut, ty, Box::new(FrameList::FNil), GoalData::LeafE(render_exp(obl)));
+    u_cer_nil(GoalData::LeafE(render_exp(obl)));
+    u_cet_bind(xfut, ty, Box::new(FrameList::FNil), GoalData::LeafE(render_exp(obl)));
+    u_cet_nil(GoalData::LeafE(render_exp(obl)));
 }
 
 /// W5e MAIN (probe26 `closure_creation_sound`): the reference WP for a
@@ -4369,15 +4947,15 @@ pub proof fn closure_creation_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, f:
     ensures holds_all(hp, he, lv,
             wp_stm(f, StmData::Seq(
                 Box::new(StmData::DeadEnd(body)),
-                Box::new(StmData::Assume(ext)))), st)
+                Box::new(StmData::Assume(0, ext, 0)))), st)
         == exec_safe_f(hp, he, lv, f, *body, st)
 {
     wp_stm_sound(hp, he, lv, f,
-        StmData::Seq(Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(ext))), st);
-    u_esf_seq(hp, he, lv, f, Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(ext)));
+        StmData::Seq(Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(0, ext, 0))), st);
+    u_esf_seq(hp, he, lv, f, Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(0, ext, 0)));
     u_esf_deadend(hp, he, lv, f, body);
     u_fa_deadend(f, body);
-    u_esf_assume(hp, he, lv, frame_after(f, StmData::DeadEnd(body)), ext);
+    u_esf_assume(hp, he, lv, frame_after(f, StmData::DeadEnd(body)), 0, ext, 0);
 }
 
 /// W5e ISOLATION (probe26 `closure_deadend_isolates`) — STRUCTURAL
@@ -4385,21 +4963,24 @@ pub proof fn closure_creation_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, f:
 /// assert's goal carries NO binder for q.
 pub proof fn closure_deadend_isolates(q: u64, h: u64, obl: RawExp)
     ensures wp_stm(FrameList::FNil, StmData::Seq(
-                Box::new(StmData::DeadEnd(Box::new(StmData::Assume(q)))),
-                Box::new(StmData::Assert(obl, h))))
+                Box::new(StmData::DeadEnd(Box::new(StmData::Assume(0, q, 0)))),
+                Box::new(StmData::Assert(obl, 0, h, 0))))
         == GoalList::Cons(Box::new(GoalData::LeafE(render_exp(obl))), Box::new(GoalList::Nil))
 {
     u_wp_seq(FrameList::FNil,
-        Box::new(StmData::DeadEnd(Box::new(StmData::Assume(q)))),
-        Box::new(StmData::Assert(obl, h)));
-    u_wp_deadend(FrameList::FNil, Box::new(StmData::Assume(q)));
-    u_wp_assume(FrameList::FNil, q);
-    u_fa_deadend(FrameList::FNil, Box::new(StmData::Assume(q)));
-    u_wp_assert(FrameList::FNil, obl, h);
-    u_gapp_nil(wp_stm(FrameList::FNil, StmData::Assert(obl, h)));
+        Box::new(StmData::DeadEnd(Box::new(StmData::Assume(0, q, 0)))),
+        Box::new(StmData::Assert(obl, 0, h, 0)));
+    u_wp_deadend(FrameList::FNil, Box::new(StmData::Assume(0, q, 0)));
+    u_wp_assume(FrameList::FNil, 0, q, 0);
+    u_fa_deadend(FrameList::FNil, Box::new(StmData::Assume(0, q, 0)));
+    u_wp_assert(FrameList::FNil, obl, 0, h, 0);
+    u_gapp_nil(wp_stm(FrameList::FNil, StmData::Assert(obl, 0, h, 0)));
     u_gate_nil();
+    u_gatep_nil();
     u_ce_hoist_mode(FrameList::FNil, obl);
-    u_ceh_nil(obl);
+    u_ceh_unfold(FrameList::FNil, obl);
+    u_cer_nil(GoalData::LeafE(render_exp(obl)));
+    u_cet_nil(GoalData::LeafE(render_exp(obl)));
 }
 
 /// W5e DISCRIMINATOR (probe26 `seq_assume_gates`) — STRUCTURAL: the
@@ -4408,24 +4989,29 @@ pub proof fn closure_deadend_isolates(q: u64, h: u64, obl: RawExp)
 /// above is the proof the DeadEnd quarantines.
 pub proof fn seq_assume_gates(q: u64, h: u64, obl: RawExp)
     ensures wp_stm(FrameList::FNil, StmData::Seq(
-                Box::new(StmData::Assume(q)),
-                Box::new(StmData::Assert(obl, h))))
+                Box::new(StmData::Assume(0, q, 0)),
+                Box::new(StmData::Assert(obl, 0, h, 0))))
         == GoalList::Cons(
             Box::new(GoalData::All(0, q, Box::new(GoalData::LeafE(render_exp(obl))))),
             Box::new(GoalList::Nil))
 {
-    let fh = FrameList::FHyp(0, q, Box::new(FrameList::FNil));
-    u_wp_seq(FrameList::FNil, Box::new(StmData::Assume(q)), Box::new(StmData::Assert(obl, h)));
-    u_wp_assume(FrameList::FNil, q);
+    let fh = FrameList::FHyp(0, q, 0, Box::new(FrameList::FNil));
+    u_wp_seq(FrameList::FNil, Box::new(StmData::Assume(0, q, 0)), Box::new(StmData::Assert(obl, 0, h, 0)));
+    u_wp_assume(FrameList::FNil, 0, q, 0);
     u_fa_assume(FrameList::FNil, q);
     u_fapp_fnil(fh);
-    u_wp_assert(fh, obl, h);
-    u_gapp_nil(wp_stm(fh, StmData::Assert(obl, h)));
-    u_gate_hyp(0, q, Box::new(FrameList::FNil));
+    u_wp_assert(fh, obl, 0, h, 0);
+    u_gapp_nil(wp_stm(fh, StmData::Assert(obl, 0, h, 0)));
+    u_gate_hyp(0, q, 0, Box::new(FrameList::FNil));
     u_gate_nil();
+    u_gatep_hyp(0, q, 0, Box::new(FrameList::FNil));
+    u_gatep_nil();
     u_ce_hoist_mode(fh, obl);
-    u_ceh_hyp(0, q, Box::new(FrameList::FNil), obl);
-    u_ceh_nil(obl);
+    u_ceh_unfold(fh, obl);
+    u_cer_hyp(0, q, 0, Box::new(FrameList::FNil), GoalData::LeafE(render_exp(obl)));
+    u_cer_nil(GoalData::LeafE(render_exp(obl)));
+    u_cet_hyp(0, q, 0, Box::new(FrameList::FNil), GoalData::LeafE(render_exp(obl)));
+    u_cet_nil(GoalData::LeafE(render_exp(obl)));
 }
 
 /// W5e CONTRACT FORWARDING (probe26 `closure_forwards_contract`): after
@@ -4434,36 +5020,45 @@ pub proof fn seq_assume_gates(q: u64, h: u64, obl: RawExp)
 /// Post-N1 the assert's goal closes over the hoisted ext binder, so the
 /// abstract reading is the ∀-form (the ext-gating meaning lives in the
 /// goal structure — All(0, ext, ·) — and the adequacy layer).
-#[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc])")]
+/// (`lib.gate_wrap` in the simp set: the mode pin's `gate_wrap fh ≠ 1`
+/// side condition is a COMPOSITE term — by_cases dispatchers get it
+/// for free, but this corollary applies the pin straight-line, so the
+/// closer must delta-unfold the gate to the u_gate*/u_gatep* facts.)
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc, lib.gate_wrap])")]
 pub proof fn closure_forwards_contract(hp: HpOracle, he: HeOracle, lv: LvOracle, body: Box<StmData>, ext: u64, h: u64, obl: RawExp, st: St)
     ensures holds_all(hp, he, lv,
             wp_stm(FrameList::FNil, StmData::Seq(
                 Box::new(StmData::Seq(
                     Box::new(StmData::DeadEnd(body)),
-                    Box::new(StmData::Assume(ext)))),
-                Box::new(StmData::Assert(obl, h)))), st)
+                    Box::new(StmData::Assume(0, ext, 0)))),
+                Box::new(StmData::Assert(obl, 0, h, 0)))), st)
         == (exec_safe_f(hp, he, lv, FrameList::FNil, *body, st)
             && (forall|v: int| #[trigger] he(render_exp(obl), upd(st, 0, v))))
 {
     wp_stm_sound(hp, he, lv, FrameList::FNil, StmData::Seq(
-        Box::new(StmData::Seq(Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(ext)))),
-        Box::new(StmData::Assert(obl, h))), st);
+        Box::new(StmData::Seq(Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(0, ext, 0)))),
+        Box::new(StmData::Assert(obl, 0, h, 0))), st);
     u_esf_seq(hp, he, lv, FrameList::FNil,
-        Box::new(StmData::Seq(Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(ext)))),
-        Box::new(StmData::Assert(obl, h)));
-    u_esf_seq(hp, he, lv, FrameList::FNil, Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(ext)));
+        Box::new(StmData::Seq(Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(0, ext, 0)))),
+        Box::new(StmData::Assert(obl, 0, h, 0)));
+    u_esf_seq(hp, he, lv, FrameList::FNil, Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(0, ext, 0)));
     u_esf_deadend(hp, he, lv, FrameList::FNil, body);
     u_fa_deadend(FrameList::FNil, body);
-    u_esf_assume(hp, he, lv, frame_after(FrameList::FNil, StmData::DeadEnd(body)), ext);
-    u_fa_seq(FrameList::FNil, Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(ext)));
+    u_esf_assume(hp, he, lv, frame_after(FrameList::FNil, StmData::DeadEnd(body)), 0, ext, 0);
+    u_fa_seq(FrameList::FNil, Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(0, ext, 0)));
     u_fa_assume(frame_after(FrameList::FNil, StmData::DeadEnd(body)), ext);
-    u_fapp_fnil(FrameList::FHyp(0, ext, Box::new(FrameList::FNil)));
-    u_esf_assert(hp, he, lv, FrameList::FHyp(0, ext, Box::new(FrameList::FNil)), obl, h);
-    u_gate_hyp(0, ext, Box::new(FrameList::FNil));
+    u_fapp_fnil(FrameList::FHyp(0, ext, 0, Box::new(FrameList::FNil)));
+    u_esf_assert(hp, he, lv, FrameList::FHyp(0, ext, 0, Box::new(FrameList::FNil)), obl, 0, h, 0);
+    u_gate_hyp(0, ext, 0, Box::new(FrameList::FNil));
     u_gate_nil();
-    u_cse_hoist_mode(hp, he, lv, FrameList::FHyp(0, ext, Box::new(FrameList::FNil)), obl);
-    u_cseh_hyp(hp, he, lv, 0, ext, Box::new(FrameList::FNil), obl);
-    u_cseh_nil(hp, he, lv, obl);
+    u_gatep_hyp(0, ext, 0, Box::new(FrameList::FNil));
+    u_gatep_nil();
+    u_cse_hoist_mode(hp, he, lv, FrameList::FHyp(0, ext, 0, Box::new(FrameList::FNil)), obl);
+    u_cseh_unfold(hp, he, lv, FrameList::FHyp(0, ext, 0, Box::new(FrameList::FNil)), obl);
+    u_cset_hyp(hp, he, lv, 0, ext, 0, Box::new(FrameList::FNil), FrameList::FHyp(0, ext, 0, Box::new(FrameList::FNil)), obl);
+    u_cset_nil(hp, he, lv, FrameList::FHyp(0, ext, 0, Box::new(FrameList::FNil)), obl);
+    u_cser_hyp(hp, he, lv, 0, ext, 0, Box::new(FrameList::FNil), obl);
+    u_cser_nil(hp, he, lv, obl);
 }
 
 // ── Non-vacuity: the theorem BITES (the leaf arms demand the ACTUAL
@@ -4473,11 +5068,11 @@ pub proof fn closure_forwards_contract(hp: HpOracle, he: HeOracle, lv: LvOracle,
 //     obligation at the very state.
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc])")]
 pub proof fn wp_sound_bites_assert(hp: HpOracle, he: HeOracle, lv: LvOracle, o: RawExp, h: u64, st: St)
-    requires holds_all(hp, he, lv, wp_stm(FrameList::FNil, StmData::Assert(o, h)), st)
+    requires holds_all(hp, he, lv, wp_stm(FrameList::FNil, StmData::Assert(o, 0, h, 0)), st)
     ensures he(render_exp(o), st)
 {
-    wp_stm_sound(hp, he, lv, FrameList::FNil, StmData::Assert(o, h), st);
-    u_esf_assert(hp, he, lv, FrameList::FNil, o, h);
+    wp_stm_sound(hp, he, lv, FrameList::FNil, StmData::Assert(o, 0, h, 0), st);
+    u_esf_assert(hp, he, lv, FrameList::FNil, o, 0, h, 0);
     u_cse_nil(hp, he, lv, o);
 }
 

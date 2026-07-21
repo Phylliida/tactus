@@ -4,6 +4,7 @@ import TactusSearch
 set_option linter.unusedVariables false
 set_option maxHeartbeats 800000
 set_option autoImplicit false
-theorem _tactus_postcondition_u_holds_all_nil_at_lib_3428_13_1 (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) :
-    /- @rust:lib.rs:3428:13 -/ ∀ (st : Int → Int), lib.holds_all hp he lv lib.GoalList.Nil st = True := by
+-- tactus-closer: user
+theorem _tactus_postcondition_u_holds_all_nil_at_lib_3604_13_1 (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) :
+    /- @rust:tactus-core/lib.rs:3604:13 -/ ∀ (st : Int → Int), lib.holds_all hp he lv lib.GoalList.Nil st = True := by
   first | tactus_auto | (intros <;> rfl)
