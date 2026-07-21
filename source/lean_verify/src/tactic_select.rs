@@ -230,6 +230,30 @@ pub(crate) const STRUCTURAL_EXTRA_LEMMAS: &str =
 /// contain a `.`, so the dotted-name shortcut misses them.
 pub(crate) const ITE_COLLAPSE_LEMMAS: &str = "if_pos, if_neg, if_true, if_false";
 
+/// The leg normalizer set for ALL SplitIf legs (LeafSimpOnlyOmega and
+/// form E's split legs): every simp in the emitted corpus is `simp
+/// only [named things]` — bare `simp_all` is BOTH opaque (its behavior
+/// is invisible to the user) and version-unstable (the default simp
+/// set drifts with Mathlib, silently changing a script's meaning on
+/// upgrade — Danielle's law, 2026-07-20). The set is deliberately
+/// small: ite collapse (context- and decided-condition), constructor
+/// disjointness, and a trimmed arithmetic normalizer — the work the
+/// DEFAULT simp set was silently doing for the wild legs (the t72
+/// form E legs: `mul_zero`/`ofNat_eq_coe` are default @[simp], and a
+/// 6-name ite set "makes no progress" without them). Deliberately NO
+/// `Int.ofNat_toNat` (rewrites subrange's toNat forms out from under
+/// divmod's `split`) and no distributive set beyond the collapse
+/// quartet. The spine already unfolded the goal's fns, `simp_all
+/// only` uses context hyps as rewrites regardless (broadcast haves,
+/// branch facts), omega finishes — and a bigger set is a whnf-budget
+/// hazard on divmod/pmul-sized legs (the 204:9 timeout).
+pub(crate) const LEG_SIMP_LEMMAS: &str =
+    "if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, \
+     Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, \
+     Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, \
+     Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, \
+     Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add";
+
 /// Arithmetic collapse lemmas for the goal-only form G arm: identity /
 /// annihilator / cast-push laws PLUS (sub)distribution, so the whole
 /// expansion reaches a monomial normal form whose nonlinear pieces
@@ -425,8 +449,10 @@ pub(crate) fn derived_closer(
         } else {
             form_e_fires = true;
             format!(
-                " | (simp_all only [{}]; first | omega | (split <;> simp_all <;> omega) | (split <;> simp_all))",
-                unfolds.join(", ")
+                " | (simp_all only [{}]; first | omega | (split <;> simp_all only [{}] <;> omega) | (split <;> simp_all only [{}]))",
+                unfolds.join(", "),
+                crate::tactic_select::LEG_SIMP_LEMMAS,
+                crate::tactic_select::LEG_SIMP_LEMMAS,
             )
         }
     };
