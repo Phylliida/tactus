@@ -273,3 +273,25 @@ additions (AssignH, RetLetH, statement hyp-name fields), the bridge
 sweep, census-gated deferrals (shadowing, name collisions), and the
 follow-up queue (discharge Q1 provenance, b70/71 closes, b69
 decision, call-mut, loop-telescope redesign, cache fingerprint).
+
+### Slice 2 step 0 DONE + scope updates (2026-07-21)
+
+Certs regenerated with current production (fixture 32/39 certified —
+call-generic rejections gone; tgt 3 exec certs + 2 lemma certs).
+Evidence table in DESIGN-b74-slice2-serializer.md §2b. Three scope
+changes vs the 07-20 plan (§2c there), Danielle approved starting +
+residue-mirroring 2026-07-21:
+1. THREE goal modes (wrap / hoist / hoist+residue) — main's
+   `8dcac64` partial hoist postdates the plan. Mirror residue in the
+   model (Danielle's call, not honest-fail).
+2. "Mentions-residue" poison is serializer-COMPUTED and carried as a
+   frame mark (model leaves are opaque).
+3. Shadow-rename mirror is IN SCOPE (was census-deferred): every
+   loop-body rebind hits it (`i_hoist1`, `_h_i_hoist1_hoist1`).
+4. Loop-telescope redesign trigger TRIPPED: `_h_ctx_N` gone from
+   goal shapes (survives in the SST `inv_hyps` side-table only);
+   nested loops = flat concatenation under one per-goal counter.
+   `loop_maintain_frame`/`loop_use_frame` simplify — this section IS
+   the card entry the plan's stop-and-card rule asks for.
+Bonus: `HypProvenance::HoistEq` already landed on main (`9a88b6c`) —
+discharge Q1 shrinks to the composer arm.
