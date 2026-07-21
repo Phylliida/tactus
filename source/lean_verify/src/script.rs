@@ -275,7 +275,8 @@ fn hoist_eq_names(hyps: &[ShapeHyp]) -> Vec<String> {
 /// Apply the hoist-equation substitutions to an expression: replace
 /// `Var(binder)` by the equation RHS, for every HoistEq hyp. Used by
 /// the ExactHyp cheap check (the author holds both texts — no
-/// proof-time hoping).
+/// proof-time hoping). Transparent wrappers are stripped for the
+/// comparison — see `apply_let_substs`.
 fn apply_hoist_substs(e: &Expr, hyps: &[ShapeHyp]) -> Expr {
     let mut out = e.clone();
     for h in hyps {
@@ -287,7 +288,7 @@ fn apply_hoist_substs(e: &Expr, hyps: &[ShapeHyp]) -> Expr {
             }
         }
     }
-    out
+    crate::lean_ast::strip_transparent(&out)
 }
 
 fn subst_var(e: &Expr, name: &str, val: &Expr) -> Expr {
@@ -466,12 +467,19 @@ pub fn author_v1(
 // ────────────────────────────────────────────────────────────────────
 
 /// Apply a list of let-substitutions (in spine order) to an expression.
+/// The result is used ONLY for pp-text comparison (form C's exact-match
+/// check): transparent wrappers are stripped, since `pp_expr` renders
+/// each `SpanMark` as a leading `/- @rust:LOC -/` comment and each
+/// `TypeAnnot` as `(e : Ty)` — the two sides of a real match carry
+/// different wrappers from different emission paths (call-site args vs
+/// the callee's instantiated ensures; antecedent props arrive with a
+/// `(P : Prop)` ascription) that would otherwise never compare equal.
 fn apply_let_substs(e: &Expr, substs: &[(String, Expr)]) -> Expr {
     let mut out = e.clone();
     for (name, val) in substs {
         out = subst_var(&out, name, val);
     }
-    out
+    crate::lean_ast::strip_transparent(&out)
 }
 
 /// Form C (§11.2): the goal core, after applying the goal's own
@@ -550,6 +558,12 @@ fn author_form_c(
             if cp == nc {
                 found = Some(n.clone());
                 break;
+            }
+        }
+        if found.is_none() && std::env::var("TACTUS_DEBUG_FORMC").is_ok() {
+            eprintln!("[formc] DECLINE conjunct: {nc}");
+            for (n, cp) in &cands {
+                eprintln!("[formc]   cand {n}: {cp}");
             }
         }
         exacts.push(found?);

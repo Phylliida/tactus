@@ -237,3 +237,116 @@ fn form_c_refine_exact_for_conjunction() {
     assert!(text.contains("subst _h_tmp9_hoist1"), "{text}");
     let _ = conj;
 }
+
+#[test]
+fn form_c_refine_exact_with_nested_hoist_refs_in_facts() {
+    // The 890:9 shape (pmul_comm): goal `peqv tmp19 tmp20 ∧ peqv tmp20
+    // tmp21` where the matching CallFact _h_hoist_13 itself mentions
+    // hoist-bound tmps (tmp17, tmp18) — the author must substitute
+    // through the candidates, not just the goal.
+    let qa = app("lib.poly.pmul", vec![var("T"), var("q"), var("t")]);            // tmp17
+    let aq = app("lib.poly.pmul", vec![var("T"), var("t"), var("q")]);            // tmp18
+    let qsh = app("lib.poly.pmul", vec![var("T"), var("q"), var("sh1")]);         // tmp19
+    let sh_qa = app("lib.poly.shiftk", vec![var("T"), qa.clone(), var("1")]);     // tmp20
+    let sh_aq = app("lib.poly.shiftk", vec![var("T"), aq.clone(), var("1")]);     // tmp21
+    let fact1 = app("lib.poly.peqv", vec![var("T"), qsh.clone(), sh_qa.clone()]);
+    let fact2 = app(
+        "lib.poly.peqv",
+        vec![
+            var("T"),
+            app("lib.poly.shiftk", vec![var("T"), var("tmp17"), var("1")]),
+            app("lib.poly.shiftk", vec![var("T"), var("tmp18"), var("1")]),
+        ],
+    );
+    let hoist = |n: &str, v: Expr| all(
+        binder(&format!("_h_{}_hoist1", n), bin(BinOp::Eq, var(n), v)),
+        Some(HypProvenance::HoistEq { binder: LeanName::lit(n) }),
+    );
+    let call = |p: Expr, n: &str| all(
+        binder(n, p),
+        Some(HypProvenance::CallFact(crate::lean_ast::CallFactInfo {
+            callee: "lib.lemma".to_string(),
+            is_self: false,
+            args: vec![],
+            ensures_summary: vec![],
+        })),
+    );
+    let goal = bin(
+        BinOp::And,
+        app("lib.poly.peqv", vec![var("T"), var("tmp19"), var("tmp20")]),
+        app("lib.poly.peqv", vec![var("T"), var("tmp20"), var("tmp21")]),
+    );
+    let shape = GoalShape {
+        spine: vec![
+            hoist("tmp17", qa),
+            hoist("tmp18", aq),
+            hoist("tmp19", qsh),
+            hoist("tmp20", sh_qa),
+            hoist("tmp21", sh_aq),
+            call(fact1, "_h_hoist_8"),
+            call(fact2, "_h_hoist_13"),
+        ],
+        leaf: goal.clone(),
+    };
+    let dts = DtDefInventory {
+        spec_fns: ["lib.poly.peqv".to_string()].into_iter().collect(),
+        ..Default::default()
+    };
+    let (moves, form) = author_v1(&goal, &shape, &dts, &[]).expect("form C applies");
+    assert_eq!(form, ScriptForm::C);
+    let text = render_script(&moves);
+    assert!(text.contains("refine ⟨_h_hoist_8, _h_hoist_13⟩"), "{text}");
+}
+
+#[test]
+fn form_c_matches_despite_span_mark_asymmetry() {
+    // The 890:9 failure mode: the candidate fact carries a SpanMark
+    // (from the callee's instantiated ensures emission path) that the
+    // goal conjunct (call-site args) lacks. pp renders SpanMark as a
+    // `/- @rust:LOC -/` comment, so the texts never compared equal and
+    // form C declined to form A. The comparison must be span-insensitive.
+    let qa = app("lib.poly.pmul", vec![var("T"), var("q"), var("t")]);
+    let sh_qa = app("lib.poly.shiftk", vec![var("T"), qa.clone(), var("1")]);
+    let fact1 = app("lib.poly.peqv", vec![
+        var("T"),
+        Expr::span_mark("src/x.rs:1:1".to_string(), None, crate::lean_ast::AssertKind::Hypothesis(crate::lean_ast::HypothesisKind::BranchCondition), qa.clone()),
+        sh_qa.clone(),
+    ]);
+    // Antecedent-style Prop ascription on top (the `(P : Prop)` wrapper
+    // that broke textual equality on the corpus).
+    let fact1 = Expr::type_annot(fact1, var("Prop"));
+    let hoist = |n: &str, v: Expr| all(
+        binder(&format!("_h_{}_hoist1", n), bin(BinOp::Eq, var(n), v)),
+        Some(HypProvenance::HoistEq { binder: LeanName::lit(n) }),
+    );
+    let call = |p: Expr, n: &str| all(
+        binder(n, p),
+        Some(HypProvenance::CallFact(crate::lean_ast::CallFactInfo {
+            callee: "lib.lemma".to_string(),
+            is_self: false,
+            args: vec![],
+            ensures_summary: vec![],
+        })),
+    );
+    let goal = bin(
+        BinOp::And,
+        app("lib.poly.peqv", vec![var("T"), var("tmp19"), var("tmp20")]),
+        app("lib.poly.peqv", vec![var("T"), var("tmp19"), var("tmp20")]),
+    );
+    let shape = GoalShape {
+        spine: vec![
+            hoist("tmp19", qa),
+            hoist("tmp20", sh_qa),
+            call(fact1, "_h_hoist_8"),
+        ],
+        leaf: goal.clone(),
+    };
+    let dts = DtDefInventory {
+        spec_fns: ["lib.poly.peqv".to_string()].into_iter().collect(),
+        ..Default::default()
+    };
+    let (moves, form) = author_v1(&goal, &shape, &dts, &[]).expect("form C applies");
+    assert_eq!(form, ScriptForm::C);
+    let text = render_script(&moves);
+    assert!(text.contains("refine ⟨_h_hoist_8, _h_hoist_8⟩"), "{text}");
+}
