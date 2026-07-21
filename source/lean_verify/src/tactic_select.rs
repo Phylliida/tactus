@@ -837,11 +837,32 @@ fn goal_core_is_equation(goal: &Expr) -> bool {
         match &cur.node {
             ExprNode::SpanMark { inner, .. } => cur = inner,
             ExprNode::Forall { body, .. } => cur = body,
-            ExprNode::Let { body, .. } => cur = body,
+            ExprNode::Let { name, value, body } => cur = let_descend(name, value, body),
             ExprNode::BinOp { op: BinOp::Implies, rhs, .. } => cur = rhs,
             ExprNode::BinOp { op: BinOp::Eq | BinOp::Iff | BinOp::Ne, .. } => return true,
             _ => return false,
         }
+    }
+}
+
+/// Descend one `let` frame, N1-wrapper-aware: the trailing equation
+/// wrapper (`let tmp := v; tmp`) is LOOKED THROUGH to its value — the
+/// goal core hides behind it (the pmul wrapper shape: `let tmp__2 :=
+/// index (push p c) 0 = c; tmp__2` gated the seq-rw arms off entirely
+/// when the peel landed on the bare `tmp` var, 2026-07-20). An
+/// ordinary let descends to the body.
+fn let_descend<'a>(name: &crate::lean_name::LeanName, value: &'a Expr, body: &'a Expr) -> &'a Expr {
+    let mut b = body;
+    loop {
+        match &b.node {
+            ExprNode::SpanMark { inner, .. } => b = inner,
+            _ => break,
+        }
+    }
+    if matches!(&b.node, ExprNode::Var(n) if n.as_str() == name.as_str()) {
+        value
+    } else {
+        body
     }
 }
 
@@ -865,7 +886,7 @@ fn goal_core_app_head(goal: &Expr) -> Option<&str> {
         match &cur.node {
             ExprNode::SpanMark { inner, .. } => cur = inner,
             ExprNode::Forall { body, .. } => cur = body,
-            ExprNode::Let { body, .. } => cur = body,
+            ExprNode::Let { name, value, body } => cur = let_descend(name, value, body),
             ExprNode::BinOp { op: BinOp::Implies, rhs, .. } => cur = rhs,
             _ => {
                 let c = peel_transparent(cur);
@@ -894,7 +915,7 @@ fn goal_core_app_head(goal: &Expr) -> Option<&str> {
 /// anything else (non-equation core, bare-var LHS, non-Var head) is
 /// `None`. Drives the eliminator apply-guard in `derived_closer` — a
 /// `None` keeps the arm (unknown → conservative).
-fn equation_lhs_head_name(goal: &Expr) -> Option<&str> {
+pub(crate) fn equation_lhs_head_name(goal: &Expr) -> Option<&str> {
     fn peel_transparent(mut e: &Expr) -> &Expr {
         loop {
             match &e.node {
@@ -909,7 +930,7 @@ fn equation_lhs_head_name(goal: &Expr) -> Option<&str> {
         match &cur.node {
             ExprNode::SpanMark { inner, .. } => cur = inner,
             ExprNode::Forall { body, .. } => cur = body,
-            ExprNode::Let { body, .. } => cur = body,
+            ExprNode::Let { name, value, body } => cur = let_descend(name, value, body),
             ExprNode::BinOp { op: BinOp::Implies, rhs, .. } => cur = rhs,
             ExprNode::BinOp { op: BinOp::Eq | BinOp::Iff | BinOp::Ne, lhs, .. } => {
                 return match &peel_transparent(lhs).node {
@@ -2068,7 +2089,7 @@ fn comparison_core(goal: &Expr) -> Option<(crate::lean_ast::BinOp, &Expr, &Expr)
             ExprNode::SpanMark { inner, .. } => cur = inner,
             ExprNode::TypeAnnot { expr, .. } => cur = expr,
             ExprNode::Forall { body, .. } => cur = body,
-            ExprNode::Let { body, .. } => cur = body,
+            ExprNode::Let { name, value, body } => cur = let_descend(name, value, body),
             ExprNode::BinOp { op: BinOp::Implies, rhs, .. } => cur = rhs,
             ExprNode::BinOp { op: op @ (BinOp::Eq | BinOp::Le | BinOp::Ge), lhs, rhs } => {
                 return Some((*op, lhs, rhs));
