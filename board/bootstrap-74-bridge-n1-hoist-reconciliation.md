@@ -274,6 +274,43 @@ sweep, census-gated deferrals (shadowing, name collisions), and the
 follow-up queue (discharge Q1 provenance, b70/71 closes, b69
 decision, call-mut, loop-telescope redesign, cache fingerprint).
 
+### Slice 2 Round A DONE (2026-07-21, `a2c40ad`): model 3-mode — 230/0 + package gate green
+
+The model (tactus-core/lib.rs) now mirrors production's post-`8dcac64`
+partial hoist. `FrameList`: `FHyp` gained a uniform `poison` field
+(serializer-computed — model leaves are opaque; `1` ⇒ prop mentions a
+residue name ⇒ whole goal wraps) and a `FLetR(x, v)` residue-let
+variant. Gate: `gate_wrap = has_plain_flet || has_poisoned_hyp`. Hoist
+mode is TWO-PHASE on rendering (`close_e_tel` skips `FLetR`;
+`residue_fold_e` folds residue lets around the leaf,
+earliest-outermost — production's own structure) and semantics
+(`close_sem_*_tel/res`), with the evaluation-context invariant
+documented (residue values read after all telescope upds; adequate
+because residue texts only mention earlier names). `StmData` gained
+`AssignH` (hoistable), `AssignR` (residue), hyp names + poison bits on
+`Assert`/`Assume`/`If`; `RetBind::RetLetH`. Poisoned `FLetH` collapses
+to plain `FLet` losslessly. Proof layer: pin families re-split per
+phase (u_cet/u_cer, u_cset/u_cser, u_csot/u_csor + u_gatep_*), the
+three big inductions restructured (`holds_residue_fold` +
+`holds_close_tel` + thin hoist wrappers; cso tel/res), `wp_stm_sound`
+gained AssignH/AssignR arms. Link discharge 144/6 — pendings are the
+pre-existing other-hyp (HoistEq) residual, UNCHANGED by the re-split.
+NEW CLOSER RECIPE: `by_cases` on the COMPOSITE `lib.gate_wrap` works
+for dispatchers; straight-line mode-pin callers need `lib.gate_wrap`
+in the simp set (zetaDelta doesn't delta-unfold top-level defs).
+
+NEXT = Round B (serializer, sst_serialize.rs): §3a `_h_hoist_i`
+ordinal walk state (+ If-branch snapshot/restore), §3b classification
+(Assign→AssignH/AssignR/plain via `local_typs`; Call-dest FLet→FLetH —
+needs dest typ plumbed into `CertCallLeaves`; RetLet→RetLetH via
+`ret_typ`; poison = prop text mentions an in-scope residue name),
+§3d census tags (`hoist-name-collision`, `hoist-shadowed-let`,
+`hoist-unclassifiable-let`, `hoist-residue-mention`). Smoke: probe9
+use_clamped + vec_read decide-close (no residue there — exercises
+naming + FLetH only). Then Round C (loop-telescope simplification per
+the §2b evidence) + Round D (loop naming + shadow-rename mirror —
+`i_hoist1`, `_h_i_hoist1_hoist1`).
+
 ### Slice 2 step 0 DONE + scope updates (2026-07-21)
 
 Certs regenerated with current production (fixture 32/39 certified —
