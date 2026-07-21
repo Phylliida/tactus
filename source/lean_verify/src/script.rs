@@ -67,7 +67,7 @@ pub enum Move {
     /// (post-normalization — the author compared the texts at
     /// emission; cheap because the emitter HOLDS both).
     ExactHyp(String),
-    /// `refine ⟨exact h1, exact h2⟩` — a 2-conjunct goal where each
+    /// `refine ⟨h1, h2⟩` — a 2-conjunct goal where each
     /// side matched a hyp (form C).
     RefineExact(Vec<String>),
     /// `rfl` — the sides differ only by let-defeq / ctor-eta after the
@@ -181,8 +181,11 @@ fn render_move(m: &Move) -> String {
         }
         Move::ExactHyp(h) => format!("exact {}", h),
         Move::RefineExact(hs) => {
-            let parts: Vec<String> = hs.iter().map(|h| format!("exact {}", h)).collect();
-            format!("refine ⟨{}⟩", parts.join(", "))
+            // `refine` takes a TERM: the conjunct proofs are the hyp names
+            // themselves. `refine ⟨exact h1, exact h2⟩` is a syntax error
+            // ("Unknown identifier `exact`") — the arm used to die on parse
+            // and the failure surfaced as the LAST arm's error instead.
+            format!("refine ⟨{}⟩", hs.join(", "))
         }
         Move::Defeq => "rfl".to_string(),
         Move::Done => "done".to_string(),
@@ -475,7 +478,7 @@ fn apply_let_substs(e: &Expr, substs: &[(String, Expr)]) -> Expr {
 /// let-substitutions, textually equals one of the candidate facts (the
 /// antecedent hyps from the goal's implication spine — the user's own
 /// trans/cong calls' ensures — or a shape hyp). Single goal →
-/// `exact h`; a 2-conjunct goal → `refine ⟨exact h1, exact h2⟩`.
+/// `exact h`; a 2-conjunct goal → `refine ⟨h1, h2⟩`.
 /// Anything else declines (the derived chain gets it).
 fn author_form_c(
     goal: &Expr,

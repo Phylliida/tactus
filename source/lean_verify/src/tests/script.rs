@@ -233,7 +233,7 @@ fn form_c_refine_exact_for_conjunction() {
     let (moves, form) = author_v1(&goal, &shape, &dts, &[]).expect("form C applies");
     assert_eq!(form, ScriptForm::C);
     let text = render_script(&moves);
-    assert!(text.contains("refine ⟨exact _h_hoist_1, exact _h_hoist_2⟩"), "{text}");
+    assert!(text.contains("refine ⟨_h_hoist_1, _h_hoist_2⟩"), "{text}");
     assert!(text.contains("subst _h_tmp9_hoist1"), "{text}");
     let _ = conj;
 }
