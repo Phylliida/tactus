@@ -2050,11 +2050,24 @@ fn height_fn_for_datatype(
         LExpr::var_lit("sizeOf"),
         LExpr::var(crate::lean_name::LeanName::lit(arg_name)),
     );
-    // `simp_arith` handles the linear-arithmetic obligation
-    // `sizeOf <field>.deref < sizeOf <ctor>` — Lean's default
-    // `decreasing_tactic` can't see through wrapper `.deref`
-    // projections, but `simp_arith` reduces them via SizeOf's
-    // auto-derived equations and closes the resulting Nat inequality.
+    // The decreasing obligation is `sizeOf <field>[.deref…] <
+    // `sizeOf <ctor …>` for each recursive field. The named simp set
+    // closes it by one predictable rule — exactly the sizeOf equations
+    // in scope, no search:
+    //   * `{Ctor}.sizeOf_spec` (one per OWN variant — Lean's
+    //     auto-derived SizeOf equation) unfolds the goal's RHS ctor;
+    //   * `Tactus.{Ref,MutRef,Box,Rc,Arc}.sizeOf_deref` (all five,
+    //     always — they live in TactusDefs) unfold the wrapper layers
+    //     on the LHS field, one `.deref` each;
+    //   * TERM_SIMP_LEMMAS normalizes any residual arithmetic;
+    //   * `omega` closes the resulting Nat inequality.
+    // (`sizeOf_spec` fires on every decreasing goal — each comes from a
+    // recursive field under a ctor — so `simp_all only` never errors
+    // with "made no progress".)
+    let ctor_sizeof_specs: String = dt.variants.iter()
+        .map(|v| format!("{}.{}.sizeOf_spec", path, sanitize(&v.name)))
+        .collect::<Vec<_>>()
+        .join(", ");
     Some(Command::Def(Def {
         attrs: vec!["simp".into()],
         name: format!("{}.height", path),
@@ -2064,8 +2077,9 @@ fn height_fn_for_datatype(
         termination_by: vec![termination],
         termination_structural: false,
         decreasing_by: Some(format!(
-            "all_goals (simp_all only [{}]; omega)",
-            crate::tactic_select::TERM_SIMP_LEMMAS
+            "all_goals (simp_all only [{}, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, {}]; omega)",
+            crate::tactic_select::TERM_SIMP_LEMMAS,
+            ctor_sizeof_specs,
         )),
     }))
 }
