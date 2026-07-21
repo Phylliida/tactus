@@ -1,6 +1,28 @@
 # DESIGN — N3: Provenance-Driven Proof Scripts
 
 **Status:** DRAFT v0.1 (2026-07-19), for iteration with Danielle.
+**Recip sign-split arc LANDED (2026-07-20):** the Field family
+complete — mul_recip_right, recip_congruence ×2 green; divmod (4),
+pmul_padd_right (4), pmul_pad (1), pmul_singleton_right (1) all came
+along. Algebra: 112 → 114 verified, 76 → 72 errors. Lessons: (25)
+`assert(false)` in a branch makes every downstream obligation in that
+branch vacuous — the False-elim arm (`cases h` on `LitBool(false)`
+binders — `False` is NOT a `Var` node) belongs in the kernel ladder.
+(26) the recip sign legs need ite-collapse + toNat facts AFTER
+`split` peels the outer guard, never before: `if_pos`/`if_neg` in the
+spine set collapse the ites `split` needs; `ofNat_toNat` rewrites
+subrange's toNat forms out from under divmod's legs; the full unfold
+set in a leg whnf-times-out; `+zetaDelta` on big contexts is
+substitution blowup. The working leg is `simp_all only [if_pos,
+if_neg, if_true, if_false] <;> omega` as BACKSTOP behind the wild
+`simp_all` (which fails catchably on the recip legs — a `¬(a.num >
+0)` branch hyp plus Prop-equations mangle the full simp set). (27)
+every normalizer added to a SHARED simp set is a regression surface —
+the green families are tuned to the exact forms the current sets
+produce, and the right set at the right position (spine vs leg vs
+rung) is the whole game. (28) budget-edge flakes: a byte-identical
+theorem can fail under corpus load and close standalone (pmul_push's
+223:16) — verify a suspected regression standalone before chasing it.
 **Infra review + pool experiment (2026-07-20):** the closer
 infrastructure audited against the transparency/predictability law.
 Already of the requested kind: the script author (computed matches —

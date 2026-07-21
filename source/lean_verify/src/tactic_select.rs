@@ -214,9 +214,21 @@ pub(crate) fn core_simp() -> String {
 /// collapse) and ite collapse over reduced Prop discriminators
 /// (`if True then a else b` after `is<Variant>` unfolds on a
 /// constructor). Probe-tested on the e2e exec corpus (2026-07-17,
-/// the 26-test squeeze-regression sweep).
+/// the 26-test squeeze-regression sweep). NOTE: `if_pos`/`if_neg`
+/// (context-conditioned ite collapse) do NOT belong here — in the
+/// rung's full set they mangle pmul's guarded forms (the 2026-07-20
+/// recip-arc regression); they live in the script's targeted set
+/// instead, where the unfold has just exposed the guard.
 pub(crate) const STRUCTURAL_EXTRA_LEMMAS: &str =
     "true_or, or_true, if_true, if_false, reduceCtorEq";
+
+/// The ite-collapse family used by the script's targeted leg
+/// (LeafTargetedSimp): context-conditioned (`if_pos`/`if_neg`) plus
+/// decided-condition (`if_true`/`if_false`) ite rewrites. Kept as a
+/// named const so the render-time name discipline
+/// (`script_names_resolve`) treats them as builtins — none of them
+/// contain a `.`, so the dotted-name shortcut misses them.
+pub(crate) const ITE_COLLAPSE_LEMMAS: &str = "if_pos, if_neg, if_true, if_false";
 
 /// Arithmetic collapse lemmas for the goal-only form G arm: identity /
 /// annihilator / cast-push laws PLUS (sub)distribution, so the whole
@@ -311,7 +323,28 @@ pub(crate) fn derived_closer(
     //   fails fast and catchably there, and non-equation goals never
     //   needed delta rfl.
     let rfl_form = if goal_core_is_equation(goal) { "rfl" } else { "with_reducible rfl" };
-    let kernel = format!("first | {} | decide | omega", rfl_form);
+    // False-hypothesis elim: a binder of type `False` closes anything
+    // (the `assert(false)`-in-a-branch idiom makes every downstream
+    // obligation in that branch vacuous — recip_congruence's
+    // `b.num == 0` leg, 2026-07-20). `cases h` is a core decision
+    // step; inside the kernel ladder it also lands after
+    // render_peel's intro prefix, so wrap-shape goals are covered.
+    let false_arms: String = binders
+        .iter()
+        .filter_map(|b| {
+            let n = b.name.as_ref()?;
+            let mut t = &b.ty;
+            while let ExprNode::SpanMark { inner, .. } = &t.node {
+                t = inner;
+            }
+            if matches!(&t.node, ExprNode::LitBool(false)) {
+                Some(format!(" | (cases {})", n.as_str()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let kernel = format!("first | {} | decide | omega{}", rfl_form, false_arms);
     let rung = structural_rung(goal, dts, binders, user_prefix);
     // N3-M1 arms (probes: probe-n3-scripts/, 2026-07-19). All ADDITIVE
     // — they run only where every pre-existing arm already failed.
