@@ -263,6 +263,14 @@ pub enum StmData {
     ///   aligned `inv_obligs` entry (`atom_ob(prop)`); deepening splits
     ///   them by TYPE (opaque frame-hyp `u64` vs structural goal `RawExp`),
     ///   not by content.
+    /// * `inv_obligs_exit` — the RENAMED re-close obligations
+    ///   (bootstrap-74 slice 2 Round D evidence): at body end,
+    ///   production's shadow mirror rewrites the invariant texts'
+    ///   references to shadowed locals (`i_hoist1 ≤ n`,
+    ///   `Int.toNat acc_hoist1 = lib.tri (Int.toNat i_hoist1)` — fresh
+    ///   leaf ids, distinct from the init obligations' plain-`i`
+    ///   texts). Index-aligned with `inv_obligs`; closed ONLY at
+    ///   maintain-reclose (init keeps `inv_obligs`).
     /// * `binders` — the modified-local havoc set `(id, typ leaf)`.
     /// * `binder_bounds` — parallel `(NoBound | Bound(_h_hoist name, range
     ///   prop))` per modified local (production re-asserts each mod-var's
@@ -283,6 +291,7 @@ pub enum StmData {
     Loop {
         inv_hyps: Box<BinderList>,
         inv_obligs: Box<RawExpList>,
+        inv_obligs_exit: Box<RawExpList>,
         binders: Box<BinderList>,
         binder_bounds: Box<ParamBoundList>,
         cond_name: u64,
@@ -724,14 +733,14 @@ pub open spec fn stm_size(s: StmData) -> nat
         StmData::AssertQueryNl(b, _tq) => 1 + stm_size(*b),
         StmData::Ret(es, _rb) => 1 + raw_exp_list_len(*es),
         StmData::If(_c, _cn, _nc, _ncn, _cp, t, e) => 1 + stm_size(*t) + stm_size(*e),
-        StmData::Loop { inv_hyps, inv_obligs, binders, binder_bounds: _, cond_name: _, cond_ann: _, neg_cond_ann: _, cond_poison: _, d_old_name: _, d_old_ty: _, d_old_val: _, d_old_eq_name: _, d_old_eq_prop: _, decrease_oblig: _, body } =>
+        StmData::Loop { inv_hyps, inv_obligs, inv_obligs_exit, binders, binder_bounds: _, cond_name: _, cond_ann: _, neg_cond_ann: _, cond_poison: _, d_old_name: _, d_old_ty: _, d_old_val: _, d_old_eq_name: _, d_old_eq_prop: _, decrease_oblig: _, body } =>
             // Mirrors the serializer's `stm_size_of` token count, which sums
             // stmt heads + LeafList/BinderList/RawExpList `Cons` — `inv_hyps`
-            // and `binders` are BinderLists (counted); `inv_obligs` is the
-            // parallel DEEP-obligation RawExpList (counted, W6d.1b-iii);
-            // `binder_bounds` is a ParamBoundList (NOT counted, same as
-            // FnCtxData's); the scalar leaves add 0.
-            1 + binder_len(*inv_hyps) + raw_exp_list_len(*inv_obligs) + binder_len(*binders) + stm_size(*body),
+            // and `binders` are BinderLists (counted); `inv_obligs` and
+            // `inv_obligs_exit` are the parallel DEEP-obligation RawExpLists
+            // (counted, W6d.1b-iii); `binder_bounds` is a ParamBoundList
+            // (NOT counted, same as FnCtxData's); the scalar leaves add 0.
+            1 + binder_len(*inv_hyps) + raw_exp_list_len(*inv_obligs) + raw_exp_list_len(*inv_obligs_exit) + binder_len(*binders) + stm_size(*body),
         StmData::Skip => 1,
         StmData::Seq(a, b) => 1 + stm_size(*a) + stm_size(*b),
     }
@@ -2505,7 +2514,7 @@ pub open spec fn frame_after(f: FrameList, s: StmData) -> FrameList
             } else {
                 f
             },
-        StmData::Loop { inv_hyps, inv_obligs: _, binders, binder_bounds, cond_name, cond_ann: _, neg_cond_ann, cond_poison, d_old_name: _, d_old_ty: _, d_old_val: _, d_old_eq_name: _, d_old_eq_prop: _, decrease_oblig: _, body: _ } =>
+        StmData::Loop { inv_hyps, inv_obligs: _, inv_obligs_exit: _, binders, binder_bounds, cond_name, cond_ann: _, neg_cond_ann, cond_poison, d_old_name: _, d_old_ty: _, d_old_val: _, d_old_eq_name: _, d_old_eq_prop: _, decrease_oblig: _, body: _ } =>
             // use telescope (finding-3 + bootstrap-16, uniform shape):
             // havoc the pre-loop lets for the modified locals,
             // re-quantify them, re-introduce each invariant + ¬cond.
@@ -2560,7 +2569,7 @@ pub open spec fn wp_stm(f: FrameList, s: StmData) -> GoalList
             goals_append(
                 wp_stm(frame_append(f, FrameList::FHyp(cn, c, cp, Box::new(FrameList::FNil))), *t),
                 wp_stm(frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e)),
-        StmData::Loop { inv_hyps, inv_obligs, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann: _, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, body } => {
+        StmData::Loop { inv_hyps, inv_obligs, inv_obligs_exit, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann: _, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, body } => {
             // Maintain telescope (finding-3 + bootstrap-16, uniform
             // post-N1 shape): havoc pre-loop lets for the modified
             // locals, re-quantify them + NAMED bound hyps, re-assert
@@ -2576,7 +2585,7 @@ pub open spec fn wp_stm(f: FrameList, s: StmData) -> GoalList
             // goal per invariant re-closed (`close_each_e` over `inv_obligs` →
             // `LeafE(render_exp(ob))`), then the DEEP decrease obligation
             // (`close_e`).
-            let maintain_reclose = close_each_e(endf, *inv_obligs);
+            let maintain_reclose = close_each_e(endf, *inv_obligs_exit);
             let decrease_goal =
                 GoalList::Cons(Box::new(close_e(endf, decrease_oblig)), Box::new(GoalList::Nil));
             // Emission order = init ++ body ++ maintain-reclose ++ decrease
@@ -2969,6 +2978,13 @@ proof fn ref_wp_sum_to_loop()
                             RawExpList::Cons(Box::new(atom_ob(24)), Box::new(
                             RawExpList::Cons(Box::new(atom_ob(25)), Box::new(
                             RawExpList::Cons(Box::new(atom_ob(26)), Box::new(RawExpList::Nil))))))))),
+                        // The RENAMED re-close obligations (Round D evidence):
+                        // body-end inv texts rewrite shadowed locals
+                        // (`i_hoist1 ≤ n`, …) — fresh synthetic ids.
+                        inv_obligs_exit: Box::new(RawExpList::Cons(Box::new(atom_ob(55)), Box::new(
+                            RawExpList::Cons(Box::new(atom_ob(56)), Box::new(
+                            RawExpList::Cons(Box::new(atom_ob(57)), Box::new(
+                            RawExpList::Cons(Box::new(atom_ob(58)), Box::new(RawExpList::Nil))))))))),
                         binders: Box::new(BinderList::Cons(9, 1, Box::new(
                             BinderList::Cons(11, 1, Box::new(BinderList::Nil))))),
                         binder_bounds: Box::new(ParamBoundList::Bound(37, 38, Box::new(
@@ -3006,7 +3022,7 @@ proof fn ref_wp_sum_to_loop()
             // telescope (named bound/inv/cond hyps + d_old FLetH pair); goals
             // 6-10 add the shadow-freshened body rebinds (i_hoist1, acc_hoist1);
             // goal 11 = use telescope + RetLetH pair.
-            GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(43, 44, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(45, 46, Box::new(GoalData::LeafE(ExprData::Atom(23))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(43, 44, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(45, 46, Box::new(GoalData::LeafE(ExprData::Atom(24))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(43, 44, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(45, 46, Box::new(GoalData::LeafE(ExprData::Atom(25))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(43, 44, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(45, 46, Box::new(GoalData::LeafE(ExprData::Atom(26))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::All(27, 1, Box::new(GoalData::All(41, 42, Box::new(GoalData::LeafE(ExprData::Atom(18))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::All(27, 1, Box::new(GoalData::All(41, 42, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(47, 1, Box::new(GoalData::All(48, 49, Box::new(GoalData::LeafE(ExprData::Atom(21))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::All(27, 1, Box::new(GoalData::All(41, 42, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(47, 1, Box::new(GoalData::All(48, 49, Box::new(GoalData::All(0, 20, Box::new(GoalData::All(0, 20, Box::new(GoalData::All(50, 1, Box::new(GoalData::All(51, 52, Box::new(GoalData::LeafE(ExprData::Atom(23))))))))))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::All(27, 1, Box::new(GoalData::All(41, 42, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(47, 1, Box::new(GoalData::All(48, 49, Box::new(GoalData::All(0, 20, Box::new(GoalData::All(0, 20, Box::new(GoalData::All(50, 1, Box::new(GoalData::All(51, 52, Box::new(GoalData::LeafE(ExprData::Atom(24))))))))))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::All(27, 1, Box::new(GoalData::All(41, 42, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(47, 1, Box::new(GoalData::All(48, 49, Box::new(GoalData::All(0, 20, Box::new(GoalData::All(0, 20, Box::new(GoalData::All(50, 1, Box::new(GoalData::All(51, 52, Box::new(GoalData::LeafE(ExprData::Atom(25))))))))))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::All(27, 1, Box::new(GoalData::All(41, 42, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(47, 1, Box::new(GoalData::All(48, 49, Box::new(GoalData::All(0, 20, Box::new(GoalData::All(0, 20, Box::new(GoalData::All(50, 1, Box::new(GoalData::All(51, 52, Box::new(GoalData::LeafE(ExprData::Atom(26))))))))))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::All(27, 1, Box::new(GoalData::All(41, 42, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(47, 1, Box::new(GoalData::All(48, 49, Box::new(GoalData::All(0, 20, Box::new(GoalData::All(0, 20, Box::new(GoalData::All(50, 1, Box::new(GoalData::All(51, 52, Box::new(GoalData::LeafE(ExprData::Atom(39))))))))))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 40, Box::new(GoalData::All(8, 1, Box::new(GoalData::All(53, 54, Box::new(GoalData::LeafE(ExprData::Atom(7))))))))))))))))))))))))))))))), Box::new(GoalList::Nil))))))))))))))))))))))))
+            GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(43, 44, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(45, 46, Box::new(GoalData::LeafE(ExprData::Atom(23))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(43, 44, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(45, 46, Box::new(GoalData::LeafE(ExprData::Atom(24))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(43, 44, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(45, 46, Box::new(GoalData::LeafE(ExprData::Atom(25))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(43, 44, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(45, 46, Box::new(GoalData::LeafE(ExprData::Atom(26))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::All(27, 1, Box::new(GoalData::All(41, 42, Box::new(GoalData::LeafE(ExprData::Atom(18))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::All(27, 1, Box::new(GoalData::All(41, 42, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(47, 1, Box::new(GoalData::All(48, 49, Box::new(GoalData::LeafE(ExprData::Atom(21))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::All(27, 1, Box::new(GoalData::All(41, 42, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(47, 1, Box::new(GoalData::All(48, 49, Box::new(GoalData::All(0, 20, Box::new(GoalData::All(0, 20, Box::new(GoalData::All(50, 1, Box::new(GoalData::All(51, 52, Box::new(GoalData::LeafE(ExprData::Atom(55))))))))))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::All(27, 1, Box::new(GoalData::All(41, 42, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(47, 1, Box::new(GoalData::All(48, 49, Box::new(GoalData::All(0, 20, Box::new(GoalData::All(0, 20, Box::new(GoalData::All(50, 1, Box::new(GoalData::All(51, 52, Box::new(GoalData::LeafE(ExprData::Atom(56))))))))))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::All(27, 1, Box::new(GoalData::All(41, 42, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(47, 1, Box::new(GoalData::All(48, 49, Box::new(GoalData::All(0, 20, Box::new(GoalData::All(0, 20, Box::new(GoalData::All(50, 1, Box::new(GoalData::All(51, 52, Box::new(GoalData::LeafE(ExprData::Atom(57))))))))))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::All(27, 1, Box::new(GoalData::All(41, 42, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(47, 1, Box::new(GoalData::All(48, 49, Box::new(GoalData::All(0, 20, Box::new(GoalData::All(0, 20, Box::new(GoalData::All(50, 1, Box::new(GoalData::All(51, 52, Box::new(GoalData::LeafE(ExprData::Atom(58))))))))))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 30, Box::new(GoalData::All(27, 1, Box::new(GoalData::All(41, 42, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(0, 17, Box::new(GoalData::All(47, 1, Box::new(GoalData::All(48, 49, Box::new(GoalData::All(0, 20, Box::new(GoalData::All(0, 20, Box::new(GoalData::All(50, 1, Box::new(GoalData::All(51, 52, Box::new(GoalData::LeafE(ExprData::Atom(39))))))))))))))))))))))))))))))))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::All(5, 4, Box::new(GoalData::All(9, 1, Box::new(GoalData::All(37, 38, Box::new(GoalData::All(11, 1, Box::new(GoalData::All(35, 36, Box::new(GoalData::All(34, 23, Box::new(GoalData::All(33, 24, Box::new(GoalData::All(32, 25, Box::new(GoalData::All(31, 26, Box::new(GoalData::All(29, 40, Box::new(GoalData::All(8, 1, Box::new(GoalData::All(53, 54, Box::new(GoalData::LeafE(ExprData::Atom(7))))))))))))))))))))))))))))))), Box::new(GoalList::Nil))))))))))))))))))))))))
         ) == 1
 by { decide }
 
@@ -3362,6 +3378,7 @@ proof fn amended_shapes_kernel_compute()
         stm_size(StmData::Loop {
             inv_hyps: Box::new(BinderList::Cons(0, 10, Box::new(BinderList::Nil))),
             inv_obligs: Box::new(RawExpList::Cons(Box::new(atom_ob(10)), Box::new(RawExpList::Nil))),
+            inv_obligs_exit: Box::new(RawExpList::Cons(Box::new(atom_ob(12)), Box::new(RawExpList::Nil))),
             binders: Box::new(BinderList::Cons(3, 4, Box::new(BinderList::Nil))),
             binder_bounds: Box::new(ParamBoundList::Bound(20, 21, Box::new(ParamBoundList::Nil))),
             cond_name: 5,
@@ -3375,7 +3392,7 @@ proof fn amended_shapes_kernel_compute()
             d_old_eq_prop: 11,
             decrease_oblig: atom_ob(8),
             body: Box::new(StmData::Skip),
-        }) == 5,
+        }) == 6,
         // Call: 1 + |reqs=1| + frame_len(post = FBind(5,6,FNil) = 1) == 3
         stm_size(StmData::Call {
             reqs: Box::new(RawExpList::Cons(Box::new(atom_ob(0)), Box::new(RawExpList::Nil))),
@@ -3644,12 +3661,12 @@ pub open spec fn exec_safe_f(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameL
         StmData::If(c, cn, nc, ncn, cp, t, e) =>
             exec_safe_f(hp, he, lv, frame_append(f, FrameList::FHyp(cn, c, cp, Box::new(FrameList::FNil))), *t, st)
                 && exec_safe_f(hp, he, lv, frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e, st),
-        StmData::Loop { inv_hyps, inv_obligs, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann: _, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, body } => {
+        StmData::Loop { inv_hyps, inv_obligs, inv_obligs_exit, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann: _, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, body } => {
             let mframe = loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop);
             let endf = frame_after(mframe, *body);
             close_sem_obligs(hp, he, lv, f, st, *inv_obligs)
                 && exec_safe_f(hp, he, lv, mframe, *body, st)
-                && close_sem_obligs(hp, he, lv, endf, st, *inv_obligs)
+                && close_sem_obligs(hp, he, lv, endf, st, *inv_obligs_exit)
                 && close_sem_e(hp, he, lv, endf, st, decrease_oblig)
         },
         StmData::Skip => true,
@@ -3990,12 +4007,13 @@ pub proof fn u_esf_if(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, c:
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
 pub proof fn u_esf_loop(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList,
-    inv_hyps: Box<BinderList>, inv_obligs: Box<RawExpList>, binders: Box<BinderList>,
+    inv_hyps: Box<BinderList>, inv_obligs: Box<RawExpList>, inv_obligs_exit: Box<RawExpList>,
+    binders: Box<BinderList>,
     binder_bounds: Box<ParamBoundList>, cond_name: u64, cond_ann: u64, neg_cond_ann: u64,
     cond_poison: u64, d_old_name: u64, d_old_ty: u64, d_old_val: u64, d_old_eq_name: u64,
     d_old_eq_prop: u64, decrease_oblig: RawExp, body: Box<StmData>)
     ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Loop {
-            inv_hyps, inv_obligs, binders, binder_bounds, cond_name, cond_ann,
+            inv_hyps, inv_obligs, inv_obligs_exit, binders, binder_bounds, cond_name, cond_ann,
             neg_cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name,
             d_old_eq_prop, decrease_oblig, body,
         }, st)
@@ -4005,7 +4023,7 @@ pub proof fn u_esf_loop(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList,
                 *body, st)
             && close_sem_obligs(hp, he, lv,
                 frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body),
-                st, *inv_obligs)
+                st, *inv_obligs_exit)
             && close_sem_e(hp, he, lv,
                 frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body),
                 st, decrease_oblig))
@@ -4200,12 +4218,13 @@ pub proof fn u_wp_if(f: FrameList, c: u64, cn: u64, nc: u64, ncn: u64, cp: u64, 
             wp_stm(frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e))
 {}
 pub proof fn u_wp_loop(f: FrameList,
-    inv_hyps: Box<BinderList>, inv_obligs: Box<RawExpList>, binders: Box<BinderList>,
+    inv_hyps: Box<BinderList>, inv_obligs: Box<RawExpList>, inv_obligs_exit: Box<RawExpList>,
+    binders: Box<BinderList>,
     binder_bounds: Box<ParamBoundList>, cond_name: u64, cond_ann: u64, neg_cond_ann: u64,
     cond_poison: u64, d_old_name: u64, d_old_ty: u64, d_old_val: u64, d_old_eq_name: u64,
     d_old_eq_prop: u64, decrease_oblig: RawExp, body: Box<StmData>)
     ensures wp_stm(f, StmData::Loop {
-            inv_hyps, inv_obligs, binders, binder_bounds, cond_name, cond_ann,
+            inv_hyps, inv_obligs, inv_obligs_exit, binders, binder_bounds, cond_name, cond_ann,
             neg_cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name,
             d_old_eq_prop, decrease_oblig, body,
         })
@@ -4213,7 +4232,7 @@ pub proof fn u_wp_loop(f: FrameList,
             goals_append(
                 wp_stm(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body),
                 goals_append(
-                    close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs),
+                    close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit),
                     GoalList::Cons(
                         Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)),
                         Box::new(GoalList::Nil)))))
@@ -4863,7 +4882,7 @@ pub proof fn wp_stm_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList
             wp_stm_sound(hp, he, lv, frame_append(f, FrameList::FHyp(cn, c, cp, Box::new(FrameList::FNil))), *t, st);   // IH
             wp_stm_sound(hp, he, lv, frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e, st);  // IH
         }
-        StmData::Loop { inv_hyps, inv_obligs, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, body } => {
+        StmData::Loop { inv_hyps, inv_obligs, inv_obligs_exit, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, body } => {
             // NO `let mframe/endf` bindings and the IH comes FIRST: Rust lets
             // ride into every subsequent VC (incl. the height-decrease
             // termination VC) and zetaDelta then forces simp to normalize
@@ -4873,21 +4892,21 @@ pub proof fn wp_stm_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList
             wp_stm_sound(hp, he, lv,
                 loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop),
                 *body, st);                                                  // IH (body, havoc'd frame opaque)
-            u_wp_loop(f, inv_hyps, inv_obligs, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, body);
-            u_esf_loop(hp, he, lv, f, inv_hyps, inv_obligs, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, body);
+            u_wp_loop(f, inv_hyps, inv_obligs, inv_obligs_exit, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, body);
+            u_esf_loop(hp, he, lv, f, inv_hyps, inv_obligs, inv_obligs_exit, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, body);
             // the three ++ splits (init ++ (body ++ (reclose ++ decrease)))
             holds_all_append(hp, he, lv, close_each_e(f, *inv_obligs),
                 goals_append(wp_stm(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body),
-                    goals_append(close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs),
+                    goals_append(close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit),
                         GoalList::Cons(Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)), Box::new(GoalList::Nil)))), st);
             holds_all_append(hp, he, lv, wp_stm(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body),
-                goals_append(close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs),
+                goals_append(close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit),
                     GoalList::Cons(Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)), Box::new(GoalList::Nil))), st);
-            holds_all_append(hp, he, lv, close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs),
+            holds_all_append(hp, he, lv, close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit),
                 GoalList::Cons(Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)), Box::new(GoalList::Nil)), st);
             // the four goal groups (body group = the IH fact above)
             holds_all_close_each_e(hp, he, lv, f, *inv_obligs, st);          // init
-            holds_all_close_each_e(hp, he, lv, frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs, st);  // maintain-reclose
+            holds_all_close_each_e(hp, he, lv, frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit, st);  // maintain-reclose
             u_holds_all_cons(hp, he, lv, Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)), Box::new(GoalList::Nil));
             u_holds_all_nil(hp, he, lv);
             holds_close_e(hp, he, lv, frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig);  // decrease
@@ -5188,6 +5207,7 @@ pub proof fn wp_sound_bites_loop_init(hp: HpOracle, he: HeOracle, lv: LvOracle,
     requires holds_all(hp, he, lv, wp_stm(FrameList::FNil, StmData::Loop {
             inv_hyps,
             inv_obligs: Box::new(RawExpList::Cons(ob, Box::new(RawExpList::Nil))),
+            inv_obligs_exit: Box::new(RawExpList::Cons(ob, Box::new(RawExpList::Nil))),
             binders, binder_bounds, cond_name, cond_ann, neg_cond_ann,
             cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop,
             decrease_oblig, body,
@@ -5197,11 +5217,13 @@ pub proof fn wp_sound_bites_loop_init(hp: HpOracle, he: HeOracle, lv: LvOracle,
     wp_stm_sound(hp, he, lv, FrameList::FNil, StmData::Loop {
         inv_hyps,
         inv_obligs: Box::new(RawExpList::Cons(ob, Box::new(RawExpList::Nil))),
+        inv_obligs_exit: Box::new(RawExpList::Cons(ob, Box::new(RawExpList::Nil))),
         binders, binder_bounds, cond_name, cond_ann, neg_cond_ann,
         cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop,
         decrease_oblig, body,
     }, st);
     u_esf_loop(hp, he, lv, FrameList::FNil, inv_hyps,
+        Box::new(RawExpList::Cons(ob, Box::new(RawExpList::Nil))),
         Box::new(RawExpList::Cons(ob, Box::new(RawExpList::Nil))),
         binders, binder_bounds, cond_name, cond_ann, neg_cond_ann,
         cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop,

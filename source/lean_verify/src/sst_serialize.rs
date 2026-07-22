@@ -441,6 +441,36 @@ struct Serializer<'a> {
     /// no current fixture diverges on it; add the walk_let mirror if
     /// one shows up.)
     let_binder_typs: im::HashMap<crate::lean_name::LeanName, (Typ, bool)>,
+    /// N1-hoist shadow mirror (bootstrap-74 slice 2 Round D): every
+    /// name bound so far on the current walk path — seeded with the
+    /// fn's param / bound-hyp / req names, extended by every let dest,
+    /// hyp name, and binder name. Production's `hoist_all` freshens a
+    /// later binding of a taken name (`i` → `i_hoist1`) — but ONLY in a
+    /// HOISTED goal: wrap-mode goals keep source names (goal-position
+    /// lets shadow textually). So freshening is gated on `wrap_forced`
+    /// (below): freshen iff the current prefix is wrap-free. (The MIX
+    /// case — wrap-free at the shadow, a wrap-forcer later — emits the
+    /// freshened name into wrap goals that production renders plain:
+    /// documented honest-fail, census `hoist-mixed-shadow`.)
+    bound_names: std::collections::HashSet<String>,
+    /// The active shadow renames (source name → freshened name), from
+    /// `fresh_let_name` on a taken let dest. Applied to every
+    /// subsequently rendered LExpr (hyp props, assign rhs, conds, ret
+    /// values, the re-close invariant obligations — the `i_hoist1 ≤ n`
+    /// evidence), mirroring production's `rename_frame_vars`. Cleared of
+    /// a loop's mod-var names at loop exit (the use telescope re-binds
+    /// the source names — `r = acc`, not `r = acc_hoist1`).
+    rename_env: HashMap<String, crate::lean_name::LeanName>,
+    /// Wrap-forcing state, split by source (the AssertQueryNl scope
+    /// strips hyps but keeps lets):
+    /// * `flet_forced` — a plain FLet went out (typ-less or
+    ///   poison-collapsed let). Persists through query scopes.
+    /// * `poison_forced` — a poisoned hyp went out. Stripped by query
+    ///   scopes (the query drops outer hyps).
+    /// Either forces whole-goal wrap from that point on; both are
+    /// monotone along a walk path and snapshot per If-branch.
+    flet_forced: bool,
+    poison_forced: bool,
 }
 
 impl<'a> Serializer<'a> {
@@ -484,9 +514,12 @@ impl<'a> Serializer<'a> {
         // Render through the binder-aware ctx (bootstrap-18) so a `&`-param
         // deref matches production's postcondition leaf. The ctx's `&self`
         // borrow ends with this statement (`inner` is owned), before
-        // `intern` takes `&mut self`.
-        let inner = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(e, &self.render_ctx())
+        // `intern` takes `&mut self`. The shadow renames (Round D) apply
+        // to the obligation too — production renames annotated obligation
+        // texts identically to hyps (`0 ≤ acc + i_hoist1 ∧ …`, sum_to).
+        let inner_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(e, &self.render_ctx())
             .map_err(|reason| format!("leaf-render: {}", reason))?;
+        let inner = self.apply_renames(&inner_raw);
         let loc = crate::obligation_naming::format_rust_loc(&e.span);
         let marked = LExpr::span_mark(
             loc,
@@ -543,9 +576,11 @@ impl<'a> Serializer<'a> {
     /// bridge. `kind` never reaches the pp (see `oblig_leaf`), so `Plain`
     /// suffices even though production marks the cond `LoopCondition`.
     fn neg_oblig_leaf(&mut self, e: &Exp) -> Sr<u64> {
-        // Binder-aware render (bootstrap-18) — see `oblig_leaf`.
-        let inner = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(e, &self.render_ctx())
+        // Binder-aware render (bootstrap-18) — see `oblig_leaf`. Shadow
+        // renames apply identically (Round D).
+        let inner_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(e, &self.render_ctx())
             .map_err(|reason| format!("leaf-render: {}", reason))?;
+        let inner = self.apply_renames(&inner_raw);
         let loc = crate::obligation_naming::format_rust_loc(&e.span);
         let marked = LExpr::span_mark(
             loc,
@@ -566,8 +601,13 @@ impl<'a> Serializer<'a> {
     /// snapshot is a synthetic Var of the per-loop d_old name. `kind`
     /// (`LoopDecrease`) is byte-irrelevant; the loc is `decrease[0].span`.
     fn decrease_oblig_leaf(&mut self, d: &Exp, loop_id: u64) -> Sr<u64> {
-        let cur = crate::to_lean_sst_expr::sst_exp_to_ast_checked(d)
+        // The shadow renames apply to the measure (Round D evidence:
+        // `0 ≤ n - i_hoist1 ∧ n - i_hoist1 < _tactus_d_old_0_0` — the
+        // decrease is evaluated at body END, after the body's rebinds;
+        // the d_old VALUE is the loop-entry one and stays unrenamed).
+        let cur_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked(d)
             .map_err(|reason| format!("leaf-render: {}", reason))?;
+        let cur = self.apply_renames(&cur_raw);
         let old = LExpr::var_synthetic(format!("_tactus_d_old_{}_0", loop_id));
         let inner = LExpr::and(
             LExpr::le(LExpr::lit_int("0"), cur.clone()),
@@ -610,6 +650,67 @@ impl<'a> Serializer<'a> {
     fn next_hyp_name(&mut self) -> u64 {
         self.hyp_ordinal += 1;
         self.text_leaf(&format!("_h_hoist_{}", self.hyp_ordinal))
+    }
+
+    /// The shadow mirror's freshening (Round D) — production's `fresh()`
+    /// in `hoist_all`: a later binding of a taken name gets
+    /// `{base}_hoist{N}` (first free N) — but ONLY when the goal hoists:
+    /// wrap-forced prefixes keep source names (production's wrap-mode
+    /// textual shadowing). Records the rename in `rename_env` (applied
+    /// to all subsequently rendered leaves) and claims the chosen name.
+    /// Returns the CHOSEN name (the base itself when free or
+    /// wrap-forced).
+    fn fresh_let_name(&mut self, base: &str) -> String {
+        if self.flet_forced || self.poison_forced || !self.bound_names.contains(base) {
+            self.bound_names.insert(base.to_string());
+            return base.to_string();
+        }
+        let mut i = 1usize;
+        loop {
+            let cand = format!("{}_hoist{}", base, i);
+            if !self.bound_names.contains(&cand) {
+                self.bound_names.insert(cand.clone());
+                self.rename_env.insert(
+                    base.to_string(),
+                    crate::lean_name::LeanName::synthetic(cand.clone()),
+                );
+                return cand;
+            }
+            i += 1;
+        }
+    }
+
+    /// Mark the walk prefix as wrap-forcing from a plain FLet (typ-less
+    /// or poison-collapsed let): persists through query scopes.
+    fn mark_flet_forced(&mut self) {
+        self.flet_forced = true;
+    }
+
+    /// Mark the walk prefix as wrap-forcing from a poisoned hyp:
+    /// stripped by query scopes (they drop outer hyps).
+    fn mark_poison_forced(&mut self) {
+        self.poison_forced = true;
+    }
+
+    /// Snapshot/restore discipline for branchy walks (If arms,
+    /// AssertQueryNl): the per-path state that must not leak across
+    /// branches. The hyp ORDINAL has its own snapshot rule (each branch
+    /// resumes from the pre-If count); this bundles the rest.
+    fn branch_state(&self) -> (std::collections::HashSet<String>, HashMap<String, crate::lean_name::LeanName>, bool, bool) {
+        (self.bound_names.clone(), self.rename_env.clone(), self.flet_forced, self.poison_forced)
+    }
+
+    fn restore_branch(&mut self, state: (std::collections::HashSet<String>, HashMap<String, crate::lean_name::LeanName>, bool, bool)) {
+        self.bound_names = state.0;
+        self.rename_env = state.1;
+        self.flet_forced = state.2;
+        self.poison_forced = state.3;
+    }
+
+    /// Apply the active shadow renames to a rendered LExpr
+    /// (production's `rename_frame_vars` — capture-respecting).
+    fn apply_renames(&self, lx: &LExpr) -> LExpr {
+        crate::sst_to_lean::rename_frame_vars(lx, &self.rename_env)
     }
 
     /// Poison check: does the rendered prop mention any in-scope
@@ -665,6 +766,8 @@ impl<'a> Serializer<'a> {
             Some(typ) => {
                 let eq_lx = LExpr::eq(LExpr::var(lname.clone()), rhs_lx.clone());
                 if self.hyp_poison(&eq_lx) == 1 {
+                    // Poison-collapse: plain FLet — forces wrap from here.
+                    self.mark_flet_forced();
                     format!("({}.StmData.Assign {} {})", NS, dest, rhs_leaf)
                 } else {
                     let ty_leaf = self.typ_leaf(&typ);
@@ -675,7 +778,11 @@ impl<'a> Serializer<'a> {
                     )
                 }
             }
-            None => format!("({}.StmData.Assign {} {})", NS, dest, rhs_leaf),
+            None => {
+                // Typ-less let: plain FLet — forces wrap from here.
+                self.mark_flet_forced();
+                format!("({}.StmData.Assign {} {})", NS, dest, rhs_leaf)
+            }
         }
     }
 
@@ -690,9 +797,10 @@ impl<'a> Serializer<'a> {
         dest_id: u64,
         dest_name: &crate::lean_name::LeanName,
         dest_typ: &Typ,
-        dv_lx: &LExpr,
+        dv_lx_raw: &LExpr,
         tail: String,
     ) -> String {
+        let dv_lx = &self.apply_renames(dv_lx_raw);
         let dv = self.leaves.intern(pp_expr(dv_lx));
         if matches!(&**dest_typ, vir::ast::TypX::Bool) {
             self.residue_names.push(dest_name.as_str().to_string());
@@ -700,6 +808,8 @@ impl<'a> Serializer<'a> {
         } else {
             let eq_lx = LExpr::eq(LExpr::var(dest_name.clone()), dv_lx.clone());
             if self.hyp_poison(&eq_lx) == 1 {
+                // Poison-collapse: plain FLet — forces wrap from here.
+                self.mark_flet_forced();
                 format!("({}.FrameList.FLet {} {} {})", NS, dest_id, dv, box_(&tail))
             } else {
                 let ty_leaf = self.typ_leaf(dest_typ);
@@ -807,7 +917,18 @@ impl<'a> Serializer<'a> {
             // to atom; the fixture's coverable fns take non-mut params, where
             // the bare-`x` collapse matches.)
             ExpX::Var(vid) | ExpX::VarAt(vid, _) => {
-                let id = self.binder_id(vid);
+                // Shadow mirror (Round D): a variable captured by a
+                // shadowed let resolves to its freshened name
+                // (`i_hoist1`), exactly as `rename_frame_vars` renames
+                // the LExpr-side renders — the deep reference RawExp
+                // must carry the same id the production goal leaf
+                // deepens to.
+                let name = crate::lean_name::LeanName::from_var_ident(vid);
+                let fresh = self.rename_env.get(name.as_str()).cloned();
+                let id = match fresh {
+                    Some(fresh) => self.text_leaf(fresh.as_str()),
+                    None => self.text_leaf(name.as_str()),
+                };
                 let ty = self.typ_data(&e.typ)?;
                 Ok(format!("({}.RawExp.Var {} {})", NS, id, paren(&ty)))
             }
@@ -2071,9 +2192,14 @@ impl<'a> Serializer<'a> {
                 // (bootstrap-74 slice 2) sees the exact interned term: a
                 // prop mentioning an in-scope residue let poisons the frame
                 // (whole-goal wrap, mirroring hoist_all's bail).
-                let hyp_lx = crate::to_lean_sst_expr::sst_exp_to_ast_checked(e)
+                let hyp_lx_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked(e)
                     .map_err(|reason| format!("leaf-render: {}", reason))?;
+                let hyp_lx = self.apply_renames(&hyp_lx_raw);
                 let hp = self.hyp_poison(&hyp_lx);
+                if hp == 1 {
+                    // A poisoned hyp forces whole-goal wrap from here.
+                    self.mark_poison_forced();
+                }
                 let hyp = self.leaves.intern(pp_expr(&hyp_lx));
                 // The forward hyp's `_h_hoist_i` name (bump AFTER the prop
                 // interns so the name leaf follows the prop in the table).
@@ -2094,9 +2220,13 @@ impl<'a> Serializer<'a> {
                 if crate::sst_to_lean::is_synthetic_assume_to_drop(e) {
                     return Ok(self.skip());
                 }
-                let e_lx = crate::to_lean_sst_expr::sst_exp_to_ast_checked(e)
+                let e_lx_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked(e)
                     .map_err(|reason| format!("leaf-render: {}", reason))?;
+                let e_lx = self.apply_renames(&e_lx_raw);
                 let hp = self.hyp_poison(&e_lx);
+                if hp == 1 {
+                    self.mark_poison_forced();
+                }
                 let id = self.leaves.intern(pp_expr(&e_lx));
                 let hn = self.next_hyp_name();
                 Ok(format!("({}.StmData.Assume {} {} {})", NS, hn, id, hp))
@@ -2109,15 +2239,24 @@ impl<'a> Serializer<'a> {
                 let Some(vid) = crate::sst_to_lean::extract_simple_var_ident(&lhs.dest) else {
                     return Err("assign-field-path".to_string());
                 };
-                let dest = self.binder_id(vid);
                 // Render the rhs ONCE as an LExpr — the value leaf, the
                 // hoist equation prop, and the poison check all read it.
-                let rhs_lx = crate::to_lean_sst_expr::sst_exp_to_ast_checked(rhs)
+                // The rhs is scoped to the PREVIOUS binding, so the
+                // shadow renames apply BEFORE this dest's own freshening
+                // (`i := i + 1` keeps plain `i`; the next use is
+                // `i_hoist1`).
+                let rhs_lx_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked(rhs)
                     .map_err(|reason| format!("leaf-render: {}", reason))?;
+                let rhs_lx = self.apply_renames(&rhs_lx_raw);
                 let rhs_leaf = self.leaves.intern(pp_expr(&rhs_lx));
                 // N1-hoist classification (bootstrap-74 slice 2), mirroring
                 // hoist_all's per-let decision (see `assign_let_term`).
-                let lname = crate::lean_name::LeanName::from_var_ident(vid);
+                // Shadow mirror (Round D): a re-binding of a taken name
+                // freshens (`i` → `i_hoist1`) and renames downstream.
+                let src_name = crate::lean_name::LeanName::from_var_ident(vid);
+                let chosen = self.fresh_let_name(src_name.as_str());
+                let lname = crate::lean_name::LeanName::synthetic(chosen);
+                let dest = self.text_leaf(lname.as_str());
                 Ok(self.assign_let_term(&lname, dest, self.local_typs.get(vid).cloned(), &rhs_lx, rhs_leaf))
             }
 
@@ -2247,7 +2386,7 @@ impl<'a> Serializer<'a> {
                         // reach. The coerced LExpr is ALSO the equation
                         // rhs for the N1-hoisted binding (rendered
                         // once, used twice).
-                        let coerced = {
+                        let coerced_raw = {
                             let rctx = self.render_ctx()
                                 .with_let_binder_typs(&self.let_binder_typs);
                             let typed = crate::to_lean_sst_expr::sst_exp_to_typed(e, &rctx)
@@ -2257,6 +2396,7 @@ impl<'a> Serializer<'a> {
                                 None => typed.inner,
                             }
                         };
+                        let coerced = self.apply_renames(&coerced_raw);
                         let vleaf = self.leaves.intern(pp_expr(&coerced));
                         // N1-hoist (bootstrap-74 slice 2): the return
                         // binding is a typed let — hoist it to
@@ -2325,23 +2465,41 @@ impl<'a> Serializer<'a> {
                 // restores the pre-If value (the two-way join is the
                 // documented unmodeled case). The cond poison covers
                 // both hyps (c and ¬c mention the same names).
-                let cond_inner = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(
+                let cond_inner_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(
                     cond,
                     &self.render_ctx(),
                 )
                 .map_err(|reason| format!("leaf-render: {}", reason))?;
+                let cond_inner = self.apply_renames(&cond_inner_raw);
                 let cp = self.hyp_poison(&cond_inner);
+                if cp == 1 {
+                    self.mark_poison_forced();
+                }
                 let save = self.hyp_ordinal;
+                // Each branch is a separate walk path: the cond hyp is
+                // `_h_hoist_{save+1}` in BOTH, and branch-local shadows /
+                // wrap-forcing must not leak across (count_down's tmp__3
+                // is a FIRST binding in each branch).
+                let bstate = self.branch_state();
                 let cn = self.text_leaf(&format!("_h_hoist_{}", save + 1));
                 let ncn = cn;
                 self.hyp_ordinal = save + 1;
                 let t = self.stm(then_stm)?;
+                self.restore_branch(bstate.clone());
                 self.hyp_ordinal = save + 1;
                 let e = match else_stm {
                     Some(s) => self.stm(s)?,
                     None => self.skip(),
                 };
-                self.hyp_ordinal = save;
+                self.restore_branch(bstate);
+                // After: the two-way join is the documented unmodeled
+                // case (counter restores to the pre-If value). The
+                // FALL-THROUGH case (`frame_after` forwards the ¬cond
+                // hyp when then diverges and else is Skip) DID push a
+                // hyp on the continuation path — the counter resumes
+                // past it.
+                let fallthrough = stm_diverges(then_stm) && e == self.skip();
+                self.hyp_ordinal = if fallthrough { save + 1 } else { save };
                 Ok(format!("({}.StmData.If {} {} {} {} {} {} {})", NS, c, cn, nc, ncn, cp, box_(&t), box_(&e)))
             }
 
@@ -2426,11 +2584,16 @@ impl<'a> Serializer<'a> {
                 // the enclosing counter resumes untouched after (the
                 // query's hyps don't leak — the proven facts re-enter
                 // via the follow-on Assume statements, which number
-                // themselves).
+                // themselves). The scope KEEPS Let/Binder frames, so
+                // `flet_forced` carries in, but a poisoned OUTER hyp is
+                // stripped — `poison_forced` resets inside and restores.
                 let save = self.hyp_ordinal;
+                let bstate = self.branch_state();
                 self.hyp_ordinal = 0;
+                self.poison_forced = false;
                 let b = self.stm(body)?;
                 self.hyp_ordinal = save;
+                self.restore_branch(bstate);
                 // The query's own ensures is EMPTY — production emits
                 // one final in-scope goal `True`
                 // (`emit_done_or_split`'s `and_all([])` fallback, the
@@ -2506,13 +2669,18 @@ impl<'a> Serializer<'a> {
                     // StmX::If arm — the cond hyp is `_h_hoist_{save+1}` in
                     // BOTH branches; each branch walk resumes from save+1;
                     // the counter restores after).
-                    let cond_inner = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(
+                    let cond_inner_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(
                         cond,
                         &self.render_ctx(),
                     )
                     .map_err(|reason| format!("leaf-render: {}", reason))?;
+                    let cond_inner = self.apply_renames(&cond_inner_raw);
                     let cp = self.hyp_poison(&cond_inner);
+                    if cp == 1 {
+                        self.mark_poison_forced();
+                    }
                     let save = self.hyp_ordinal;
+                    let bstate = self.branch_state();
                     let cn = self.text_leaf(&format!("_h_hoist_{}", save + 1));
                     let ncn = cn;
                     // Serialize the then-branch, then the continuation ONCE
@@ -2520,16 +2688,20 @@ impl<'a> Serializer<'a> {
                     // production's after-clone walk order), then reuse the
                     // `rest` term verbatim in the else branch (interning is
                     // idempotent). An absent else falls through as `Skip`.
+                    // Branch state restores between branches (separate
+                    // walk paths — branch-local shadows don't leak).
                     self.hyp_ordinal = save + 1;
                     let then_body = self.stm(then_stm)?;
                     let rest = self.block(&stms[1..])?;
                     let t = format!("({}.StmData.Seq {} {})", NS, box_(&then_body), box_(&rest));
+                    self.restore_branch(bstate.clone());
                     self.hyp_ordinal = save + 1;
                     let else_body = match else_stm {
                         Some(s) => self.stm(s)?,
                         None => self.skip(),
                     };
                     let e = format!("({}.StmData.Seq {} {})", NS, box_(&else_body), box_(&rest));
+                    self.restore_branch(bstate);
                     self.hyp_ordinal = save;
                     return Ok(format!(
                         "({}.StmData.If {} {} {} {} {} {} {})",
@@ -2571,9 +2743,12 @@ impl<'a> Serializer<'a> {
         };
         // dest binder id = interned leaf id of the dest's rendered name
         // (same path as `binder_id`; production Phase-5 binds
-        // `let <dest> := …`).
-        let dest_id = self.text_leaf(leaves.dest_name.as_str());
-        let dest_name = leaves.dest_name.clone();
+        // `let <dest> := …`). Shadow mirror (Round D): a colliding dest
+        // freshens, and the post-frame leaves render under the active
+        // renames.
+        let chosen = self.fresh_let_name(leaves.dest_name.as_str());
+        let dest_name = crate::lean_name::LeanName::synthetic(chosen);
+        let dest_id = self.text_leaf(dest_name.as_str());
         let dest_typ = leaves.dest_typ.clone();
         // Record the dest binder at its Lean-level typ (production's
         // Phase-5 `with_let_binder(dest, ret_typ_subst, true)`, every
@@ -2595,6 +2770,9 @@ impl<'a> Serializer<'a> {
                 let mut post = self.dest_let_frame(dest_id, &dest_name, &dest_typ, &dest_value, fnil);
                 if let Some(rest) = rest {
                     let hp = self.hyp_poison(&rest);
+                    if hp == 1 {
+                        self.mark_poison_forced();
+                    }
                     let r = self.leaves.intern(pp_expr(&rest));
                     post = format!(
                         "({}.FrameList.FHyp {} {} {} {})",
@@ -2603,6 +2781,9 @@ impl<'a> Serializer<'a> {
                 }
                 if let Some(eb) = e_bound {
                     let hp = self.hyp_poison(&eb);
+                    if hp == 1 {
+                        self.mark_poison_forced();
+                    }
                     let b = self.leaves.intern(pp_expr(&eb));
                     post = format!(
                         "({}.FrameList.FHyp {} {} {} {})",
@@ -2630,6 +2811,9 @@ impl<'a> Serializer<'a> {
                 };
                 if let Some(e) = ens {
                     let hp = self.hyp_poison(&e);
+                    if hp == 1 {
+                        self.mark_poison_forced();
+                    }
                     let i = self.leaves.intern(pp_expr(&e));
                     post = format!(
                         "({}.FrameList.FHyp {} {} {} {})",
@@ -2638,6 +2822,9 @@ impl<'a> Serializer<'a> {
                 }
                 if let Some(rb) = ret_bound {
                     let hp = self.hyp_poison(&rb);
+                    if hp == 1 {
+                        self.mark_poison_forced();
+                    }
                     let b = self.leaves.intern(pp_expr(&rb));
                     post = format!(
                         "({}.FrameList.FHyp {} {} {} {})",
@@ -2692,18 +2879,18 @@ impl<'a> Serializer<'a> {
             std::collections::HashSet::new();
         crate::sst_to_lean::collect_modifications(body, &mut locally_declared, &mut mod_names);
 
-        // The shared `_h_ctx_N` counter (mirrors `OblCtx::
-        // split_leading_binders`: one increment per HYPOTHESIS frame that
-        // trails the mod-var binders — the mod-var bounds, then the
-        // invariants, then the cond — while the ∀-binder frames for the
-        // mod-vars themselves keep their source names).
-        let mut hyp_counter: usize = 0;
+        // Hyp names are `_h_hoist_i` ordinals continuing the walk counter
+        // (bootstrap-74 slice 2; `_h_ctx_N` is gone from goal shapes):
+        // mod-var bounds first, then invariants, then the cond — the
+        // maintain and use telescopes share them (sum_to evidence:
+        // `_h_hoist_1..7` in both).
 
         // Havoc-set binders (id, typ leaf) + the parallel bound list.
         // Each modified local is re-quantified `∀ (x : T)`; an int-typed
-        // one gets a `_h_ctx_N` type-bound hyp right after (production's
+        // one gets a `_h_hoist_i` type-bound hyp right after (production's
         // `push_mod_var_frames`, BARE `LExpr::var(name)` — no deref,
-        // unlike params).
+        // unlike params). The mod-var binders claim the SOURCE names
+        // (production never freshens them) so body rebinds shadow.
         let mut binder_entries: Vec<(u64, u64)> = Vec::new();
         let mut bound_entries: Vec<Option<(u64, u64)>> = Vec::new();
         for vid in mod_names.iter() {
@@ -2717,10 +2904,10 @@ impl<'a> Serializer<'a> {
             let tleaf = self.typ_leaf(&typ);
             binder_entries.push((bid, tleaf));
             let name = crate::lean_name::LeanName::from_var_ident(vid);
+            self.bound_names.insert(name.as_str().to_string());
             match crate::to_lean_sst_expr::type_bound_predicate(&LExpr::var(name.clone()), &typ) {
                 Some(pred) => {
-                    let hname = self.text_leaf(&format!("_h_ctx_{}", hyp_counter));
-                    hyp_counter += 1;
+                    let hname = self.next_hyp_name();
                     let prop = self.leaves.intern(pp_expr(&pred));
                     bound_entries.push(Some((hname, prop)));
                 }
@@ -2731,11 +2918,13 @@ impl<'a> Serializer<'a> {
         // Standard `invariant` clauses only (at_entry && at_exit). An
         // `invariant_except_break` (at_entry only) or loop-`ensures`
         // (at_exit only) needs the entry/exit distinction the flat shape
-        // does not carry. Each becomes a `(_h_ctx_N name, ANNOTATED
+        // does not carry. Each becomes a `(_h_hoist_i name, ANNOTATED
         // obligation leaf)` — the annotated leaf serves BOTH the
-        // init/maintain obligation AND the ∀-hyp (production reuses the
-        // one span_mark'd `LoopInvariant` leaf for both roles, unlike
-        // Assert's bare/annotated split).
+        // init obligation AND the ∀-hyp (production reuses the one
+        // span_mark'd `LoopInvariant` leaf for both roles, unlike
+        // Assert's bare/annotated split). The maintain-RECLOSE
+        // obligation is the RENAMED variant (`inv_obligs_exit`,
+        // rendered after the body walk — the `i_hoist1 ≤ n` evidence).
         let mut inv_entries: Vec<(u64, u64)> = Vec::new();
         // W6d.2b: the parallel DEEP invariant obligation slots (index-aligned
         // with `inv_entries`). `oblig_slot` gives BOTH the opaque leaf id (for
@@ -2746,25 +2935,48 @@ impl<'a> Serializer<'a> {
             if !(li.at_entry && li.at_exit) {
                 return Err("loop-nonstandard-invariant".to_string());
             }
-            let hname = self.text_leaf(&format!("_h_ctx_{}", hyp_counter));
-            hyp_counter += 1;
+            let hname = self.next_hyp_name();
             let (oblig, slot) = self.oblig_slot(&li.inv)?;
             inv_entries.push((hname, oblig));
             inv_slots.push(slot);
         }
 
-        // The loop condition: one shared `_h_ctx_N` name for both the
+        // The loop condition: one shared `_h_hoist_i` name for both the
         // maintain hyp (`cond_ann`) and the use hyp (`neg_cond_ann`), the
-        // last hyp in the telescope (counter not consumed further).
-        let cond_name = self.text_leaf(&format!("_h_ctx_{}", hyp_counter));
+        // last hyp in the telescope (counter not consumed further); plus
+        // the cond's poison bit (a cond mentioning a residue let forces
+        // whole-goal wrap).
+        let cond_name = self.next_hyp_name();
         let cond_ann = self.oblig_leaf(cond_exp)?;
         let neg_cond_ann = self.neg_oblig_leaf(cond_exp)?;
+        let cond_inner_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(
+            cond_exp,
+            &self.render_ctx(),
+        )
+        .map_err(|reason| format!("leaf-render: {}", reason))?;
+        let cond_poison = self.hyp_poison(&self.apply_renames(&cond_inner_raw));
+        if cond_poison == 1 {
+            self.mark_poison_forced();
+        }
 
-        // Decreases snapshot let (`_tactus_d_old_<id>_0 := D`, maintain
-        // only) + the body-end decrease obligation.
-        let d_old_name = self.text_leaf(&format!("_tactus_d_old_{}_0", loop_id));
+        // Decreases snapshot let — an FLetH binder pair (the
+        // `_tactus_d_old_<id>_0 : T` binder + its equation
+        // `_h__tactus_d_old_<id>_0_hoist1 : _tactus_d_old_<id>_0 = D`,
+        // maintain only) + the body-end decrease obligation. The measure
+        // renders pre-body (the renames are not yet in effect —
+        // `_tactus_d_old_0_0 = n - i`, NOT `n - i_hoist1`).
+        let d_old_text = format!("_tactus_d_old_{}_0", loop_id);
+        let d_old_name = self.text_leaf(&d_old_text);
+        self.bound_names.insert(d_old_text.clone());
+        let d_old_ty = self.typ_leaf(&decrease[0].typ);
         let d_old_val = self.exp_leaf(&decrease[0])?;
-        let decrease_oblig = self.decrease_oblig_leaf(&decrease[0], loop_id)?;
+        let measure_lx = crate::to_lean_sst_expr::sst_exp_to_ast_checked(&decrease[0])
+            .map_err(|reason| format!("leaf-render: {}", reason))?;
+        let d_old_eq_name = self.text_leaf(&format!("_h_{}_hoist1", d_old_text));
+        let d_old_eq_prop = self.leaves.intern(pp_expr(&LExpr::eq(
+            LExpr::var(crate::lean_name::LeanName::synthetic(d_old_text.clone())),
+            measure_lx,
+        )));
 
         // W6d.2b: the parallel DEEP invariant obligations (`inv_obligs`,
         // index-aligned with `inv_hyps`). Each slot is `oblig_slot`'s output —
@@ -2777,19 +2989,86 @@ impl<'a> Serializer<'a> {
         let binders = self.binder_list(&binder_entries);
         let bounds = self.param_bound_list(&bound_entries);
 
+        // The loop is a SCOPE boundary for hyp numbering (production's
+        // per-goal-path ordinals — find_square evidence): the body's
+        // own hyps (if conds, overflow assumes) number INSIDE the
+        // loop's goals but do NOT advance the post-loop path — the
+        // continuation resumes from the telescope end (`0 ≤ a + 1` in
+        // the outer body gets `_h_hoist_10` right after the inner
+        // loop's `_h_hoist_5..9`, while the inner body's own hyps
+        // number from the same point).
+        let loop_counter_end = self.hyp_ordinal;
         let body_term = self.stm(body)?;
+        self.hyp_ordinal = loop_counter_end;
+
+        // The body-end decrease obligation — rendered AFTER the body
+        // walk so the shadow renames apply to the measure
+        // (`0 ≤ n - i_hoist1 ∧ …`, NOT the loop-entry `n - i` the
+        // d_old value keeps).
+        let decrease_oblig = self.decrease_oblig_leaf(&decrease[0], loop_id)?;
+
+        // The maintain-RECLOSE obligations (Round D): the invariant
+        // texts with the body's shadow renames applied
+        // (`i_hoist1 ≤ n`, `Int.toNat acc_hoist1 = lib.tri (Int.toNat
+        // i_hoist1)` — fresh leaf ids, distinct from the init
+        // obligations' plain texts). Slot discipline (production's
+        // ob-drives, sum_to evidence): a renamed text whose id is
+        // ALREADY deep (an invariant the renames leave untouched —
+        // `n ≤ 1000` reuses the init's deep leaf id) keeps the deep
+        // `RawExp.Span` slot; a genuinely renamed text (a NEW id, not
+        // in `deep_ids`) is the opaque `atom_ob` fallback — matching
+        // the production goal side exactly.
+        let mut exit_slots: Vec<String> = Vec::new();
+        for (i, li) in invs.iter().enumerate() {
+            let inner = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(
+                &li.inv,
+                &self.render_ctx(),
+            )
+            .map_err(|reason| format!("leaf-render: {}", reason))?;
+            let renamed = self.apply_renames(&inner);
+            let loc = crate::obligation_naming::format_rust_loc(&li.inv.span);
+            let marked = LExpr::span_mark(
+                loc,
+                Some(li.inv.span.clone()),
+                AssertKind::Obligation(ObligationKind::Plain),
+                renamed,
+            );
+            let id = self.leaves.intern(pp_expr(&marked));
+            if self.deep_ids.contains(&id) {
+                // The renames were a no-op on this invariant: the init's
+                // deep slot (same id) is the correct exit slot too.
+                exit_slots.push(inv_slots[i].clone());
+            } else {
+                exit_slots.push(atom_ob_lit(id));
+            }
+        }
+        let inv_obligs_exit = raw_exp_list(&exit_slots);
+
+        // Loop exit: the use telescope re-binds the mod-vars under their
+        // SOURCE names, so the shadow renames for them end here
+        // (post-loop references are plain again — `r = acc`).
+        for vid in mod_names.iter() {
+            let name = crate::lean_name::LeanName::from_var_ident(vid);
+            self.rename_env.remove(name.as_str());
+        }
+
         Ok(format!(
-            "({}.StmData.Loop {} {} {} {} {} {} {} {} {} {} {})",
+            "({}.StmData.Loop {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {})",
             NS,
             box_(&inv_hyps),
             box_(&inv_obligs),
+            box_(&inv_obligs_exit),
             box_(&binders),
             box_(&bounds),
             cond_name,
             cond_ann,
             neg_cond_ann,
+            cond_poison,
             d_old_name,
+            d_old_ty,
             d_old_val,
+            d_old_eq_name,
+            d_old_eq_prop,
             // W6d.2a: decrease_oblig is now a DEEP `RawExp` (like Assert);
             // opaque fallback wraps the synthesized `0 ≤ D ∧ D < d_old` leaf id.
             atom_ob_lit(decrease_oblig),
@@ -3063,6 +3342,18 @@ fn serialize<'a>(
         let prop = s.exp_leaf(r)?;
         let hname = s.text_leaf(&format!("h_req{}", i));
         req_entries.push((hname, prop));
+    }
+
+    // Shadow-mirror seed (bootstrap-74 slice 2 Round D): production's
+    // `taken_names` = the base binders — value params, their `h_<p>_bound`
+    // names, and the `h_req<i>` names (sst_to_lean.rs:2499-2503).
+    for p in fn_sst.x.pars.iter().filter(|p| !p.x.name.0.contains('%')) {
+        let name = crate::lean_name::LeanName::from_var_ident(&p.x.name);
+        s.bound_names.insert(name.as_str().to_string());
+        s.bound_names.insert(format!("h_{}_bound", name.as_str()));
+    }
+    for i in 0..check.reqs.len() {
+        s.bound_names.insert(format!("h_req{}", i));
     }
 
     // Ensures leaves (bare) → `FnCtxData.enss`. refWp does NOT read this

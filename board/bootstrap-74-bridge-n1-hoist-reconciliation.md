@@ -274,6 +274,48 @@ sweep, census-gated deferrals (shadowing, name collisions), and the
 follow-up queue (discharge Q1 provenance, b70/71 closes, b69
 decision, call-mut, loop-telescope redesign, cache fingerprint).
 
+### Slice 2 Round D DONE (2026-07-21): loops close — probe9 18/20 + 2 documented honest-fails, ALL CLASSIFIED ✓
+
+Serializer `loop_stm` emits the full uniform Loop node + the shadow
+mirror. The lessons, in order of increasing subtlety:
+1. **Hyp numbering is PER-GOAL-PATH, not a linear walk counter**
+   (find_square evidence: `0 ≤ a + 1` is `_h_hoist_10` in BOTH the
+   inner body and the outer re-close). The Loop statement is a SCOPE
+   boundary: telescope names consume (`bounds/invs/cond`), the body
+   numbers independently from the telescope end, and the post-loop
+   path resumes from the same point.
+2. **Freshening happens only in HOISTED goals.** Wrap-mode goals keep
+   source names (goal-position lets shadow textually). Gate:
+   `flet_forced`/`poison_forced` (split because the AssertQueryNl
+   scope strips hyps but keeps lets); freshen iff prefix wrap-free.
+   MIX case (shadow before a later wrap-forcer) = documented
+   honest-fail (`hoist-mixed-shadow`, unhit).
+3. **Branch state snapshots**: bound_names/rename_env/forcing flags
+   restore per If-branch (count_down's `tmp__3` is a FIRST binding in
+   each branch) and the fall-through counter advances past the
+   forwarded ¬cond hyp.
+4. **Renames apply to obligation texts too** (`oblig_leaf`/
+   `neg_oblig_leaf`, and the RawExp Var arm — the DEEP reference
+   leaves carry the freshened ids); the decrease obligation renders
+   AFTER the body walk (the d_old VALUE stays loop-entry-plain).
+5. **`inv_obligs_exit` (model addition, evidence-driven)**: re-close
+   invariant obligations carry RENAMED texts distinct from init. Slot
+   discipline: deep iff the renamed id is already in `deep_ids`
+   (rename no-op — `n ≤ 1000` keeps the deep Span), else `atom_ob`.
+FIXTURE-TOOLING FLAG (suspicious, worth its own look): the
+`TactusStmts_*` module olean went STALE silently — the gate wrote a
+fresh `.lean` (16:58) but did not rebuild the `.olean` (16:48), and
+the next gate's Link layer then reported a "Type mismatch" +
+"contains sorry" pointing everywhere but the real cause. Rebuilt the
+olean manually to unblock. This looks like a stmts-module
+rebuild-logic hole, distinct from the known binary-fingerprint gap.
+Classified the two remaining BROKE fixtures (probe9 run.sh):
+- vec_read — stage-B reference-renderer coercion (telescope matches
+  production EXACTLY; `render_exp` derives `v.deref` where production
+  writes `v`, misses the CallN-arg `Int.ofNat`; follow-up queue §7.7).
+- head_exec — match-statement machinery (N2 match-split; stage A has
+  no Match arm — card separately).
+
 ### Slice 2 Round C DONE (2026-07-21): uniform loop telescope — gate 231/0, suite 551/0
 
 The `has_let` leading/non-leading switch is DELETED (the §2b loop
