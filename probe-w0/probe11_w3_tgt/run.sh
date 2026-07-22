@@ -63,6 +63,8 @@ export LEAN_PATH="$CORE_OUT:$CORE_OUT/pkg:$PRELUDE"
 # honest-fail set; it must now close-ok.
 honest_fail_reason() {
   case "$1" in
+    runtime__apply_hom_gen|runtime__apply_hom_inv) printf '%s' 'call-arg temp lets + auto-ref arg coercion unmodeled (bootstrap-74 slice 2 sweep, 2026-07-21): Verus lowers `&h.generator_images[i]` to a `tmp__N := h.deref.generator_images` arg temp whose Wp::LetRaw frame is TYP-LESS (production bails hoist_all to whole-goal wrap); the serializer typed it from local_typs and hoisted (AssignH). And the instantiated callee requires keeps the auto-ref coercion (`Tactus.Ref.mk <arg>`) which the serializer drops. New Call-arm machinery — carded follow-up.' ;;
+    runtime__lemma_runtime_word_view_append|runtime__lemma_runtime_word_view_subrange) printf '%s' 'assert-forall quantifier binders unmodeled (bootstrap-74 slice 2 sweep, 2026-07-21): the fn asserts `forall |k: int| …` — production emits the skolem binder `∀ (k : Int)` in the goal telescope; stage A has no quantifier-binder arm, so the serializer instead emits the lowering bool temp as a residue let + a poisoned Assume and wraps. SHOULD be a loud census rejection (assert-forall tag), not a non-bridging cert — census-gap follow-up.' ;;
     *) printf '%s' '' ;;
   esac
 }

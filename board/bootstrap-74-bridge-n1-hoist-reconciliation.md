@@ -274,6 +274,45 @@ sweep, census-gated deferrals (shadowing, name collisions), and the
 follow-up queue (discharge Q1 provenance, b70/71 closes, b69
 decision, call-mut, loop-telescope redesign, cache fingerprint).
 
+### Slice 2 COMPLETE (2026-07-21): bridge ↔ N1-hoist reconciliation done — probe9 18/20 close + 2 documented; probe11 1/5 close + 4 documented; ALL CLASSIFIED ✓ on both
+
+**probe9 (fixtures): 18 close-ok, 2 documented honest-fails** — every
+fixture family bridges: asserts/seq (add_capped, all three modes in
+one fn), call ret-eq (use_clamped, use_multiarg, clamped_inc,
+call_g2/g3_ob, quad_exec), if-join (count_down), assert-query
+(mul_bound incl. the degenerate ensures-True goal), loops (sum_to,
+find_square — uniform telescope + shadow mirror), plus double_exec,
+id_generic, max_u64, mk_point, scope_shape, swap_pair, tri_one.
+Documented: vec_read (stage-B reference-renderer coercion — telescope
+matches production EXACTLY, the gap is leaf-rendering coercion
+derivation; §7.7) and head_exec (N2 match-split — new machinery,
+carded separately).
+**probe11 (tgt): runtime__impl__4__clone CLOSES** — the differential
+gate's first real-corpus bridge subject. Documented: apply_hom_gen/
+apply_hom_inv (call-arg temp lets are typ-less `Wp::LetRaw` frames →
+production wraps; the serializer typed and hoisted — plus auto-ref
+arg coercion `Tactus.Ref.mk <arg>` in instantiated requires; new
+Call-arm machinery) and the two lemma_runtime_word_view_* fns
+(assert-forall skolem binders unmodeled — stage A has no quantifier
+binder; SHOULD be a loud census rejection, not a non-bridging cert —
+census-gap follow-up).
+**Census check (§5.3):** call-generic 0, call-forall-path 0 hold;
+remaining tgt tags = 1 call-mut (runtime.copy_word) + assert-query-
+tactus (separate arcs, as planned).
+**Suite state:** tactus-core gate 231/0 + package gate green, Link
+discharge 144/6 steady (the 6 = pre-existing other-hyp/HoistEq
+residual, unchanged through all of slice 2), e2e 551/0, lean_verify
+unit 400/0.
+**Follow-up queue (from the card, updated):** discharge Q1 composer
+arm (HoistEq exists, main `9a88b6c`); b70/71 full closes (unblocked —
+re-run vec_read/use_clamped bridges end-to-end + mutation-kill the
+∀-path frame); b69 Tactus-mode assert-query decision; call-mut arm;
+**NEW: call-arg temp lets + auto-ref arg coercion** (apply_hom class);
+**NEW: assert-forall loud census rejection**; **NEW: stmts-olean
+staleness investigation** (the misleading Type-mismatch/sorry
+cascade); loop-telescope residual (none — done); cache
+emitter-fingerprint (parked).
+
 ### Slice 2 Round D DONE (2026-07-21): loops close — probe9 18/20 + 2 documented honest-fails, ALL CLASSIFIED ✓
 
 Serializer `loop_stm` emits the full uniform Loop node + the shadow
