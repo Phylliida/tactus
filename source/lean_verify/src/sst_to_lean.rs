@@ -1728,7 +1728,7 @@ use crate::obligation_naming::{build_theorem_name, detect_assert_kind, format_ru
 /// an expression-level binder for a name removes its env entry inside
 /// that scope, so capture is respected. `SpanMark`s and all other
 /// structure are preserved verbatim.
-fn rename_frame_vars(
+pub(crate) fn rename_frame_vars(
     e: &LExpr,
     env: &HashMap<String, crate::lean_name::LeanName>,
 ) -> LExpr {
