@@ -1,5 +1,16 @@
 # NEXT — bootstrap work queue (2026-07-21; superseded 2026-07-24)
 
+**2026-07-24 evening: endgame rows 5+6 (A3+A5+R1 batch) LANDED —
+`board/bootstrap-77-a3a5r1-batch-churn.md`.** tactus-core 254/0 +
+discharge 172/0; probe9 all-green (head_exec CLOSES via IfCtor);
+probe11 all-classified (find_cancellation = the vec_read/A7 stage-B
+class); `assert-query-tactus` census tag retired; probes 13/14/37/38 +
+units green. Remaining endgame order: **A4 (call-mut, card first) →
+A7 (stage-B callee-signature vocab — closes vec_read AND
+find_cancellation) → D tripwire done (in-model column landed) → B
+(b67 caching + b68 flip)**. b77 card carries small follow-ups
+(IfCtor/AQT mutation classes, statement-If N2 residue).
+
 **The ordered map of everything remaining is now
 `DESIGN-bootstrap-endgame.md`** (milestones A–F + policy points P1–P4,
 agreed with Danielle 2026-07-24). The single source of per-brick detail
