@@ -6,8 +6,12 @@ agreed with Danielle 2026-07-24). The single source of per-brick detail
 is still the board (`board/*.md`); this file's sections below remain as
 the pre-endgame snapshot. **Milestone C DONE 2026-07-24: Link discharge
 150/0** (HoistEq + Req composer arms, b73 closed) **+ P1 poison
-contract/mutation** (probe13 `poison_flip`, probes de-staled). Suite
-551/0, gate 231/0. Next: A1 (b70/71 close-out), A2, A6-short. Suite state: 551/0 upstream; tactus-core
+contract/mutation** (probe13 `poison_flip`, probes de-staled). **A1
+DONE same day: b70/71 closed via probe38** (∀-path close + 2 frame
+kills; vec_read goal-0 close + kill; A7 tripwire). Suite 551/0, gate
+231/0. Next: A2 (apply_hom call-arg temps), A6-short (assert-forall
+census tag), then Danielle-decided A3 shape (AssertQueryTactus
+variant, batch churn with A5). Suite state: 551/0 upstream; tactus-core
 gate 231/0 + Link discharge 144/6 (the 6 = pre-existing other-hyp/HoistEq
 residual; mode flags are part of the verification-cache key, `16d301c`).
 
