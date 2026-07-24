@@ -4789,6 +4789,16 @@ fn build_link_module(
                 (name, kind)
             })
             .collect();
+        // WFDEBUG (bootstrap-77 temporary): seed_frame sig classification.
+        if rel == "seed_frame" {
+            let kinds: Vec<String> = params.iter().map(|(n, k)| match k {
+                crate::wf_synth::ParamKind::Bounded(_) => format!("{}:Bounded", n),
+                crate::wf_synth::ParamKind::Dt(d) => format!("{}:Dt({})", n, d),
+                crate::wf_synth::ParamKind::Other => format!("{}:Other", n),
+            }).collect();
+            eprintln!("WFDEBUG seed_frame params: {:?}; scalar_carrying(FnCtxData)={}",
+                kinds, scalar_carrying.contains("FnCtxData"));
+        }
         wf_sigs.insert(rel.clone(), crate::wf_synth::FnWfSig { params, ret_dt: ret_d });
     }
     let ectx_link = crate::emit_ctx::EmitCtx::build(krate, tactic_bodies);

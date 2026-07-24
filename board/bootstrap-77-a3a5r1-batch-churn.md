@@ -155,3 +155,29 @@ bootstrap_coverage in-model column.
   per endgame Q1/R1 under Danielle's standing no-half-measures
   guidance. The two endgame-doc corrections (assert-by HAS a goal;
   Match-node reframed as IfCtor) recorded here.
+- (2026-07-24) **tactus-core churn LANDED (`a0c9423`): gate 254/0.**
+  FUserCloser (all 23 frame-walker arms + 12 u_* pin families + weave
+  lemmas), AssertQueryTactus + IfCtor (wp/esf/frame_after/size/diverges
+  + wp_stm_sound arms — model total, D column holds), FnCtxData.closer_default
+  + seed_frame conditional. GOTCHA that cost a round: IfCtor field
+  `then` is a Lean KEYWORD → defs module failed to elaborate → whole
+  crate island-fallback whose surface error ("invalid 'import'
+  command", 172 reds) pointed nowhere near the cause. Renamed `thn`.
+  One straight-line proof (closure_forwards_contract) needed the new
+  u_gateu_* pins (its closer delta-unfolds gate_wrap).
+  RESIDUE: Link discharge 171/1 — seed_frame_wf stopped synthesizing
+  ("no wf source for `c.typ_params`" — c classified non-Dt), under
+  investigation with a WFDEBUG probe.
+- (2026-07-24) Serializer side WRITTEN + compiled: honest let
+  classification in wrap fns (wrap_mode collapse + wrap_guard +
+  user-closer-hoistless + user-closer-assert-query all RETIRED),
+  FnCtxData.mk 6th field, AssertQueryTactus arm (AssertBy = Assert-
+  shaped node; ProofBlock = Skip), ret_fork + ctor_fork_frames (walk_let
+  fork mirror + shared N2 detector `branch_isvariant_of` now
+  pub(crate)), G4 impl-fold gated to the LEGACY route only (fixes the
+  probe_if_ret-class silent divergence), ret_terminal extraction,
+  stm_size_of new heads (`If ` trailing-space guard vs IfCtor).
+  Fixtures added: pick_max (F22 plain fork), head_via_let (F23 no-fork
+  negative control), assert_by_default (F24 R1 force-wrap), 
+  proof_block_fn (F25 fn-level gate flip). bootstrap_coverage gains the
+  in-model column (D tripwire). Validation pending.
