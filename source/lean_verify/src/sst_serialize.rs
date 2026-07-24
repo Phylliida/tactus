@@ -47,6 +47,21 @@
 //! Pinned live by the poison-flip mutation (probe13 `mut_poison`
 //! class): flipping the emitted poison bit must flip the bridge 1→0.
 //!
+//! SECOND named trusted predicate (bootstrap-77): the N2 IsVariant
+//! DETECTOR. `ctor_fork_frames` decides whether a fork's positive
+//! branch gets ctor frames using production's own
+//! `branch_isvariant_of` (shared single-source) — a detector bug is
+//! therefore COMMON-MODE: both sides would upgrade (or not) in the
+//! same wrong places and the bridge would close on the wrong shape.
+//! The krate-data gates (dt-in-map, multi-variant, typ-args exposed,
+//! wrapper-deref count) and the FRAME ASSEMBLY are recomputed here
+//! independently; only the peel-to-IsVariant decision is shared.
+//! Like the poison mark, this is carried as trusted until the
+//! reference side can express the check (A7-era deep scrutinee
+//! leaves, or an independent serializer-side peel — b77 card
+//! follow-up); an IfCtor arm-structure mutation kill (also carded)
+//! pins the assembled frames meanwhile.
+//!
 //! # Snapshot point (faithfulness anchor #1)
 //!
 //! [`emit_cert`] is called at the inputs of
@@ -2543,9 +2558,15 @@ impl<'a> Serializer<'a> {
                 // — `lift_if_value`'s Bind arm renders it as-is
                 // (is_inverse_pair evidence: `let out := let tmp__ :=
                 // (s1, s2); if …` as ONE leaf) — so it must NOT peel.
+                // EXACTLY production's Return-arm gate (two conditions):
+                // `ctx.ret_name` ↦ `pending_ret_name` (both from
+                // `post_condition.dest`) and `ctx.ret_typ` ↦ `ret_typ`
+                // (the same `type_map` lookup, sst_to_lean.rs:524).
+                // `pending_ret_lname` needs no separate check — it maps
+                // off the SAME `dest` Option as `pending_ret_name`
+                // (serialize() setup), so they are Some/None together.
                 let default_route = !self.wrap_mode
                     && self.pending_ret_name.is_some()
-                    && self.pending_ret_lname.is_some()
                     && self.ret_typ.is_some();
                 let mut peel_terms: Vec<String> = Vec::new();
                 let mut cur: Option<&Exp> = ret_exp.as_ref();

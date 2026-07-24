@@ -721,8 +721,13 @@ pub struct FnCtxData {
     pub reqs: BinderList,
     pub enss: LeafList,
     // R1 (bootstrap-77): the fn-level closer class — 1 = default
-    // (`tactus_auto`), 0 = user (a fn-level `tactus_tactic` attr or a
-    // proof-block prefix, production's `closer_is_default` DFS).
+    // (`tactus_auto`), 0 = user. AMENDED post-landing (proof_block_fn
+    // evidence, b77 card): this is the ATTR bit ONLY — a fn-level
+    // `tactus_tactic` sets `obl.closer` for every goal (they all wrap).
+    // A proof-block PREFIX does NOT touch `obl.closer` (it composes
+    // into the tactic AFTER the hoist decision), so a prefix-only fn
+    // seeds 1 here and its goals hoist normally; the prefix flips only
+    // the RETURN ROUTE (a serializer-side decision, not frame state).
     // `seed_frame` plants a `FUserCloser` marker when 0, so every goal
     // of the fn renders in wrap mode (the A2 wrap_mode collapse,
     // now modeled as frame state instead of lying about let classes).
