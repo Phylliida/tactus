@@ -451,6 +451,16 @@ struct Serializer<'a> {
     /// PLAIN here (Assign/FLet/RetLet, forcing refWp's wrap gate),
     /// never AssignH/FLetH/RetLetH.
     wrap_mode: bool,
+    /// ATTR-ONLY closer bit (bootstrap-77 proof_block_fn evidence): a
+    /// fn-level `tactus_tactic` sets `obl.closer` to the user tactic for
+    /// EVERY goal — those wrap. A proof-block PREFIX does NOT touch
+    /// `obl.closer` (it composes into the tactic AFTER the hoist
+    /// decision), so a prefix-only fn's goals still HOIST — only its
+    /// Return ROUTE flips to the legacy fold (`wrap_mode` above, the
+    /// `closer_is_default` DFS). The FnCtxData `closer_default` seed and
+    /// the freshening/loop gates key on THIS bit; route decisions (G4,
+    /// ret_fork, RetLetH) key on `wrap_mode`.
+    attr_user_closer: bool,
     /// `LocalDeclKind::AssertByVar` locals (assert-forall skolems),
     /// mirroring `WpCtx.assert_by_var_typs` — a DeadEnd scope
     /// referencing any of these ∀-binds them in production's goal
@@ -2514,9 +2524,21 @@ impl<'a> Serializer<'a> {
                 // of the Ret. Only single-binder Let chains peel;
                 // anything else stays inside the value render (the
                 // plain path, which honest-fails on divergence).
+                // Route bit first (bootstrap-77): the peel below and the
+                // fork are DEFAULT-route mirrors (`Wp::Let` → `walk_let`
+                // peels Bind-chains into frame lets). The LEGACY route
+                // (`fn_closer_is_default` false, or no declared ret
+                // name/typ) keeps the WHOLE chain inside the `Done` leaf
+                // — `lift_if_value`'s Bind arm renders it as-is
+                // (is_inverse_pair evidence: `let out := let tmp__ :=
+                // (s1, s2); if …` as ONE leaf) — so it must NOT peel.
+                let default_route = !self.wrap_mode
+                    && self.pending_ret_name.is_some()
+                    && self.pending_ret_lname.is_some()
+                    && self.ret_typ.is_some();
                 let mut peel_terms: Vec<String> = Vec::new();
                 let mut cur: Option<&Exp> = ret_exp.as_ref();
-                while let Some(e) = cur {
+                while let (true, Some(e)) = (default_route, cur) {
                     let ExpX::Bind(bnd, body) = &e.x else { break };
                     let Some((lname, rhs, inner)) =
                         crate::sst_to_lean::match_single_let_bind(bnd, body)
@@ -2549,10 +2571,6 @@ impl<'a> Serializer<'a> {
                 // value-if into per-branch walks. Mirror the fork; a
                 // failure inside propagates as a loud census tag (P2 —
                 // a silently-diverging cert is worse than a reject).
-                let default_route = !self.wrap_mode
-                    && self.pending_ret_name.is_some()
-                    && self.pending_ret_lname.is_some()
-                    && self.ret_typ.is_some();
                 if default_route {
                     if let Some(e) = ret_exp {
                         if matches!(
@@ -2704,7 +2722,7 @@ impl<'a> Serializer<'a> {
                 // hoist-shaped; production wrap-renders it all
                 // goal-position. Unmodeled — reject loud (endgame A2;
                 // vocabulary follow-up with the A3/A5 churn).
-                if self.wrap_mode {
+                if self.attr_user_closer {
                     return Err("user-closer-loop".to_string());
                 }
                 // finding-3: `modified_vars` is IGNORED (it's `None` at
@@ -3012,6 +3030,26 @@ impl<'a> Serializer<'a> {
     fn block(&mut self, stms: &[Stm]) -> Sr<String> {
         if stms.is_empty() {
             return Ok(self.skip());
+        }
+        // Flatten nested Blocks FIRST (bootstrap-77, inverse_column_exec
+        // evidence): production's `build_wp` threads the continuation
+        // through block boundaries transparently, so an If at the TAIL of
+        // an inner block (a `proof { }` scope puts the rest of the body
+        // in one) still clones the OUTER continuation into its branches.
+        // Without flattening, `as_if(&stms[0])` sees a Block and the
+        // two-way-join desugar never fires — refWp then closes the
+        // post-If continuation ONCE where production emits it per branch.
+        // Walk order (leaf interning, hyp ordinals) is unchanged —
+        // flattening only reshapes the Seq tree.
+        if stms.iter().any(|s| matches!(&s.x, StmX::Block(_))) {
+            let mut flat: Vec<Stm> = Vec::new();
+            for s in stms {
+                match &s.x {
+                    StmX::Block(inner) => flat.extend(inner.iter().cloned()),
+                    _ => flat.push(s.clone()),
+                }
+            }
+            return self.block(&flat);
         }
         if stms.len() > 1 {
             if let Some((cond, then_stm, else_stm)) = as_if(&stms[0]) {
@@ -3643,7 +3681,11 @@ fn serialize<'a>(
     // shadow-freshening is off from the start (production's
     // `rename_frame_vars` only runs inside `hoist_all`).
     s.wrap_mode = !crate::sst_to_lean::closer_is_default(fn_sst, check);
-    if s.wrap_mode {
+    s.attr_user_closer = fn_sst.x.attrs.tactus_tactic.is_some();
+    if s.attr_user_closer {
+        // Freshening runs only inside `hoist_all`; an attr fn's goals
+        // never hoist. (A proof-block-only fn's goals DO hoist, so its
+        // freshening stays live — b77 proof_block_fn evidence.)
         s.mark_flet_forced();
     }
 
@@ -3896,7 +3938,7 @@ fn serialize<'a>(
         paren(&s.param_bound_list(&param_bounds)),
         paren(&s.binder_list(&req_entries)),
         paren(&s.leaf_list(&ens_leaves)),
-        if s.wrap_mode { 0 } else { 1 },
+        if s.attr_user_closer { 0 } else { 1 },
     );
 
     // Goal half (N3b): after the SST walk, so SST leaf ids are fixed and
