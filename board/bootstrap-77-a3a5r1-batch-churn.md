@@ -1,6 +1,6 @@
 ---
 title: "A3+A5+R1 batched tactus-core churn — AssertQueryTactus + IfCtor fork + FUserCloser frame"
-status: in_progress
+status: done
 claimed_by:
 created: 2026-07-24T00:00:00Z
 updated: 2026-07-24T00:00:00Z
@@ -188,6 +188,14 @@ bootstrap_coverage in-model column.
   RESIDUE: Link discharge 171/1 — seed_frame_wf stopped synthesizing
   ("no wf source for `c.typ_params`" — c classified non-Dt), under
   investigation with a WFDEBUG probe.
+- (2026-07-24 late) **E2E: main suite green; the examples binary has 2
+  PRE-EXISTING reds** (`examples_state_machines_flat_combine`,
+  `examples_state_machines_tutorial_fifo` — Z3-side "inherent safety
+  condition" deposit/withdraw failures). ATTRIBUTED by reverting
+  lean_verify to pre-b77 (`8e7696d`) and rebuilding: they fail there
+  too — not this arc's. Deterministic, so not load flake either;
+  worth an independent look (vstd/toolchain drift from earlier main
+  merges is the suspect class). All other suites 0-fail.
 - (2026-07-24 evening) **TRIAGE COMPLETE — probe9 all-green (23/24
   close, vec_read the lone stage-B hfail), probe11 ALL-CLASSIFIED
   (9/10 close), probes 13/14/37/38 PASS, units 406/0+7/0.** The tgt
