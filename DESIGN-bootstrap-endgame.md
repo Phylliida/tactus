@@ -176,15 +176,20 @@ retired (0 on tgt). Cards `bootstrap-70`/`bootstrap-71` closed. The
 probe's `gl_nth`/`gl_nth_eq` make the b74 per-goal triage idiom a
 standing artifact.
 
-### A2 — apply_hom class: call-arg temp lets + auto-ref coercion (small-medium)
+### A2 — apply_hom class — **DONE 2026-07-24** (mechanism corrected)
 
-Production wraps the whole goal when call-arg temps appear as typ-less
-`Wp::LetRaw` frames; the serializer currently types them from `local_typs`
-and hoists — wrong side of the 3-mode gate. Classify them plain-wrap, and
-keep the `Tactus.Ref.mk <arg>` coercion in instantiated requires (today
-dropped). **Acceptance:** apply_hom_gen/apply_hom_inv bridge-close on
-probe11. **Card:** new, `bootstrap-75` (or fold into the b70/71 close if
-the diff is small).
+**Both fns bridge-close; probe11 3/3 CLOSE, all classified.** The b74
+diagnosis was wrong about the mechanism: the wrap-forcer is the
+**closer gate**, not a typ-less arg temp — production never hoists a fn
+carrying a user `tactus_tactic` (the tactic text is positional against
+the wrap shape). Landed: the gate extracted to a shared single source
+(`sst_to_lean::closer_is_default`), serializer wrap-mode (plain
+`Assign`/`FLet`/`RetLet`, freshening off), req leaves via production's
+`build_req_binders` (view-arg auto-ref coercion), and the let-binder
+ledger threaded into `cert_call_leaves` (no double `Ref.mk` on
+call-dest args). Two new loud tags per P2: `user-closer-hoistless`
+(goal before any let — needs the fn-level force-wrap bit, batched with
+the A3/A5 churn) and `user-closer-loop`. Card: `bootstrap-75`.
 
 ### A3 — b69: Tactus-mode assert-query (small-medium; decided — §9 Q1)
 
@@ -354,7 +359,7 @@ Independent of the critical path; pick up in gap sessions:
 |---|---|---|---|---|
 | 1 | C — HoistEq discharge + P1 poison mutation/contract | **DONE 07-24** | b73 (closed) | — |
 | 2 | A1 — b70/71 close-out (probe38) | **DONE 07-24** | b70, b71 (closed) | — |
-| 3 | A2 — apply_hom call-arg temps + auto-ref | small-med | new (b75) | — |
+| 3 | A2 — user-closer wrap-mode mirror (apply_hom) | **DONE 07-24** | b75 (closed) | — |
 | 4 | A6-short — assert-forall census tag | small | new | — |
 | 5 | A3 — tactus assert-query variant + arm | small-med | b69 | — (Q1 resolved) |
 | 6 | A5 — Match arm (+ D model delta; batch churn w/ A3) | medium | new | — |

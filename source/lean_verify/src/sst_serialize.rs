@@ -442,6 +442,23 @@ struct Serializer<'a> {
     /// (goal-position lets shadow textually), so a name stays
     /// poison-relevant for the rest of the walk.
     residue_names: Vec<String>,
+    /// Wrap-mode mirror (endgame A2): true when the fn's closer is
+    /// NON-default (`!sst_to_lean::closer_is_default` — a fn-level
+    /// `tactus_tactic` or a `proof { tac }` prefix). Production's
+    /// `emit_leaf_theorem` NEVER hoists such fns' goals (the user
+    /// tactic is positional against the wrap shape) and the Return
+    /// keeps the legacy goal-position let — so every let classifies
+    /// PLAIN here (Assign/FLet/RetLet, forcing refWp's wrap gate),
+    /// never AssignH/FLetH/RetLetH.
+    wrap_mode: bool,
+    /// Whether a plain FLet has entered the frame yet on this walk —
+    /// refWp's wrap gate (`has_plain_flet`) is per-goal, so a goal
+    /// emitted in wrap_mode BEFORE any let would hoist reference-side
+    /// while production wraps it. Stage A cannot express fn-level
+    /// force-wrap; such fns census-reject loud
+    /// (`user-closer-hoistless`) until the vocabulary grows a
+    /// wrap-mode bit (batch with the A3/A5 churn).
+    wrap_gate_armed: bool,
     /// The declared return var's NAME text (`sanitize`d, finding-4's
     /// `pending_ret_name` companion) — the eq-leaf pair for the hoisted
     /// return binding (`RetBind::RetLetH`, bootstrap-74 slice 2) renders
@@ -756,6 +773,21 @@ impl<'a> Serializer<'a> {
         (en, ep)
     }
 
+    /// Wrap-mode goal guard (endgame A2): a goal emitted in a
+    /// wrap-mode fn BEFORE any plain FLet entered the frame would
+    /// HOIST reference-side (refWp's `has_plain_flet` gate is
+    /// per-goal) while production wraps it — and stage A has no
+    /// fn-level force-wrap bit yet. Reject loud rather than emit a
+    /// cert that cannot bridge (P2: fixed arm or census tag, never a
+    /// non-bridging cert). Vocabulary follow-up batched with the
+    /// A3/A5 tactus-core churn.
+    fn wrap_guard(&self) -> Sr<()> {
+        if self.wrap_mode && !self.wrap_gate_armed {
+            return Err("user-closer-hoistless".to_string());
+        }
+        Ok(())
+    }
+
     /// The N1-hoist classification for a plain let statement
     /// (bootstrap-74 slice 2), mirroring `hoist_all`'s per-let decision:
     /// typ known + non-Bool → `AssignH` (the hoisted binder pair —
@@ -773,6 +805,14 @@ impl<'a> Serializer<'a> {
         rhs_lx: &LExpr,
         rhs_leaf: u64,
     ) -> String {
+        // Wrap-mode fn (user closer): production never hoists — every
+        // let (Bool included: plain-FLet also renders goal-position
+        // AND arms refWp's wrap gate, which FLetR would not) is plain.
+        if self.wrap_mode {
+            self.mark_flet_forced();
+            self.wrap_gate_armed = true;
+            return format!("({}.StmData.Assign {} {})", NS, dest, rhs_leaf);
+        }
         match typ {
             Some(typ) if matches!(&*typ, vir::ast::TypX::Bool) => {
                 self.residue_names.push(lname.as_str().to_string());
@@ -817,6 +857,12 @@ impl<'a> Serializer<'a> {
     ) -> String {
         let dv_lx = &self.apply_renames(dv_lx_raw);
         let dv = self.leaves.intern(pp_expr(dv_lx));
+        // Wrap-mode fn: plain FLet always (see `assign_let_term`).
+        if self.wrap_mode {
+            self.mark_flet_forced();
+            self.wrap_gate_armed = true;
+            return format!("({}.FrameList.FLet {} {} {})", NS, dest_id, dv, box_(&tail));
+        }
         if matches!(&**dest_typ, vir::ast::TypX::Bool) {
             self.residue_names.push(dest_name.as_str().to_string());
             format!("({}.FrameList.FLetR {} {} {})", NS, dest_id, dv, box_(&tail))
@@ -2200,6 +2246,7 @@ impl<'a> Serializer<'a> {
             // hyp first (keeps it in body pre-order), then the annotated
             // obligation — the goal walk (N3b) reuses whichever id.
             StmX::Assert(_, _, e) | StmX::AssertCompute(_, e, _) => {
+                self.wrap_guard()?;
                 // Intern the BARE hyp first (keeps it in body pre-order), then
                 // the obligation slot (`oblig_slot` interns the span_mark'd
                 // leaf + the deep `raw_exp` atoms after it). The hyp render
@@ -2424,10 +2471,13 @@ impl<'a> Serializer<'a> {
                         // residue-wraps it, the bridge honest-fails).
                         let ret_lname = self.pending_ret_lname.clone()
                             .map(crate::lean_name::LeanName::synthetic);
-                        let hoistable = match (&self.ret_typ, &ret_lname) {
-                            (Some(rt), Some(_)) => !matches!(&**rt, vir::ast::TypX::Bool),
-                            _ => false,
-                        };
+                        // Wrap-mode fn: the legacy Return route keeps
+                        // the goal-position let — never RetLetH.
+                        let hoistable = !self.wrap_mode
+                            && match (&self.ret_typ, &ret_lname) {
+                                (Some(rt), Some(_)) => !matches!(&**rt, vir::ast::TypX::Bool),
+                                _ => false,
+                            };
                         match (hoistable, ret_lname) {
                             (true, Some(lname)) => {
                                 let eq_lx = LExpr::eq(LExpr::var(lname.clone()), coerced.clone());
@@ -2524,9 +2574,19 @@ impl<'a> Serializer<'a> {
                 body,
                 invs,
                 decrease,
+                // (wrap-mode loops reject below — see the guard at the
+                // arm body's head)
                 id,
                 ..
             } => {
+                // Wrap-mode fns with loops: the mirror telescope
+                // (FLetH d_old pair, named inv/cond hyps) is
+                // hoist-shaped; production wrap-renders it all
+                // goal-position. Unmodeled — reject loud (endgame A2;
+                // vocabulary follow-up with the A3/A5 churn).
+                if self.wrap_mode {
+                    return Err("user-closer-loop".to_string());
+                }
                 // finding-3: `modified_vars` is IGNORED (it's `None` at
                 // this SST stage — production's `build_wp` spells it `_`
                 // and RE-DERIVES the havoc set in `build_wp_loop` via
@@ -2578,6 +2638,7 @@ impl<'a> Serializer<'a> {
                     &stm.span,
                     &self.fn_map,
                     &self.caller_param_typs,
+                    &self.let_binder_typs,
                 )?;
                 self.call_stm(leaves)
             }
@@ -2592,6 +2653,7 @@ impl<'a> Serializer<'a> {
             // `have := by <tactic>` render, not an isolated goal list)
             // — sharper tag, still fail-loud.
             StmX::AssertQuery { mode: AssertQueryMode::NonLinear, body, .. } => {
+                self.wrap_guard()?;
                 // N1-hoist (bootstrap-74 slice 2): production's
                 // `new_scope` DROPS the enclosing hyps for the isolated
                 // query, so the sub-walk numbers its hyps from 0
@@ -2751,6 +2813,8 @@ impl<'a> Serializer<'a> {
         // id rides through as `atom_ob(id)`.
         let reqs = match &leaves.precondition {
             Some(l) => {
+                // The precondition IS a goal at this frame point.
+                self.wrap_guard()?;
                 let id = self.leaves.intern(pp_expr(l));
                 raw_exp_list(&[atom_ob_lit(id)])
             }
@@ -3279,6 +3343,16 @@ fn serialize<'a>(
 ) -> Sr<CertBody> {
     let mut s: Serializer<'a> = Serializer::default();
 
+    // Wrap-mode mirror (endgame A2): the SHARED closer gate — a user
+    // `tactus_tactic` / proof-block prefix means production never
+    // hoists this fn's goals; every let classifies plain and the
+    // shadow-freshening is off from the start (production's
+    // `rename_frame_vars` only runs inside `hoist_all`).
+    s.wrap_mode = !crate::sst_to_lean::closer_is_default(fn_sst, check);
+    if s.wrap_mode {
+        s.mark_flet_forced();
+    }
+
     // fn_map for `render_ctx()` (bootstrap-18) — built EXACTLY as
     // production's (sst_to_lean.rs:503): borrows the krate for the
     // serializer's lifetime. Callee resolution puts plain-spec-fn calls in
@@ -3352,9 +3426,29 @@ fn serialize<'a>(
     // ∀-binder `∀ (h_req0 : x < 1000)` (sst_to_lean::build_req_binders), so
     // reqs is a BinderList, not a leaf list (finding-2). The `h_req<i>` name
     // text matches production's `format!("h_req{}", i)`.
+    // Leaf TEXT via production's own `build_req_binders` (endgame A2):
+    // the fn_map ctx + mut-ref rewrite + shadow prefix produce e.g. the
+    // view-arg auto-ref coercion (`Ref.mk h.deref.generator_images`)
+    // that a bare render misses — the req prop must byte-match
+    // production's base-binder ty or refWp's seed hyp diverges.
+    let mut_param_names: std::collections::HashSet<String> = {
+        let mut m: std::collections::HashSet<String> = fn_sst.x.pars.iter()
+            .filter(|p| crate::expr_shared::is_mut_ref_typ(&p.x.typ, p.x.is_mut))
+            .map(|p| crate::to_lean_type::sanitize(&p.x.name.0))
+            .collect();
+        for decl in check.local_decls.iter() {
+            if matches!(decl.kind, vir::sst::LocalDeclKind::BorrowMut) {
+                m.insert(crate::to_lean_type::sanitize(&decl.ident.0));
+            }
+        }
+        m
+    };
     let mut req_entries: Vec<(u64, u64)> = Vec::new();
-    for (i, r) in check.reqs.iter().enumerate() {
-        let prop = s.exp_leaf(r)?;
+    for (i, b) in crate::sst_to_lean::build_req_binders(fn_sst, check, &mut_param_names, &s.fn_map)
+        .iter()
+        .enumerate()
+    {
+        let prop = s.leaves.intern(pp_expr(&b.ty));
         let hname = s.text_leaf(&format!("h_req{}", i));
         req_entries.push((hname, prop));
     }

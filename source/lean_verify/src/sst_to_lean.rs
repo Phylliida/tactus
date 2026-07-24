@@ -471,6 +471,9 @@ impl<'a> WpCtx<'a> {
     pub fn new(
         krate: &'a KrateX,
         check: &'a FuncCheckSst,
+        // The COMBINED closer gate (attr + proof-block prefix), from
+        // `closer_is_default` — the single source shared with the cert
+        // serializer's wrap-mode mirror (endgame A2).
         fn_attr_closer_is_default: bool,
         // For callee-side `&mut` body verification (#94): set of
         // sanitized param-name strings for the fn's `&mut` params.
@@ -588,31 +591,10 @@ impl<'a> WpCtx<'a> {
                 ))
             }).collect::<Result<Vec<_>, String>>()?
         );
-        // The Return→Wp::Let route additionally requires NO user
-        // `proof { tac }` tactic prefix anywhere in the body: a
-        // prefix flows onto every theorem in its scope and is
-        // positional against the legacy goal shape (a user
-        // `cases k with …; split` script overshoots forked per-arm
-        // goals — `test_exec_match_enum_with_per_arm_proof`).
-        // Assert-by closers are fine: they close only their own
-        // theorem.
-        let mut has_proof_block_prefix = false;
-        let _ = vir::sst_visitor::stm_visitor_dfs::<(), _>(
-            &check.body,
-            &mut |stm: &vir::sst::Stm| {
-                if let vir::sst::StmX::AssertQuery {
-                    mode: vir::ast::AssertQueryMode::Tactus {
-                        kind: vir::ast::TactusKind::ProofBlock, ..
-                    },
-                    ..
-                } = &stm.x
-                {
-                    has_proof_block_prefix = true;
-                }
-                vir::visitor::VisitorControlFlow::Recurse
-            },
-        );
-        let fn_closer_is_default = fn_attr_closer_is_default && !has_proof_block_prefix;
+        // The combined closer gate is computed by the caller via the
+        // shared `closer_is_default` helper (also consumed by the cert
+        // serializer, endgame A2 — the two must never drift).
+        let fn_closer_is_default = fn_attr_closer_is_default;
         Ok(Self {
             fn_map,
             datatypes,
@@ -1063,6 +1045,37 @@ pub struct ExecFnObligations {
     pub goal_shapes: Vec<Option<GoalShape>>,
 }
 
+/// The N1-hoist / leaf-normal closer gate — SINGLE SOURCE, shared by
+/// `WpCtx` (production's hoist/Return-route decisions) and the cert
+/// serializer's wrap-mode mirror (endgame A2). Default iff the fn has
+/// no fn-level `tactus_tactic` attr AND no user `proof { tac }` prefix
+/// anywhere in the body: a user closer/prefix is positional against
+/// the legacy goal-position wrap shape, so production NEVER hoists
+/// those fns' goals (`emit_leaf_theorem`'s `is_default` gate) and the
+/// Return keeps the legacy `Done(let ret := e; …)` leaf.
+pub(crate) fn closer_is_default(fn_sst: &FunctionSst, check: &FuncCheckSst) -> bool {
+    if fn_sst.x.attrs.tactus_tactic.is_some() {
+        return false;
+    }
+    let mut has_proof_block_prefix = false;
+    let _ = vir::sst_visitor::stm_visitor_dfs::<(), _>(
+        &check.body,
+        &mut |stm: &vir::sst::Stm| {
+            if let vir::sst::StmX::AssertQuery {
+                mode: vir::ast::AssertQueryMode::Tactus {
+                    kind: vir::ast::TactusKind::ProofBlock, ..
+                },
+                ..
+            } = &stm.x
+            {
+                has_proof_block_prefix = true;
+            }
+            vir::visitor::VisitorControlFlow::Recurse
+        },
+    );
+    !has_proof_block_prefix
+}
+
 pub fn exec_fn_theorems_to_ast<'a>(
     krate: &'a KrateX,
     fn_sst: &'a FunctionSst,
@@ -1215,7 +1228,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
     let ctx = WpCtx::new(
         krate,
         check,
-        fn_sst.x.attrs.tactus_tactic.is_none(),
+        closer_is_default(fn_sst, check),
         &mut_param_names,
         borrow_mut_links,
         caller_param_typs,
@@ -5084,6 +5097,13 @@ pub(crate) fn cert_call_leaves<'a>(
     call_span: &Span,
     fn_map: &'a crate::expr_shared::RenderFnMap<'a>,
     caller_param_typs: &HashMap<VarIdent, Typ>,
+    // The serializer's mirror of the walk's `OblCtx.let_binder_typs`
+    // ledger (endgame A2): call args that are EARLIER call-dest locals
+    // render at their LEDGERED typ (trusted), exactly as production's
+    // walk-time `arg_rctx` does — without it, a `tmp__N : &T` dest
+    // re-wraps `Tactus.Ref.mk` at the next call's arg slot and the
+    // instantiated ensures leaf diverges (apply_hom class).
+    let_binder_typs: &im::HashMap<crate::lean_name::LeanName, (Typ, bool)>,
 ) -> Result<CertCallLeaves, String> {
     // ── Phase A: restricted-subset resolution (mirrors resolve_callee's
     // Static arm; everything else is a sharp fail-loud tag). ──
@@ -5136,11 +5156,13 @@ pub(crate) fn cert_call_leaves<'a>(
         .map_err(|reason| format!("leaf-render: {}", reason))?;
 
     // ── Phase C: substitution maps + render ctxs (reuse production). ──
-    // Shell obl/emitter: in the restricted subset (no let-binder ledger,
-    // no prophecies) neither affects the rendered leaf text — the ret-eq
-    // path substitutes `fresh_ret_name` OUT, and the emitter's id counter
-    // only names theorems (not leaves). Constructed here (in-module).
-    let obl = OblCtx::new(Tactic::Named("tactus_auto".to_string()));
+    // Shell obl/emitter: the emitter's id counter only names theorems
+    // (not leaves) and prophecies stay out of the restricted subset —
+    // but the LET-BINDER LEDGER is load-bearing (endgame A2): the
+    // serializer's mirror installs so arg renders see earlier call
+    // dests at their trusted ledgered typs, matching the walk.
+    let mut obl = OblCtx::new(Tactic::Named("tactus_auto".to_string()));
+    obl.let_binder_typs = let_binder_typs.clone();
     let mut emitter = ObligationEmitter {
         fn_name: String::new(),
         base_binders: Vec::new(),
@@ -5158,7 +5180,8 @@ pub(crate) fn cert_call_leaves<'a>(
         dt_inventory: Default::default(),
     };
     let arg_rctx = crate::expr_shared::RenderCtx::with_fn_map(fn_map)
-        .with_binder_typs(caller_param_typs);
+        .with_binder_typs(caller_param_typs)
+        .with_let_binder_typs(let_binder_typs);
     let subst = build_call_substitutions(
         callee, spec_callee, &typ_args[..], &validated_args, &[],
         caller_param_typs, &arg_rctx, &obl, &mut emitter,
@@ -5639,7 +5662,10 @@ fn build_borrow_mut_binders(check: &FuncCheckSst) -> Vec<LBinder> {
 /// applies to the body's WP. This keeps `Var(x)` in the rewritten req
 /// expression type-checking against inner T at the theorem-binder
 /// position (which is outside the OblCtx wrap).
-fn build_req_binders(
+// pub(crate): the cert serializer reuses this for its `FnCtxData.reqs`
+// leaf TEXTS (endgame A2 — leaf text is production-rendered by design,
+// DESIGN §2.5; the fn_map ctx's view-arg auto-ref coercion must match).
+pub(crate) fn build_req_binders(
     fn_sst: &FunctionSst,
     check: &FuncCheckSst,
     mut_param_names: &HashSet<String>,
