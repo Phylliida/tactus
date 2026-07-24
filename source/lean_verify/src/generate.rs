@@ -4776,29 +4776,30 @@ fn build_link_module(
             .map(|pr| {
                 let name = crate::lean_name::LeanName::from_var_ident(&pr.x.name)
                     .into_string();
-                let kind = if let Some(pred) = field_bound_pred(&pr.x.typ, &name) {
-                    crate::wf_synth::ParamKind::Bounded(pred)
-                } else {
-                    match field_dt(&pr.x.typ) {
-                        Some((d, false)) if scalar_carrying.contains(&d) => {
-                            crate::wf_synth::ParamKind::Dt(d)
+                // Dt-classification takes PRECEDENCE for datatype-typed
+                // params (bootstrap-77): a scalar field in a struct makes
+                // `type_bound_predicate` fire on the WHOLE struct
+                // (FnCtxData.closer_default did exactly this), but the wf
+                // hypothesis subsumes the projected bound — it is a
+                // conjunct of the wf pred — and the synthesizer needs the
+                // Dt proof to project field wf (`hwf_c.1` etc.). A
+                // Bounded-classified struct param starved seed_frame_wf
+                // ("no wf source for `c.typ_params`").
+                let kind = match field_dt(&pr.x.typ) {
+                    Some((d, false)) if scalar_carrying.contains(&d) => {
+                        crate::wf_synth::ParamKind::Dt(d)
+                    }
+                    _ => {
+                        if let Some(pred) = field_bound_pred(&pr.x.typ, &name) {
+                            crate::wf_synth::ParamKind::Bounded(pred)
+                        } else {
+                            crate::wf_synth::ParamKind::Other
                         }
-                        _ => crate::wf_synth::ParamKind::Other,
                     }
                 };
                 (name, kind)
             })
             .collect();
-        // WFDEBUG (bootstrap-77 temporary): seed_frame sig classification.
-        if rel == "seed_frame" {
-            let kinds: Vec<String> = params.iter().map(|(n, k)| match k {
-                crate::wf_synth::ParamKind::Bounded(_) => format!("{}:Bounded", n),
-                crate::wf_synth::ParamKind::Dt(d) => format!("{}:Dt({})", n, d),
-                crate::wf_synth::ParamKind::Other => format!("{}:Other", n),
-            }).collect();
-            eprintln!("WFDEBUG seed_frame params: {:?}; scalar_carrying(FnCtxData)={}",
-                kinds, scalar_carrying.contains("FnCtxData"));
-        }
         wf_sigs.insert(rel.clone(), crate::wf_synth::FnWfSig { params, ret_dt: ret_d });
     }
     let ectx_link = crate::emit_ctx::EmitCtx::build(krate, tactic_bodies);

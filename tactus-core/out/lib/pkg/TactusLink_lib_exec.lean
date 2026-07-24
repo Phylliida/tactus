@@ -1236,6 +1236,15 @@ def FrameListWf (x : lib.FrameList) : Prop :=
   | lib.FrameList.FUserCloser x0 => FrameListWf x0.deref
 termination_by structural x
 
+def LeafListWf (x : lib.LeafList) : Prop :=
+  match x with
+  | lib.LeafList.Nil => True
+  | lib.LeafList.Cons x0 x1 => (0 ≤ x0 ∧ x0 < 18446744073709551616) ∧ LeafListWf x1.deref
+termination_by structural x
+
+def FnCtxDataWf (x : lib.FnCtxData) : Prop :=
+  BinderListWf x.typ_params ∧ BinderListWf x.params ∧ ParamBoundListWf x.param_bounds ∧ BinderListWf x.reqs ∧ LeafListWf x.enss ∧ (0 ≤ x.closer_default ∧ x.closer_default < 18446744073709551616)
+
 mutual
 def RawArmListWf (x : lib.RawArmList) : Prop :=
   match x with
@@ -1296,8 +1305,6 @@ def StmDataWf (x : lib.StmData) : Prop :=
   | lib.StmData.Seq x0 x1 => StmDataWf x0.deref ∧ StmDataWf x1.deref
 termination_by structural x
 
--- wf lemma not synthesized: seed_frame: no wf source for `c.typ_params`
--- wf lemma not synthesized: seed_frame: no wf source for `c.typ_params`
 theorem strip_hyps_wf (f : lib.FrameList) (hwf_f : FrameListWf f) :
     FrameListWf (lib.strip_hyps f) :=
   match f, hwf_f with
@@ -1370,20 +1377,20 @@ theorem havoc_lets_wf (f : lib.FrameList) (hwf_f : FrameListWf f) (mods : lib.Bi
   | lib.FrameList.FHyp hn h p t, ⟨hw4, hw5, hw6, hw7⟩ =>
       ⟨hw4, hw5, hw6, (havoc_lets_wf (t.deref) hw7 (mods) hwf_mods)⟩
   | lib.FrameList.FLet id v t, ⟨hw8, hw9, hw10⟩ =>
-      if hc11 : lib.binder_has_id mods id = 1 then
+      (if hc11 : lib.binder_has_id mods id = 1 then
         (congrArg FrameListWf (if_pos hc11)).mpr ((havoc_lets_wf (t.deref) hw10 (mods) hwf_mods))
       else
-        (congrArg FrameListWf (if_neg hc11)).mpr (⟨hw8, hw9, (havoc_lets_wf (t.deref) hw10 (mods) hwf_mods)⟩)
+        (congrArg FrameListWf (if_neg hc11)).mpr (⟨hw8, hw9, (havoc_lets_wf (t.deref) hw10 (mods) hwf_mods)⟩))
   | lib.FrameList.FLetH id ty v en ep t, ⟨hw12, hw13, hw14, hw15, hw16, hw17⟩ =>
-      if hc18 : lib.binder_has_id mods id = 1 then
+      (if hc18 : lib.binder_has_id mods id = 1 then
         (congrArg FrameListWf (if_pos hc18)).mpr ((havoc_lets_wf (t.deref) hw17 (mods) hwf_mods))
       else
-        (congrArg FrameListWf (if_neg hc18)).mpr (⟨hw12, hw13, hw14, hw15, hw16, (havoc_lets_wf (t.deref) hw17 (mods) hwf_mods)⟩)
+        (congrArg FrameListWf (if_neg hc18)).mpr (⟨hw12, hw13, hw14, hw15, hw16, (havoc_lets_wf (t.deref) hw17 (mods) hwf_mods)⟩))
   | lib.FrameList.FLetR id v t, ⟨hw19, hw20, hw21⟩ =>
-      if hc22 : lib.binder_has_id mods id = 1 then
+      (if hc22 : lib.binder_has_id mods id = 1 then
         (congrArg FrameListWf (if_pos hc22)).mpr ((havoc_lets_wf (t.deref) hw21 (mods) hwf_mods))
       else
-        (congrArg FrameListWf (if_neg hc22)).mpr (⟨hw19, hw20, (havoc_lets_wf (t.deref) hw21 (mods) hwf_mods)⟩)
+        (congrArg FrameListWf (if_neg hc22)).mpr (⟨hw19, hw20, (havoc_lets_wf (t.deref) hw21 (mods) hwf_mods)⟩))
   | lib.FrameList.FUserCloser t, hw23 =>
       (havoc_lets_wf (t.deref) hw23 (mods) hwf_mods)
 termination_by structural f
@@ -1416,15 +1423,15 @@ theorem frame_after_wf (f : lib.FrameList) (hwf_f : FrameListWf f) (s : lib.StmD
   | lib.StmData.Ret _es _rb, ⟨hw26, hw27⟩ =>
       hwf_f
   | lib.StmData.If _c _cn nc ncn cp t e, ⟨hw28, hw29, hw30, hw31, hw32, hw33, hw34⟩ =>
-      if hc35 : lib.diverges t.deref = 1 ∧ lib.is_skip e.deref = 1 then
+      (if hc35 : lib.diverges t.deref = 1 ∧ lib.is_skip e.deref = 1 then
         (congrArg FrameListWf (if_pos hc35)).mpr ((frame_append_wf (f) hwf_f (lib.FrameList.FHyp ncn nc cp (Tactus.Box.mk lib.FrameList.FNil)) ⟨hw31, hw30, hw32, trivial⟩))
       else
-        (congrArg FrameListWf (if_neg hc35)).mpr (hwf_f)
+        (congrArg FrameListWf (if_neg hc35)).mpr (hwf_f))
   | lib.StmData.IfCtor _ _ _ _ neg_name neg_prop neg_poison thn els, ⟨hw36, hw37, hw38, hw39, hw40, hw41, hw42, hw43, hw44⟩ =>
-      if hc45 : lib.diverges thn.deref = 1 ∧ lib.is_skip els.deref = 1 then
+      (if hc45 : lib.diverges thn.deref = 1 ∧ lib.is_skip els.deref = 1 then
         (congrArg FrameListWf (if_pos hc45)).mpr ((frame_append_wf (f) hwf_f (lib.FrameList.FHyp neg_name neg_prop neg_poison (Tactus.Box.mk lib.FrameList.FNil)) ⟨hw40, hw41, hw42, trivial⟩))
       else
-        (congrArg FrameListWf (if_neg hc45)).mpr (hwf_f)
+        (congrArg FrameListWf (if_neg hc45)).mpr (hwf_f))
   | lib.StmData.Loop inv_hyps _ _ binders binder_bounds cond_name _ neg_cond_ann cond_poison _ _ _ _ _ _ _, ⟨hw46, hw47, hw48, hw49, hw50, hw51, hw52, hw53, hw54, hw55, hw56, hw57, hw58, hw59, hw60, hw61⟩ =>
       (loop_use_frame_wf (f) hwf_f (inv_hyps.deref) hw46 (binders.deref) hw49 (binder_bounds.deref) hw50 (cond_name) hw51 (neg_cond_ann) hw53 (cond_poison) hw54)
   | lib.StmData.Skip, _ =>
@@ -1474,6 +1481,13 @@ theorem seed_params_wf (params : lib.BinderList) (hwf_params : BinderListWf para
   | lib.ParamBoundList.Nil, _ =>
       ⟨hw1, hw2, (seed_params_wf (t.deref) hw3 (lib.ParamBoundList.Nil) trivial)⟩
 termination_by structural params
+
+theorem seed_frame_wf (c : lib.FnCtxData) (hwf_c : FnCtxDataWf c) :
+    FrameListWf (lib.seed_frame c) :=
+  (frame_append_wf (lib.binders_to_frame c.typ_params) (binders_to_frame_wf (c.typ_params) hwf_c.1) (lib.frame_append (lib.seed_params c.params c.param_bounds) (lib.frame_append (lib.binders_to_frame c.reqs) (if c.closer_default = 1 then lib.FrameList.FNil else lib.FrameList.FUserCloser (Tactus.Box.mk lib.FrameList.FNil)))) (frame_append_wf (lib.seed_params c.params c.param_bounds) (seed_params_wf (c.params) hwf_c.2.1 (c.param_bounds) hwf_c.2.2.1) (lib.frame_append (lib.binders_to_frame c.reqs) (if c.closer_default = 1 then lib.FrameList.FNil else lib.FrameList.FUserCloser (Tactus.Box.mk lib.FrameList.FNil))) (frame_append_wf (lib.binders_to_frame c.reqs) (binders_to_frame_wf (c.reqs) hwf_c.2.2.2.1) (if c.closer_default = 1 then lib.FrameList.FNil else lib.FrameList.FUserCloser (Tactus.Box.mk lib.FrameList.FNil)) (if hc1 : c.closer_default = 1 then
+        (congrArg FrameListWf (if_pos hc1)).mpr (trivial)
+      else
+        (congrArg FrameListWf (if_neg hc1)).mpr (trivial)))))
 
 theorem u_cce_cons_closed : _tactus_postcondition_u_cce_cons_at_lib_4426_13_1_stmt := _tactus_postcondition_u_cce_cons_at_lib_4426_13_1_closed
 
@@ -2341,6 +2355,11 @@ theorem wp_sound_bites_loop_init_closed (hp : Int → (Int → Int) → Prop) (h
   let tmp__7 := lib.RawExpList.Nil;
   _tactus_postcondition_wp_sound_bites_loop_init_at_lib_5548_13_5 hp he lv inv_hyps ob binders binder_bounds cond_name h_cond_name_bound cond_ann h_cond_ann_bound neg_cond_ann h_neg_cond_ann_bound cond_poison h_cond_poison_bound d_old_name h_d_old_name_bound d_old_ty h_d_old_ty_bound d_old_val h_d_old_val_bound d_old_eq_name h_d_old_eq_name_bound d_old_eq_prop h_d_old_eq_prop_bound decrease_oblig body st h_req0 () (wp_stm_sound_closed hp he lv tmp__1 tmp__2 st trivial ⟨hwf_inv_hyps, ⟨hwf_ob, trivial⟩, ⟨hwf_ob, trivial⟩, hwf_binders, hwf_binder_bounds, h_cond_name_bound, h_cond_ann_bound, h_neg_cond_ann_bound, h_cond_poison_bound, h_d_old_name_bound, h_d_old_ty_bound, h_d_old_val_bound, h_d_old_eq_name_bound, h_d_old_eq_prop_bound, hwf_decrease_oblig, hwf_body⟩) () (u_esf_loop_closed hp he lv tmp__3 inv_hyps (Tactus.Box.mk tmp__4) (Tactus.Box.mk tmp__5) binders binder_bounds cond_name h_cond_name_bound cond_ann h_cond_ann_bound neg_cond_ann h_neg_cond_ann_bound cond_poison h_cond_poison_bound d_old_name h_d_old_name_bound d_old_ty h_d_old_ty_bound d_old_val h_d_old_val_bound d_old_eq_name h_d_old_eq_name_bound d_old_eq_prop h_d_old_eq_prop_bound decrease_oblig body) () (u_cso_nil_closed hp he lv tmp__6) () (u_obligs_cons_closed he ob (Tactus.Box.mk tmp__7))
 
+theorem ref_wp_sound_closed (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (c : lib.FnCtxData) (h_c_bound : 0 ≤ c.closer_default ∧ c.closer_default < 18446744073709551616) (s : lib.StmData) (st : Int → Int) (hwf_s : StmDataWf s) (hwf_c : FnCtxDataWf c) :
+    (lib.holds_all hp he lv (lib.ref_wp c s) st = lib.exec_safe_f hp he lv (lib.seed_frame c) s st) :=
+  let tmp__1 := lib.seed_frame c;
+  _tactus_postcondition_ref_wp_sound_at_lib_5271_13_3 hp he lv c h_c_bound s st () (u_ref_wp_closed c h_c_bound s) () (wp_stm_sound_closed hp he lv tmp__1 s st (seed_frame_wf c hwf_c) hwf_s)
+
 end lib
 #tactus_check_axioms lib.u_cce_cons_closed []
 #tactus_check_axioms lib.u_cce_nil_closed []
@@ -2513,3 +2532,4 @@ end lib
 #tactus_check_axioms lib.closure_forwards_contract_closed []
 #tactus_check_axioms lib.wp_sound_bites_assert_closed []
 #tactus_check_axioms lib.wp_sound_bites_loop_init_closed []
+#tactus_check_axioms lib.ref_wp_sound_closed []
