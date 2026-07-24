@@ -120,6 +120,26 @@ If-arm analogue — ctor-eq is an opaque hyp leaf under the oracle
 model; AssertQueryTactus = Assert-arm analogue) + the
 bootstrap_coverage in-model column.
 
+## Follow-ups (small, tracked — not blockers)
+
+* **Mutation-kill classes for the NEW arms** (acceptance item, deferred
+  with reasons): probe13 classes for IfCtor (drop the ctor-eq / swap
+  arms) and AssertQueryTactus (drop the forward hyp). The A5-restored
+  deref class already exercises the fork's per-arm goals; these add the
+  arm-specific channels. Regex-mutation over the nested IfCtor term
+  needs a bracket-aware helper in gen.py — mechanical, fresh-session
+  sized.
+* **R4 resolved by construction**: with honest classification the
+  FLetH eq/name leaves in wrap-mode certs are load-bearing SST data
+  (not unused interned noise) — no tidy needed; noted for the record.
+* **Statement-If IsVariant N2 upgrade** (pre-existing, unexercised):
+  production's `Wp::Branch` walker ALSO ctor-upgrades statement-level
+  `if x.is_v()` tests in default scopes; the serializer's StmX::If arm
+  emits plain cond hyps. No corpus fn hits it (matches lower to
+  return-position value-ifs). Would honest-fail loudly if one appears;
+  wire the shared `ctor_fork_frames` into the If/block-desugar arms
+  then.
+
 ## Known residue (documented, not solved here)
 
 * Leading-position Hyp in a WRAP-mode goal: production's
@@ -168,6 +188,37 @@ bootstrap_coverage in-model column.
   RESIDUE: Link discharge 171/1 — seed_frame_wf stopped synthesizing
   ("no wf source for `c.typ_params`" — c classified non-Dt), under
   investigation with a WFDEBUG probe.
+- (2026-07-24 evening) **TRIAGE COMPLETE — probe9 all-green (23/24
+  close, vec_read the lone stage-B hfail), probe11 ALL-CLASSIFIED
+  (9/10 close), probes 13/14/37/38 PASS, units 406/0+7/0.** The tgt
+  user-closer class forced FIVE post-landing corrections, each
+  evidence-driven:
+  1. **Two-bit split** (proof_block_fn goal-0 evidence): the fn-level
+     `closer_is_default` DFS gates the RETURN ROUTE only; per-goal
+     hoisting follows `obl.closer` = the ATTR alone. FUserCloser
+     seeding/freshening/loop-reject now key on `attr_user_closer`;
+     G4/fork/RetLetH on route-level `wrap_mode`.
+  2. **Nested-Block flatten** in `block()` (inverse_column 4-vs-5
+     goals): a `proof { }` scope nests a Block whose tail If must see
+     the OUTER continuation for the two-way-join desugar — production
+     threads continuations through block boundaries transparently.
+  3. **Legacy-route peel gate** (is_inverse_pair extra Let):
+     `lift_if_value`'s Bind arm keeps the whole `let tmp__ := …; if …`
+     chain inside the RetLet leaf — the Bind-peel is a default-route
+     mirror only.
+  4. **Binder-aware hyp renders** (apply_hom_symbol `s` vs `s.deref`):
+     Assert / Assume / AssertQueryTactus forward hyps all render
+     through `render_ctx().with_let_binder_typs` (the bootstrap-18
+     class, latent in the plain arms until a `&`-param assert showed).
+  5. **find_cancellation_exec = the vec_read stage-B class**, newly
+     visible now that it serializes: stage-A assembly matches (21
+     goals, spines align); the divergence is deep-leaf only
+     (`FieldProj .deref` on a View-call arg). Classified honest-fail
+     in probe11 pointing at A7.
+  probe13's parked A5 tripwire FIRED AS DESIGNED → deref class
+  restored to close+kill. probe14/probe37 vendored pins updated for
+  the 6-arg FnCtxData.mk / the closed theorem's new `h_c_bound`
+  binder (fed from FnCtxDataWf's final conjunct).
 - (2026-07-24) Serializer side WRITTEN + compiled: honest let
   classification in wrap fns (wrap_mode collapse + wrap_guard +
   user-closer-hoistless + user-closer-assert-query all RETIRED),

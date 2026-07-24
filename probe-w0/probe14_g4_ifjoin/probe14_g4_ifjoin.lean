@@ -33,7 +33,7 @@ set_option maxRecDepth 8000
 
 -- ── production fn context (VERBATIM from bootstrap-fixture/out/lib/cert/max_u64.cert.lean) ──
 @[reducible] def ctx : lib.FnCtxData :=
-  (lib.FnCtxData.mk lib.BinderList.Nil (lib.BinderList.Cons 0 1 (Tactus.Box.mk (lib.BinderList.Cons 4 1 (Tactus.Box.mk lib.BinderList.Nil)))) (lib.ParamBoundList.Bound 3 2 (Tactus.Box.mk (lib.ParamBoundList.Bound 6 5 (Tactus.Box.mk lib.ParamBoundList.Nil)))) lib.BinderList.Nil (lib.LeafList.Cons 7 (Tactus.Box.mk (lib.LeafList.Cons 8 (Tactus.Box.mk lib.LeafList.Nil)))))
+  (lib.FnCtxData.mk lib.BinderList.Nil (lib.BinderList.Cons 0 1 (Tactus.Box.mk (lib.BinderList.Cons 4 1 (Tactus.Box.mk lib.BinderList.Nil)))) (lib.ParamBoundList.Bound 3 2 (Tactus.Box.mk (lib.ParamBoundList.Bound 6 5 (Tactus.Box.mk lib.ParamBoundList.Nil)))) lib.BinderList.Nil (lib.LeafList.Cons 7 (Tactus.Box.mk (lib.LeafList.Cons 8 (Tactus.Box.mk lib.LeafList.Nil)))) 1)
 
 -- ══ REFERENCE side: the recompute RawExps (what `lift_if_raw` must build) ══
 -- shared ensures conjunction `r≥x ∧ r≥y`, each conjunct Span-wrapped at its

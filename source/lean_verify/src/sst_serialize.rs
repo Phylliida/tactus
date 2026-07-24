@@ -2446,8 +2446,15 @@ impl<'a> Serializer<'a> {
                 // (bootstrap-74 slice 2) sees the exact interned term: a
                 // prop mentioning an in-scope residue let poisons the frame
                 // (whole-goal wrap, mirroring hoist_all's bail).
-                let hyp_lx_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked(e)
-                    .map_err(|reason| format!("leaf-render: {}", reason))?;
+                // Binder-aware ctx (bootstrap-77, the bootstrap-18 class):
+                // production renders assert/assume hyps through the walk's
+                // render ctx — a `&`-param mention (`*s` → `s.deref`) must
+                // match (apply_hom_symbol evidence).
+                let hyp_lx_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(
+                    e,
+                    &self.render_ctx().with_let_binder_typs(&self.let_binder_typs),
+                )
+                .map_err(|reason| format!("leaf-render: {}", reason))?;
                 let hyp_lx = self.apply_renames(&hyp_lx_raw);
                 let hp = self.hyp_poison(&hyp_lx);
                 if hp == 1 {
@@ -2474,8 +2481,12 @@ impl<'a> Serializer<'a> {
                 if crate::sst_to_lean::is_synthetic_assume_to_drop(e) {
                     return Ok(self.skip());
                 }
-                let e_lx_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked(e)
-                    .map_err(|reason| format!("leaf-render: {}", reason))?;
+                // Binder-aware ctx — see the Assert arm (bootstrap-77).
+                let e_lx_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(
+                    e,
+                    &self.render_ctx().with_let_binder_typs(&self.let_binder_typs),
+                )
+                .map_err(|reason| format!("leaf-render: {}", reason))?;
                 let e_lx = self.apply_renames(&e_lx_raw);
                 let hp = self.hyp_poison(&e_lx);
                 if hp == 1 {
@@ -2867,8 +2878,17 @@ impl<'a> Serializer<'a> {
                         let StmX::Assert(_, _, cond) = &body.x else {
                             return Err("assert-query-tactus-shape".to_string());
                         };
-                        let hyp_lx_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked(cond)
-                            .map_err(|reason| format!("leaf-render: {}", reason))?;
+                        // Binder-aware ctx (bootstrap-18 class): production's
+                        // `walk_assert_by_tactus` pushes `cond_ast` rendered
+                        // with `render_ctx().with_let_binder_typs(…)` — a
+                        // `&`-param deref (`*s` → `s.deref`) must match
+                        // (apply_hom_symbol per-goal evidence: hyp leaf
+                        // `…view s` vs production's `…view s.deref`).
+                        let hyp_lx_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(
+                            cond,
+                            &self.render_ctx().with_let_binder_typs(&self.let_binder_typs),
+                        )
+                        .map_err(|reason| format!("leaf-render: {}", reason))?;
                         let hyp_lx = self.apply_renames(&hyp_lx_raw);
                         let hp = self.hyp_poison(&hyp_lx);
                         if hp == 1 {
