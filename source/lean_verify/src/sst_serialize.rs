@@ -459,6 +459,14 @@ struct Serializer<'a> {
     /// (`user-closer-hoistless`) until the vocabulary grows a
     /// wrap-mode bit (batch with the A3/A5 churn).
     wrap_gate_armed: bool,
+    /// `LocalDeclKind::AssertByVar` locals (assert-forall skolems),
+    /// mirroring `WpCtx.assert_by_var_typs` — a DeadEnd scope
+    /// referencing any of these ∀-binds them in production's goal
+    /// telescope (`Wp::Scope.scope_vars`), which stage A cannot
+    /// express: census-reject loud (`assert-forall`, endgame
+    /// A6-short). The real quantifier-binder arm is planned post-flip
+    /// (endgame table row 11b).
+    assert_by_var_typs: std::collections::HashMap<&'a vir::ast::VarIdent, &'a Typ>,
     /// The declared return var's NAME text (`sanitize`d, finding-4's
     /// `pending_ret_name` companion) — the eq-leaf pair for the hoisted
     /// return binding (`RetBind::RetLetH`, bootstrap-74 slice 2) renders
@@ -2597,6 +2605,18 @@ impl<'a> Serializer<'a> {
             }
 
             StmX::DeadEnd(inner) => {
+                // Assert-forall skolems (endgame A6-short): production
+                // ∀-binds referenced AssertByVar locals in this scope's
+                // goal telescope — no stage-A arm for that; reject loud
+                // (SAME detection as production's `collect_assert_by_vars`).
+                if !crate::sst_to_lean::collect_assert_by_vars_in(
+                    inner,
+                    &self.assert_by_var_typs,
+                )
+                .is_empty()
+                {
+                    return Err("assert-forall".to_string());
+                }
                 let b = self.stm(inner)?;
                 Ok(format!("({}.StmData.DeadEnd {})", NS, box_(&b)))
             }
@@ -3337,7 +3357,9 @@ struct CertBody {
 fn serialize<'a>(
     krate: &'a KrateX,
     fn_sst: &FunctionSst,
-    check: &FuncCheckSst,
+    // `'a`: the AssertByVar map borrows local_decls for the
+    // serializer's lifetime (A6-short).
+    check: &'a FuncCheckSst,
     theorems: &[Theorem],
     goal_shapes: &[Option<GoalShape>],
 ) -> Sr<CertBody> {
@@ -3352,6 +3374,16 @@ fn serialize<'a>(
     if s.wrap_mode {
         s.mark_flet_forced();
     }
+
+    // Assert-forall skolem map (endgame A6-short) — built EXACTLY as
+    // `WpCtx::new`'s `assert_by_var_typs`; the DeadEnd arm rejects when
+    // a scope references one.
+    s.assert_by_var_typs = check
+        .local_decls
+        .iter()
+        .filter(|d| matches!(d.kind, vir::sst::LocalDeclKind::AssertByVar { .. }))
+        .map(|d| (&d.ident, &d.typ))
+        .collect();
 
     // fn_map for `render_ctx()` (bootstrap-18) — built EXACTLY as
     // production's (sst_to_lean.rs:503): borrows the krate for the

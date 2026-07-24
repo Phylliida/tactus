@@ -13,11 +13,13 @@ kills; vec_read goal-0 close + kill; A7 tripwire). **A2 DONE same day
 mechanism was the CLOSER GATE (production never hoists user-tactic
 fns), not arg-temp LetRaw: shared `closer_is_default` + serializer
 wrap-mode + `build_req_binders` leaf reuse + call-leaves ledger. New
-tags: `user-closer-hoistless`/`user-closer-loop`. Next: A6-short
-(assert-forall census tag), then A3+A5 (AssertQueryTactus + Match,
-one batched tactus-core churn incl. the fn-level force-wrap bit). Suite state: 551/0 upstream; tactus-core
-gate 231/0 + Link discharge 144/6 (the 6 = pre-existing other-hyp/HoistEq
-residual; mode flags are part of the verification-cache key, `16d301c`).
+tags: `user-closer-hoistless`/`user-closer-loop`. **A6-short DONE same
+day (b76): assert-forall census-rejects via production's own skolem
+detection — probe11 fully green, 3/3 CLOSE, zero honest-fails, no
+non-bridging certs anywhere.** Next: A3+A5 batched tactus-core churn
+(AssertQueryTactus variant + Match arm + fn-level force-wrap bit),
+then A4 (call-mut), A7 (stage-B vocab), B (b67/b68 flip). Suite
+state: e2e 551/0; tactus-core gate 231/0 + Link discharge 150/0.
 
 ## 1. bootstrap-74 — bridge ↔ N1-hoist reconciliation (DONE 2026-07-21)
 

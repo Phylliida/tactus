@@ -232,19 +232,16 @@ Same step-0-evidence-first discipline. **Acceptance:** head_exec closes;
 probe9 20/20 minus only stage-B classes. **Card:** new, from the b74
 residue note ("Card separately").
 
-### A6 — assert-forall: census rejection now, binder arm planned (small, then medium)
+### A6 — assert-forall — **short form DONE 2026-07-24** (card b76)
 
-Short form (pre-flip, required by P2): serializer detects skolem binders
-and rejects loud with an `assert-forall` tag — today these emit
-non-bridging certs, the worst of both worlds. Real fix (**planned
-post-flip work, not optional — §9 Q4**): a quantifier binder in the
-stage-A telescope (`∀ (k : Int)` frames), so these lemmas join the
-certificate. The tag is a bridge-era stopgap only; under the
-verify-as-much-as-possible policy no census tag is intended to be
-permanent unless the construct is genuinely outside the frontend subset.
-The tag suffices for b68. **Acceptance (short):** the two
-lemma_runtime_word_view fns census-reject with the tag; no non-bridging
-certs emitted anywhere. **Acceptance (full):** the tag population drops
+The serializer's DeadEnd arm now runs production's OWN skolem
+detection (`collect_assert_by_vars_in`, shared single-source) and
+census-rejects `assert-forall` — both lemma_runtime_word_view fns tag
+out with no cert, and **probe11 is fully green (3/3 CLOSE, zero
+honest-fails)**: no non-bridging certs remain anywhere in the corpus.
+The real fix (the `∀ (k : Int)` stage-A telescope binder arm) stays
+planned post-flip work — row 11b, per Q4: the tag is b68 scaffolding,
+never permanent. **Acceptance (full, 11b):** the tag population drops
 to 0 and the binder frame enters the D in-model column.
 
 ### A7 — stage-B deep-leaf growth: the vec_read class (medium)
@@ -360,7 +357,7 @@ Independent of the critical path; pick up in gap sessions:
 | 1 | C — HoistEq discharge + P1 poison mutation/contract | **DONE 07-24** | b73 (closed) | — |
 | 2 | A1 — b70/71 close-out (probe38) | **DONE 07-24** | b70, b71 (closed) | — |
 | 3 | A2 — user-closer wrap-mode mirror (apply_hom) | **DONE 07-24** | b75 (closed) | — |
-| 4 | A6-short — assert-forall census tag | small | new | — |
+| 4 | A6-short — assert-forall census tag | **DONE 07-24** | b76 (closed) | — |
 | 5 | A3 — tactus assert-query variant + arm | small-med | b69 | — (Q1 resolved) |
 | 6 | A5 — Match arm (+ D model delta; batch churn w/ A3) | medium | new | — |
 | 7 | A4 — call-mut arm (+ D model delta) | med-large | new (card first) | — |
