@@ -61,6 +61,11 @@ export LEAN_PATH="$CORE_OUT:$CORE_OUT/pkg:$PRELUDE"
 # ret_typ) — in the Return arm, so the RetBind value renders `self.deref`
 # (leaf 5) and the SST RetLet 4 5 matches the goal's Let 4 5. Removed from the
 # honest-fail set; it must now close-ok.
+# NOTE (endgame A6-short, 2026-07-24): the lemma_runtime_word_view_* fns now
+# census-reject at emission (`assert-forall` tag — skolem binders unmodeled at
+# stage A; detection = production's own collect_assert_by_vars). They emit NO
+# cert and are no longer bridge subjects; if one ever reappears with a cert
+# and no quantifier-binder arm, it lands UNCLASSIFIED and fails this runner.
 # NOTE (endgame A2, 2026-07-24): apply_hom_gen/inv are now expected-CLOSE.
 # The b74-sweep honest-fail was the CLOSER GATE, not arg-temp LetRaw: these
 # fns carry user tactus_tactic closers, and production's emit_leaf_theorem
@@ -71,7 +76,6 @@ export LEAN_PATH="$CORE_OUT:$CORE_OUT/pkg:$PRELUDE"
 # cert_call_leaves (no double Ref.mk on earlier call-dest args).
 honest_fail_reason() {
   case "$1" in
-    runtime__lemma_runtime_word_view_append|runtime__lemma_runtime_word_view_subrange) printf '%s' 'assert-forall quantifier binders unmodeled (bootstrap-74 slice 2 sweep, 2026-07-21): the fn asserts `forall |k: int| …` — production emits the skolem binder `∀ (k : Int)` in the goal telescope; stage A has no quantifier-binder arm, so the serializer instead emits the lowering bool temp as a residue let + a poisoned Assume and wraps. SHOULD be a loud census rejection (assert-forall tag), not a non-bridging cert — census-gap follow-up.' ;;
     *) printf '%s' '' ;;
   esac
 }

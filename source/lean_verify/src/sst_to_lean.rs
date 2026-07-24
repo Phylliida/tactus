@@ -6723,6 +6723,19 @@ fn collect_assert_by_vars<'a>(
     stm: &Stm,
     ctx: &WpCtx<'a>,
 ) -> Vec<(&'a VarIdent, &'a Typ)> {
+    collect_assert_by_vars_in(stm, &ctx.assert_by_var_typs)
+}
+
+// Split out (endgame A6-short) so the cert serializer can run the SAME
+// detection from its own `LocalDeclKind::AssertByVar` map — a DeadEnd
+// scope referencing skolems means production ∀-binds them in the goal
+// telescope, which stage A has no quantifier-binder arm for; the
+// serializer census-rejects loud (`assert-forall`) instead of emitting
+// a cert that cannot bridge.
+pub(crate) fn collect_assert_by_vars_in<'a>(
+    stm: &Stm,
+    assert_by_var_typs: &HashMap<&'a VarIdent, &'a Typ>,
+) -> Vec<(&'a VarIdent, &'a Typ)> {
     use vir::sst::ExpX as X;
     let mut used: std::collections::HashSet<VarIdent> = std::collections::HashSet::new();
     let _ = vir::sst_visitor::map_exps_in_stm_visitor(stm, &mut |e: &Exp| {
@@ -6737,7 +6750,7 @@ fn collect_assert_by_vars<'a>(
         });
         e.clone()
     });
-    let mut out: Vec<(&'a VarIdent, &'a Typ)> = ctx.assert_by_var_typs.iter()
+    let mut out: Vec<(&'a VarIdent, &'a Typ)> = assert_by_var_typs.iter()
         .filter(|(v, _)| used.contains(**v))
         .map(|(v, t)| (*v, *t))
         .collect();
