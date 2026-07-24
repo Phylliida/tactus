@@ -5,10 +5,7 @@
 discharge 172/0; probe9 all-green (head_exec CLOSES via IfCtor);
 probe11 all-classified (find_cancellation = the vec_read/A7 stage-B
 class); `assert-query-tactus` census tag retired; probes 13/14/37/38 +
-units green. ⚠ FIRST STANDALONE TASK (nothing else heavy in parallel — it OOM'd
-under session load): the full tgt gate with the BOOTSTRAP binary
-(recipe + the word_numbering observation on the b77 card §Follow-ups).
-Remaining endgame order: **b77 follow-up mutation kills FIRST
+units green. Remaining endgame order: **b77 follow-up mutation kills FIRST
 (next-session warm-up: probe13 `ifctor_eq_drop`/`ifctor_arm_swap`/
 `aqt_hyp_drop` classes — concrete recipe on the b77 card §Follow-ups,
 incl. the bracket-aware splitter) → A4 (call-mut, card first) →

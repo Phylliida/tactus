@@ -125,21 +125,15 @@ bootstrap_coverage in-model column.
 
 ## Follow-ups (small, tracked — not blockers)
 
-* **FULL tgt gate with the bootstrap binary — DEFERRED (Danielle's
-  call: the run OOM'd the machine under session load; run it
-  STANDALONE, nothing else heavy, later).** Purpose: the wf-sig
-  Dt-precedence change affects Link discharge on any package-mode
-  crate, and tgt is an unvalidated corpus for it. Command (cold out
-  tree, from the worktree root):
-  `TACTUS_LEAN_OUT=<fresh dir> ./source/target-verus/release/verus
-  --lean-backend --crate-type=lib -V cache
-  ../tactus-group-theory/src/lib.rs`.
-  OBSERVATION from the killed partial run: the
-  `TactusDefs_lib_exec__word_numbering` defs module failed
-  ("simp_all made no progress" ×4 in a decreasing_by) BEFORE the OOM —
-  unattributed (defs emission is untouched by b77; the bootstrap
-  binary's last full tgt run predates several main-side fixes).
-  Check whether it also fails at `8e7696d` during the standalone run.
+* **FULL tgt gate with the bootstrap binary — DROPPED (Danielle's
+  call, 2026-07-24: not needed, ever — tgt's real gate runs with the
+  MAIN binary via its check.sh, and the wf-sig change gets its tgt
+  exposure at the next bootstrap→main sync anyway; the attempted run
+  also OOM'd the machine under session load).** For the record from
+  the killed partial run: `TactusDefs_lib_exec__word_numbering` failed
+  ("simp_all made no progress" ×4 in a decreasing_by) before the OOM —
+  unattributed, defs emission untouched by b77; only relevant if a
+  future sync surfaces the same signature.
 * **Review-round fixes LANDED (2026-07-24 late-late):** N2 shared
   detector named as the SECOND trusted predicate in the serializer
   header contract (reference-side derivation rides A7; cross-check
