@@ -55,7 +55,10 @@ proof-block kind (`cond = None`) emits nothing structural: the tactic
 goes onto `e.tactic_prefix`, composed into closers AFTER the hoist
 decision — per-obligation shape unaffected.
 
-**E4 — but the proof block flips the FN-LEVEL gate.** A2's
+**E4 — but the proof block flips the FN-LEVEL gate.** *(AMENDED by the
+Progress triage: the fn-level DFS gates the RETURN ROUTE only — per-goal
+hoisting follows the ATTR alone; "all 5 fns are wrap-mode" below is the
+pre-correction framing. See Progress item 1 and the two-bit split.)* A2's
 `closer_is_default(fn)` DFS counts proof-block prefixes: a fn containing
 `proof { tac }` routes Return via the LEGACY `Done(let ret := e; …)`
 path (no fork, goal wraps — is_inverse_pair_exec's observed single
@@ -122,13 +125,54 @@ bootstrap_coverage in-model column.
 
 ## Follow-ups (small, tracked — not blockers)
 
-* **Mutation-kill classes for the NEW arms** (acceptance item, deferred
-  with reasons): probe13 classes for IfCtor (drop the ctor-eq / swap
-  arms) and AssertQueryTactus (drop the forward hyp). The A5-restored
-  deref class already exercises the fork's per-arm goals; these add the
-  arm-specific channels. Regex-mutation over the nested IfCtor term
-  needs a bracket-aware helper in gen.py — mechanical, fresh-session
-  sized.
+* **FULL tgt gate with the bootstrap binary — DEFERRED (Danielle's
+  call: the run OOM'd the machine under session load; run it
+  STANDALONE, nothing else heavy, later).** Purpose: the wf-sig
+  Dt-precedence change affects Link discharge on any package-mode
+  crate, and tgt is an unvalidated corpus for it. Command (cold out
+  tree, from the worktree root):
+  `TACTUS_LEAN_OUT=<fresh dir> ./source/target-verus/release/verus
+  --lean-backend --crate-type=lib -V cache
+  ../tactus-group-theory/src/lib.rs`.
+  OBSERVATION from the killed partial run: the
+  `TactusDefs_lib_exec__word_numbering` defs module failed
+  ("simp_all made no progress" ×4 in a decreasing_by) BEFORE the OOM —
+  unattributed (defs emission is untouched by b77; the bootstrap
+  binary's last full tgt run predates several main-side fixes).
+  Check whether it also fails at `8e7696d` during the standalone run.
+* **Review-round fixes LANDED (2026-07-24 late-late):** N2 shared
+  detector named as the SECOND trusted predicate in the serializer
+  header contract (reference-side derivation rides A7; cross-check
+  pin rides the mutation kills); `closer_default` doc in tactus-core
+  AMENDED to attr-only (+ E4 amendment marker above); step-0 fork
+  probe VENDORED as `probe-w0/probe39_b77_fork_gate/`; the
+  `default_route` gate simplified to production's exact two
+  conditions after PROVING the lname coupling (both map off the same
+  `post_condition.dest` Option) — probe9 re-pinned all-green on the
+  rebuilt binary.
+
+* **Mutation-kill classes for the NEW arms — NEXT SESSION'S WARM-UP**
+  (acceptance item, explicitly deferred; also queued in NEXT.md).
+  Concrete plan for probe13 `gen.py`:
+  1. Add a bracket-aware term splitter (`take_sexpr(s, i)` — scan from
+     an offset, balance parens, return the span) so a ctor's
+     positional args are addressable without regex fragility.
+  2. `ifctor_eq_drop` (head_exec, sst-side): locate
+     `lib.StmData.IfCtor`, take_sexpr the pos_binders group, then
+     rewrite the following `eq_prop` scalar to the interned `True`
+     leaf id — the ctor-equation hyp text diverges → bridge must flip
+     1→0.
+  3. `ifctor_arm_swap` (head_exec, sst-side): take_sexpr the two
+     trailing `(Tactus.Box.mk …)` groups (thn/els) and swap them —
+     per-arm goals emit in the wrong order → flip.
+  4. `aqt_hyp_drop` (assert_by_default, sst-side): locate
+     `lib.StmData.AssertQueryTactus`, rewrite its bare-hyp scalar
+     (2nd-from-last arg) to 0 — the continuation goals lose the
+     AssertFact hyp → flip.
+  Each keeps the standard baseline `= 1` + kill `= 0` pair. ALSO wire
+  the N2-detector cross-check here (the header-contract's second
+  trusted predicate): the arm-structure kills pin the assembled
+  frames while the detector remains shared.
 * **R4 resolved by construction**: with honest classification the
   FLetH eq/name leaves in wrap-mode certs are load-bearing SST data
   (not unused interned noise) — no tidy needed; noted for the record.

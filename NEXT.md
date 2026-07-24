@@ -5,11 +5,19 @@
 discharge 172/0; probe9 all-green (head_exec CLOSES via IfCtor);
 probe11 all-classified (find_cancellation = the vec_read/A7 stage-B
 class); `assert-query-tactus` census tag retired; probes 13/14/37/38 +
-units green. Remaining endgame order: **A4 (call-mut, card first) →
+units green. ⚠ FIRST STANDALONE TASK (nothing else heavy in parallel — it OOM'd
+under session load): the full tgt gate with the BOOTSTRAP binary
+(recipe + the word_numbering observation on the b77 card §Follow-ups).
+Remaining endgame order: **b77 follow-up mutation kills FIRST
+(next-session warm-up: probe13 `ifctor_eq_drop`/`ifctor_arm_swap`/
+`aqt_hyp_drop` classes — concrete recipe on the b77 card §Follow-ups,
+incl. the bracket-aware splitter) → A4 (call-mut, card first) →
 A7 (stage-B callee-signature vocab — closes vec_read AND
-find_cancellation) → D tripwire done (in-model column landed) → B
-(b67 caching + b68 flip)**. b77 card carries small follow-ups
-(IfCtor/AQT mutation classes, statement-If N2 residue).
+find_cancellation) → B (b67 caching + b68 flip)**. D's in-model
+tripwire column landed with b77. NOTE the serializer header now names
+a SECOND trusted predicate (the shared N2 IsVariant detector) —
+reference-side derivation rides with A7, cross-check pin rides with
+the mutation kills.
 
 **The ordered map of everything remaining is now
 `DESIGN-bootstrap-endgame.md`** (milestones A–F + policy points P1–P4,
