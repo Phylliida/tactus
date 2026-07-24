@@ -1,6 +1,6 @@
 ---
 title: "Link discharge — premise-free closed theorems per proof fn (spec: DESIGN-link-discharge.md)"
-status: in_progress
+status: done
 claimed_by: fable-b73
 created: 2026-07-16T23:30:00Z
 updated: 2026-07-18T14:00:00Z
@@ -344,3 +344,46 @@ Danielle (naming / default-on / theorem-vs-def).
   `tmp___0_reqs` → Call's field index); (2) fix-arm patterns always
   name binders (`_pb{i}`, never bare `_`) — field binders must be
   instantiable terms.
+
+- (2026-07-24, fable-endgame-C) **DISCHARGE 150/0 — THE Q1 RESIDUAL IS
+  CLOSED.** Endgame milestone C (`DESIGN-bootstrap-endgame.md` §2): the
+  144/6 pending residual is gone. The 6 split into TWO classes, both
+  now composed by `link_discharge.rs`:
+  - **HoistEq (4 fns: closure_deadend_isolates, prophecy_sound,
+    prophecy_swapped_sound, seq_assume_gates):** the N1 hoisted-let
+    pair (`∀ (x : T) (_h_x_hoist1 : x = v)`) parses from the sidecar's
+    all+p form (`Node::HoistEq`; RHS recovered from the `ty` text —
+    malformed strips stay `Other`, loud). Composition: `leading_alls`
+    trims hoist value-binders from the lead run (they are NOT params);
+    `replay_lets` replays `let x := v;` unconditionally in spine
+    order; app_args instantiates the ∀ with the let name and closes
+    the equation premise with `rfl` (zeta-defeq). Guard: a hoisted
+    binder referenced in a postcondition leaf pends precisely (the
+    closed statement would be ill-formed).
+  - **Req (2 fns: wp_sound_bites_assert, wp_sound_bites_loop_init):**
+    the fn's own `requires` (`p:"requires"` named hyp) is carried as a
+    hypothesis binder of the closed theorem (mirrors hwf_*) and fed
+    back positionally — it is the fn's contract, not a woven premise.
+    Guard: a CALL to a requires-carrying callee pends loudly
+    ("call-site discharge unsupported" — no such site exists; the
+    recorded args cannot feed the extra binder).
+  - Both validated: 6 unit pins (`tests/link_discharge.rs`, incl.
+    malformed-hoist and leaf-reference negative pins), lean_verify
+    406/0, tactus-core gate 231/0 + package gate green + **Link
+    discharge 150/0** (12 fix + 15 straight-line + 123 zero-spine).
+  - Bundled P1 items (same session, endgame policy): serializer
+    faithfulness contract now names the poison mark as a trusted
+    semantic predicate (sst_serialize.rs header ¶); probe13 gained the
+    `poison_flip` kill class — zeroing ALL emitted poison marks flips
+    the bridge 1→0. TWO live finds from its first run: (a) a
+    SINGLE-bit flip is masked by the duplicated Assert+Assume hyp pair
+    (FINDINGS §3) — the honest channel-kill zeroes all marks; (b)
+    probe13/14 had been stale-red since the prelude split (pinned
+    pre-split `prelude-e81f…` dir lacks the collapsed bare
+    `TactusDefs`) and since b74 (head_exec baseline) — repaired with
+    the probe9 all-preludes glob; the deref class is PARKED as an
+    expected-divergent `=0` tripwire that fires when the A5 match arm
+    lands.
+  - Drive-by: tactus-core/lib.rs canonical-check header updated
+    (`--lean-all-proofs` is gone since e5f7aea — proof fns always
+    route under `--lean-backend`).

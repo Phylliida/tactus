@@ -4,7 +4,10 @@
 `DESIGN-bootstrap-endgame.md`** (milestones A–F + policy points P1–P4,
 agreed with Danielle 2026-07-24). The single source of per-brick detail
 is still the board (`board/*.md`); this file's sections below remain as
-the pre-endgame snapshot. Suite state: 551/0 upstream; tactus-core
+the pre-endgame snapshot. **Milestone C DONE 2026-07-24: Link discharge
+150/0** (HoistEq + Req composer arms, b73 closed) **+ P1 poison
+contract/mutation** (probe13 `poison_flip`, probes de-staled). Suite
+551/0, gate 231/0. Next: A1 (b70/71 close-out), A2, A6-short. Suite state: 551/0 upstream; tactus-core
 gate 231/0 + Link discharge 144/6 (the 6 = pre-existing other-hyp/HoistEq
 residual; mode flags are part of the verification-cache key, `16d301c`).
 

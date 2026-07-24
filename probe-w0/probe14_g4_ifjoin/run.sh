@@ -18,7 +18,10 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 CORE_OUT="$ROOT/tactus-core/out/lib"
-PRELUDE="${TACTUS_PRELUDE:-$HOME/.cache/tactus/prelude-e81fbf9a86375c12}"
+# All prelude caches (probe9-style glob — a pinned pre-prelude-split dir
+# lacks the collapsed bare TactusDefs and fails module resolution).
+PRELUDES="$(ls -d "$HOME"/.cache/tactus/prelude-* 2>/dev/null | tr '\n' ':')"
+PRELUDE="${TACTUS_PRELUDE:-${PRELUDES%:}}"
 LEAN_BIN="${LEAN:-$(command -v lean)}"
 SRC="$HERE/probe14_g4_ifjoin.lean"
 

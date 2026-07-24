@@ -32,6 +32,21 @@
 //! the SST literal independently, and the `decide` equality validates the
 //! claim — a mismark fails the bridge, never silent-passes.
 //!
+//! One qualification to that claim (endgame policy P1,
+//! `DESIGN-bootstrap-endgame.md` §1): the N1 wrap-gate POISON MARK is
+//! not a transcription but a semantic predicate computed *here*
+//! ([`Serializer::hyp_poison`] — "does this prop mention an in-scope
+//! residue name"), mirroring `hoist_all`'s `lexpr_mentions_var` bail
+//! check. The model reads the mark; it cannot recompute it while
+//! stage-A leaves are opaque ids. A lone wrong mark diverges refWp from
+//! production and fails the bridge loudly — but a CORRELATED bug in
+//! both mentions-checks is a common-mode channel (the bootstrap-48/B1
+//! class) that this contract explicitly carries as trusted until A7,
+//! when deep `ExprData` leaves let refWp derive the mark
+//! reference-side and this serializer's copy demotes to a cross-check.
+//! Pinned live by the poison-flip mutation (probe13 `mut_poison`
+//! class): flipping the emitted poison bit must flip the bridge 1→0.
+//!
 //! # Snapshot point (faithfulness anchor #1)
 //!
 //! [`emit_cert`] is called at the inputs of

@@ -2,7 +2,7 @@
 # W6e expression-level mutation-kill runner (bootstrap-24).
 #
 # Regenerates ExprMutations.lean from the LIVE fixture certs, then elaborates it.
-# The file asserts, all by `decide`, for each of four coercion-drop classes
+# The file asserts, all by `decide`, for four coercion/poison mutation classes
 # (cast / deref / field / HasType-width, one per fixture fn):
 #   * baseline   goals_eq (ref_wp ctx sst) goals     = 1   (deep bridge closes)
 #   * kill       goals_eq (ref_wp ctx sst) goals_mut = 0   (single GOAL-side
@@ -22,7 +22,10 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 CORE_OUT="$ROOT/tactus-core/out/lib"
-PRELUDE="${TACTUS_PRELUDE:-$HOME/.cache/tactus/prelude-e81fbf9a86375c12}"
+# All prelude caches (slim-prelude work mints new hashes; the collapsed
+# bare TactusDefs ships inside the prelude — glob them all, probe9-style).
+PRELUDES="$(ls -d "$HOME"/.cache/tactus/prelude-* 2>/dev/null | tr '\n' ':')"
+PRELUDE="${TACTUS_PRELUDE:-${PRELUDES%:}}"
 LEAN_BIN="${LEAN:-$(command -v lean)}"
 export LEAN_PATH="$CORE_OUT:$PRELUDE"
 
@@ -37,8 +40,8 @@ t0=$(date +%s%N)
 t1=$(date +%s%N)
 echo "elapsed: $(( (t1 - t0) / 1000000 ))ms   lean exit=$rc"
 if [ $rc -eq 0 ]; then
-  echo "EXPR MUTATION-KILL PASS ✓  (4 deep baselines close; all 4 coercion-drops provably flip 1->0)"
+  echo "EXPR MUTATION-KILL PASS ✓  (4 baselines close + kills flip 1->0 [incl. P1 poison-channel]; deref class parked-divergent until A5)"
 else
-  echo "EXPR MUTATION-KILL FAIL ✗  (a coercion drop did NOT flip, or a baseline broke — see errors above)"
+  echo "EXPR MUTATION-KILL FAIL ✗  (a mutation did NOT flip, a baseline broke, or the parked A5 tripwire fired — see errors above)"
 fi
 exit $rc
