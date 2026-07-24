@@ -174,7 +174,11 @@ def poison_drop(sst):
 #   restored to expect="close" with its kill. Never a silent cap (P2).
 CLASSES = [
     ("sum_to",     "cast_drop",   "drop an Int.toNat nat-coercion (cast class)",      drop_first_cast, "goals", "close"),
-    ("head_exec",  "deref_drop",  "drop the .deref auto-coercion (G2)",               drop_deref,      "goals", "divergent-parked"),
+    # RESTORED (bootstrap-77): the A5 IfCtor fork landed and head_exec
+    # CLOSES — the parked tripwire fired as designed; the class is back
+    # to close+kill (the .deref drop now exercises the fork's per-arm
+    # goal leaves).
+    ("head_exec",  "deref_drop",  "drop the .deref auto-coercion (G2)",               drop_deref,      "goals", "close"),
     ("mk_point",   "wrong_field", "emit a wrong struct field accessor (G3)",          wrong_field,     "goals", "close"),
     ("add_capped", "wrong_width", "wrong HasType overflow bound width 2^64->2^32 (G6)", wrong_width,   "goals", "close"),
     ("add_capped", "poison_flip", "zero ALL wrap-gate poison marks (P1 trusted-predicate channel)", poison_drop, "sst", "close"),

@@ -76,6 +76,7 @@ export LEAN_PATH="$CORE_OUT:$CORE_OUT/pkg:$PRELUDE"
 # cert_call_leaves (no double Ref.mk on earlier call-dest args).
 honest_fail_reason() {
   case "$1" in
+    runtime__find_cancellation_exec) printf '%s' 'stage-B reference-renderer coercion derivation (bootstrap-77, 2026-07-24): the vec_read class, newly VISIBLE because the fn finally serializes (its assert-query-tactus census tag retired). Stage-A assembly matches (goal count 21 = production; spines align); the per-goal divergence is deep-leaf ONLY — the reference render_exp derives `App idx (FieldProj (Atom v) deref)` where production writes `App idx (Atom v)` (View.view call arg on the &Vec param — per-arg spec-call coercions need the callee signature the fixed-vocabulary mirror does not carry). Same class and same fix as probe9 vec_read: endgame A7 (stage-B callee-signature vocabulary).' ;;
     *) printf '%s' '' ;;
   esac
 }
