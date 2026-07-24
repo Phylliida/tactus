@@ -1,7 +1,9 @@
 # DESIGN — bootstrap endgame: from rung 5 to the full claim
 
 **Date:** 2026-07-24. **Status:** agreed plan (policy points P1–P4 confirmed
-by Danielle 2026-07-24; b69 mirror shape still her call — §9).
+by Danielle 2026-07-24; Q1–Q4 resolved same day under her delegated
+guidance — "verify as much as possible, the right way, no hacks or
+half-way measures" — resolutions in §9).
 **Position:** rungs 1–5 of the claim ladder (`VERIFICATION-PATH.md` §4) are
 held. W5/W6/W7 boards are closed. What remains is rung 6: making the
 certificate **default, corpus-wide, and census-honest**. The hard theoretical
@@ -65,10 +67,12 @@ Mitigations, in order:
 2. **Now:** add the poison mark to the serializer faithfulness-contract
    doc comment (`sst_serialize.rs` header) — it is a semantic predicate
    mirrored in Rust, not a transcription, and the contract must say so.
-3. **End-state (lands with E, or with A7 if the vocabulary is ready
-   sooner):** once leaves are deep `ExprData`, recompute "mentions"
-   reference-side and *derive* the poison mark instead of trusting it.
-   The serializer's copy becomes a cross-check, then retires.
+3. **At A7 (decided — §9 Q3):** once leaves are deep `ExprData`,
+   recompute "mentions" reference-side and *derive* the poison mark
+   instead of trusting it; the serializer's copy becomes a cross-check,
+   then retires. This lands with A7's vocabulary work, not deferred to
+   E — a trusted bit should not outlive the first milestone able to
+   check it.
 
 ### P2 — honest-fail classes need a policy before the W4 flip
 
@@ -166,17 +170,25 @@ dropped). **Acceptance:** apply_hom_gen/apply_hom_inv bridge-close on
 probe11. **Card:** new, `bootstrap-75` (or fold into the b70/71 close if
 the diff is small).
 
-### A3 — b69: Tactus-mode assert-query (small arm after Danielle's call)
+### A3 — b69: Tactus-mode assert-query (small-medium; decided — §9 Q1)
 
 Production renders the 4 remaining tgt assert-query fns inline
-(`have h : P := by <tactic>` — no separate goal, P enters as hyp), so the
-stage-A mirror looks Assume-like. **Decision needed (§9 Q1):**
-Assume-with-provenance-mark vs a dedicated `StmData` variant.
-Recommendation on record: Assume-with-mark — honest about the actual goal
-shape, and a dedicated variant would carry payload the wrap gate never
-reads. Then a small serializer arm. **Acceptance:** the 4 fns serialize
-and bridge (or classify per the decision); `assert-query-tactus` census
-tag drops to 0. **Card:** `bootstrap-69` (in_progress).
+(`have h : P := by <tactic>` — no separate goal, P enters as hyp).
+**Decided: dedicated `StmData::AssertQueryTactus` variant** (Q1), not
+Assume-with-mark. Rationale: `AssertQueryNl` is already a first-class
+variant — modeling one assert-query mode as a constructor and the other
+as a marked Assume is an asymmetric half-measure; and the trust story is
+cleaner as data — the P is *proven inline* (kernel-checked at
+elaboration), not assumed, so the mirror should say so structurally
+rather than via a side-channel bit that only census reads. Shape: wp
+semantics = the Assume arm (P enters the continuation's hyp frame, no
+separate goal); own W5 soundness arm delegating to the Assume argument;
+census/trust reporting counts it as proven-inline, never as an assume
+(it must not trip assume-warnings). One cache-churning tactus-core edit
+(batch with A5's `StmData::Match` if timing aligns — one churn, not
+two). **Acceptance:** the 4 fns serialize and bridge;
+`assert-query-tactus` census tag drops to 0; the in-model column (D)
+gains the variant. **Card:** `bootstrap-69` (in_progress).
 
 ### A4 — call-mut arm: prophecy/rebind in the frame mirror (medium-large)
 
@@ -199,15 +211,20 @@ Same step-0-evidence-first discipline. **Acceptance:** head_exec closes;
 probe9 20/20 minus only stage-B classes. **Card:** new, from the b74
 residue note ("Card separately").
 
-### A6 — assert-forall: census rejection now, binder arm later (small / medium)
+### A6 — assert-forall: census rejection now, binder arm planned (small, then medium)
 
 Short form (pre-flip, required by P2): serializer detects skolem binders
 and rejects loud with an `assert-forall` tag — today these emit
-non-bridging certs, the worst of both worlds. Real fix (post-flip,
-optional): a quantifier binder in the stage-A telescope (`∀ (k : Int)`
-frames). The tag suffices for b68. **Acceptance (short):** the two
+non-bridging certs, the worst of both worlds. Real fix (**planned
+post-flip work, not optional — §9 Q4**): a quantifier binder in the
+stage-A telescope (`∀ (k : Int)` frames), so these lemmas join the
+certificate. The tag is a bridge-era stopgap only; under the
+verify-as-much-as-possible policy no census tag is intended to be
+permanent unless the construct is genuinely outside the frontend subset.
+The tag suffices for b68. **Acceptance (short):** the two
 lemma_runtime_word_view fns census-reject with the tag; no non-bridging
-certs emitted anywhere.
+certs emitted anywhere. **Acceptance (full):** the tag population drops
+to 0 and the binder frame enters the D in-model column.
 
 ### A7 — stage-B deep-leaf growth: the vec_read class (medium)
 
@@ -323,14 +340,15 @@ Independent of the critical path; pick up in gap sessions:
 | 2 | A1 — b70/71 close-out | small | b70, b71 | — |
 | 3 | A2 — apply_hom call-arg temps + auto-ref | small-med | new (b75) | — |
 | 4 | A6-short — assert-forall census tag | small | new | — |
-| 5 | A3 — tactus assert-query arm | small | b69 | **Q1 (Danielle)** |
-| 6 | A5 — Match arm (+ D model delta) | medium | new | — |
+| 5 | A3 — tactus assert-query variant + arm | small-med | b69 | — (Q1 resolved) |
+| 6 | A5 — Match arm (+ D model delta; batch churn w/ A3) | medium | new | — |
 | 7 | A4 — call-mut arm (+ D model delta) | med-large | new (card first) | — |
 | 8 | A7 — stage-B callee-signature vocabulary | medium | new | — |
 | 9 | D — in-model tripwire column | small | new | — |
 | 10 | B1 — b67 caching + fingerprint + costs | medium | b67 | — |
 | 11 | B2 — b68 default flip | small | b68 | P2, P3, 1–8, 10 |
-| 12 | E — W8 authority flip (+ P1 item 3) | small-med | b13 | B soak (Q2) |
+| 11b | A6-full — ∀-binder telescope arm (kills the tag) | medium | new | post-flip (Q4) |
+| 12 | E — W8 authority flip | small-med | b13 | B soak (Q2) |
 | 13 | F — hygiene / vstd / differential | small ×3 | new ×3 | — |
 
 Items 2–4 are independent of each other and of 1; parallelize freely.
@@ -338,17 +356,29 @@ Items 2–4 are independent of each other and of 1; parallelize freely.
 
 ---
 
-## 9. Open questions
+## 9. Open questions — all resolved 2026-07-24
 
-- **Q1 (blocks A3, Danielle):** tactus-mode assert-query mirror shape —
-  Assume-with-provenance-mark (recommended) vs dedicated `StmData`
-  variant.
-- **Q2 (blocks E start, Danielle):** the B-soak criterion — the §6
-  two-week proposal, or a different bar.
-- **Q3 (A7 vs E):** where the reference-side mentions-check / poison
-  derivation lands. Default: whichever of A7/E arrives first with the
-  vocabulary to express it; not a flip-blocker either way.
-- **Q4 (A6):** is the real ∀-binder arm ever needed, or does the census
-  tag stay permanent for assert-forall lemmas? (They verify fine via the
-  normal path; the tag only excludes them from the *certificate*.)
-  Revisit after b68 with the tag-population numbers.
+Danielle delegated these to Claude's judgment with the standing
+guidance: *verify as much as possible; do things the right way; no
+hacks or half-way measures.* Resolutions under that principle:
+
+- **Q1 (A3) — RESOLVED: dedicated `StmData::AssertQueryTactus`
+  variant.** This reverses the earlier Assume-with-mark recommendation.
+  `AssertQueryNl` is already a first-class variant, so mode symmetry
+  alone argues for it; more importantly the construct's trust status
+  (proven inline, not assumed) should be structural in the mirror data,
+  not a side-channel bit. The extra cost is one small soundness arm and
+  a cache-churning edit that batches with A5's Match variant.
+- **Q2 (E) — RESOLVED: adopt the §6 soak criterion** — bridge
+  default-on across the full corpus (tgt + suite + tutorial) for two
+  consecutive weeks of active development with zero unclassified drift
+  errors, then E may start.
+- **Q3 (P1 item 3) — RESOLVED: the poison derivation lands with A7**,
+  the first milestone whose vocabulary can express the reference-side
+  mentions-check. A trusted bit should not outlive the first point it
+  can be checked. Not a flip-blocker (the P1 mutation test covers the
+  bridge era).
+- **Q4 (A6) — RESOLVED: the ∀-binder arm is planned post-flip work,
+  not optional.** No census tag is intended as permanent unless the
+  construct is genuinely outside the frontend subset; assert-forall is
+  not. The tag is scaffolding for b68 sequencing only.
