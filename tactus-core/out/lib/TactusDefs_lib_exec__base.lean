@@ -339,6 +339,7 @@ inductive lib.FrameList where
   | FLet (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
   | FLetH (val0 : Int) (val1 : Int) (val2 : Int) (val3 : Int) (val4 : Int) (val5 : Tactus.Box lib.FrameList)
   | FLetR (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
+  | FUserCloser (val0 : Tactus.Box lib.FrameList)
   deriving Inhabited
 @[simp] noncomputable def lib.FrameList.isFNil (x : lib.FrameList) : Prop :=
   match x with | lib.FrameList.FNil => True | _ => False
@@ -352,6 +353,8 @@ inductive lib.FrameList where
   match x with | lib.FrameList.FLetH _ _ _ _ _ _ => True | _ => False
 @[simp] noncomputable def lib.FrameList.isFLetR (x : lib.FrameList) : Prop :=
   match x with | lib.FrameList.FLetR _ _ _ => True | _ => False
+@[simp] noncomputable def lib.FrameList.isFUserCloser (x : lib.FrameList) : Prop :=
+  match x with | lib.FrameList.FUserCloser _ => True | _ => False
 @[simp] noncomputable def lib.FrameList.FBind_val0 (x : lib.FrameList) : Int :=
   match x with | lib.FrameList.FBind val0 _ _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.FrameList.FBind_val1 (x : lib.FrameList) : Int :=
@@ -390,10 +393,12 @@ inductive lib.FrameList where
   match x with | lib.FrameList.FLetR _ val1 _ => val1 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.FrameList.FLetR_val2 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
   match x with | lib.FrameList.FLetR _ _ val2 => val2 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FUserCloser_val0 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
+  match x with | lib.FrameList.FUserCloser val0 => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.FrameList.height (s : lib.FrameList) : Nat :=
-  match s with | lib.FrameList.FNil => 1 | lib.FrameList.FBind _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FHyp _ _ _ val3 => 1 + lib.FrameList.height val3.deref | lib.FrameList.FLet _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FLetH _ _ _ _ _ val5 => 1 + lib.FrameList.height val5.deref | lib.FrameList.FLetR _ _ val2 => 1 + lib.FrameList.height val2.deref
+  match s with | lib.FrameList.FNil => 1 | lib.FrameList.FBind _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FHyp _ _ _ val3 => 1 + lib.FrameList.height val3.deref | lib.FrameList.FLet _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FLetH _ _ _ _ _ val5 => 1 + lib.FrameList.height val5.deref | lib.FrameList.FLetR _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FUserCloser val0 => 1 + lib.FrameList.height val0.deref
 termination_by sizeOf s
-decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.FrameList.FNil.sizeOf_spec, lib.FrameList.FBind.sizeOf_spec, lib.FrameList.FHyp.sizeOf_spec, lib.FrameList.FLet.sizeOf_spec, lib.FrameList.FLetH.sizeOf_spec, lib.FrameList.FLetR.sizeOf_spec]; omega)
+decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.FrameList.FNil.sizeOf_spec, lib.FrameList.FBind.sizeOf_spec, lib.FrameList.FHyp.sizeOf_spec, lib.FrameList.FLet.sizeOf_spec, lib.FrameList.FLetH.sizeOf_spec, lib.FrameList.FLetR.sizeOf_spec, lib.FrameList.FUserCloser.sizeOf_spec]; omega)
 inductive lib.StmData where
   | Assert (val0 : lib.RawExp) (val1 : Int) (val2 : Int) (val3 : Int)
   | Assume (val0 : Int) (val1 : Int) (val2 : Int)
@@ -406,6 +411,8 @@ inductive lib.StmData where
   | If (val0 : Int) (val1 : Int) (val2 : Int) (val3 : Int) (val4 : Int) (val5 : Tactus.Box lib.StmData) (val6 : Tactus.Box lib.StmData)
   | Loop (inv_hyps : Tactus.Box lib.BinderList) (inv_obligs : Tactus.Box lib.RawExpList) (inv_obligs_exit : Tactus.Box lib.RawExpList) (binders : Tactus.Box lib.BinderList) (binder_bounds : Tactus.Box lib.ParamBoundList) (cond_name : Int) (cond_ann : Int) (neg_cond_ann : Int) (cond_poison : Int) (d_old_name : Int) (d_old_ty : Int) (d_old_val : Int) (d_old_eq_name : Int) (d_old_eq_prop : Int) (decrease_oblig : lib.RawExp) (body : Tactus.Box lib.StmData)
   | AssertQueryNl (val0 : Tactus.Box lib.StmData) (val1 : lib.RawExp)
+  | AssertQueryTactus (val0 : lib.RawExp) (val1 : Int) (val2 : Int) (val3 : Int)
+  | IfCtor (pos_binders : Tactus.Box lib.BinderList) (eq_name : Int) (eq_prop : Int) (eq_poison : Int) (neg_name : Int) (neg_prop : Int) (neg_poison : Int) (thn : Tactus.Box lib.StmData) (els : Tactus.Box lib.StmData)
   | Skip
   | Seq (val0 : Tactus.Box lib.StmData) (val1 : Tactus.Box lib.StmData)
   deriving Inhabited
@@ -431,6 +438,10 @@ inductive lib.StmData where
   match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isAssertQueryNl (x : lib.StmData) : Prop :=
   match x with | lib.StmData.AssertQueryNl _ _ => True | _ => False
+@[simp] noncomputable def lib.StmData.isAssertQueryTactus (x : lib.StmData) : Prop :=
+  match x with | lib.StmData.AssertQueryTactus _ _ _ _ => True | _ => False
+@[simp] noncomputable def lib.StmData.isIfCtor (x : lib.StmData) : Prop :=
+  match x with | lib.StmData.IfCtor _ _ _ _ _ _ _ _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isSkip (x : lib.StmData) : Prop :=
   match x with | lib.StmData.Skip => True | _ => False
 @[simp] noncomputable def lib.StmData.isSeq (x : lib.StmData) : Prop :=
@@ -527,14 +538,40 @@ inductive lib.StmData where
   match x with | lib.StmData.AssertQueryNl val0 _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.AssertQueryNl_val1 (x : lib.StmData) : lib.RawExp :=
   match x with | lib.StmData.AssertQueryNl _ val1 => val1 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.AssertQueryTactus_val0 (x : lib.StmData) : lib.RawExp :=
+  match x with | lib.StmData.AssertQueryTactus val0 _ _ _ => val0 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.AssertQueryTactus_val1 (x : lib.StmData) : Int :=
+  match x with | lib.StmData.AssertQueryTactus _ val1 _ _ => val1 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.AssertQueryTactus_val2 (x : lib.StmData) : Int :=
+  match x with | lib.StmData.AssertQueryTactus _ _ val2 _ => val2 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.AssertQueryTactus_val3 (x : lib.StmData) : Int :=
+  match x with | lib.StmData.AssertQueryTactus _ _ _ val3 => val3 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.IfCtor_pos_binders (x : lib.StmData) : Tactus.Box lib.BinderList :=
+  match x with | lib.StmData.IfCtor pos_binders _ _ _ _ _ _ _ _ => pos_binders | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.IfCtor_eq_name (x : lib.StmData) : Int :=
+  match x with | lib.StmData.IfCtor _ eq_name _ _ _ _ _ _ _ => eq_name | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.IfCtor_eq_prop (x : lib.StmData) : Int :=
+  match x with | lib.StmData.IfCtor _ _ eq_prop _ _ _ _ _ _ => eq_prop | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.IfCtor_eq_poison (x : lib.StmData) : Int :=
+  match x with | lib.StmData.IfCtor _ _ _ eq_poison _ _ _ _ _ => eq_poison | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.IfCtor_neg_name (x : lib.StmData) : Int :=
+  match x with | lib.StmData.IfCtor _ _ _ _ neg_name _ _ _ _ => neg_name | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.IfCtor_neg_prop (x : lib.StmData) : Int :=
+  match x with | lib.StmData.IfCtor _ _ _ _ _ neg_prop _ _ _ => neg_prop | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.IfCtor_neg_poison (x : lib.StmData) : Int :=
+  match x with | lib.StmData.IfCtor _ _ _ _ _ _ neg_poison _ _ => neg_poison | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.IfCtor_thn (x : lib.StmData) : Tactus.Box lib.StmData :=
+  match x with | lib.StmData.IfCtor _ _ _ _ _ _ _ thn _ => thn | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.IfCtor_els (x : lib.StmData) : Tactus.Box lib.StmData :=
+  match x with | lib.StmData.IfCtor _ _ _ _ _ _ _ _ els => els | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Seq_val0 (x : lib.StmData) : Tactus.Box lib.StmData :=
   match x with | lib.StmData.Seq val0 _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Seq_val1 (x : lib.StmData) : Tactus.Box lib.StmData :=
   match x with | lib.StmData.Seq _ val1 => val1 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.height (s : lib.StmData) : Nat :=
-  match s with | lib.StmData.Assert _ _ _ _ => 1 | lib.StmData.Assume _ _ _ => 1 | lib.StmData.Assign _ _ => 1 | lib.StmData.AssignH _ _ _ _ _ => 1 | lib.StmData.AssignR _ _ => 1 | lib.StmData.Call _ _ => 1 | lib.StmData.DeadEnd val0 => 1 + lib.StmData.height val0.deref | lib.StmData.Ret _ _ => 1 | lib.StmData.If _ _ _ _ _ val5 val6 => 1 + lib.StmData.height val5.deref + lib.StmData.height val6.deref | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ body => 1 + lib.StmData.height body.deref | lib.StmData.AssertQueryNl val0 _ => 1 + lib.StmData.height val0.deref | lib.StmData.Skip => 1 | lib.StmData.Seq val0 val1 => 1 + lib.StmData.height val0.deref + lib.StmData.height val1.deref
+  match s with | lib.StmData.Assert _ _ _ _ => 1 | lib.StmData.Assume _ _ _ => 1 | lib.StmData.Assign _ _ => 1 | lib.StmData.AssignH _ _ _ _ _ => 1 | lib.StmData.AssignR _ _ => 1 | lib.StmData.Call _ _ => 1 | lib.StmData.DeadEnd val0 => 1 + lib.StmData.height val0.deref | lib.StmData.Ret _ _ => 1 | lib.StmData.If _ _ _ _ _ val5 val6 => 1 + lib.StmData.height val5.deref + lib.StmData.height val6.deref | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ body => 1 + lib.StmData.height body.deref | lib.StmData.AssertQueryNl val0 _ => 1 + lib.StmData.height val0.deref | lib.StmData.AssertQueryTactus _ _ _ _ => 1 | lib.StmData.IfCtor _ _ _ _ _ _ _ thn els => 1 + lib.StmData.height thn.deref + lib.StmData.height els.deref | lib.StmData.Skip => 1 | lib.StmData.Seq val0 val1 => 1 + lib.StmData.height val0.deref + lib.StmData.height val1.deref
 termination_by sizeOf s
-decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.StmData.Assert.sizeOf_spec, lib.StmData.Assume.sizeOf_spec, lib.StmData.Assign.sizeOf_spec, lib.StmData.AssignH.sizeOf_spec, lib.StmData.AssignR.sizeOf_spec, lib.StmData.Call.sizeOf_spec, lib.StmData.DeadEnd.sizeOf_spec, lib.StmData.Ret.sizeOf_spec, lib.StmData.If.sizeOf_spec, lib.StmData.Loop.sizeOf_spec, lib.StmData.AssertQueryNl.sizeOf_spec, lib.StmData.Skip.sizeOf_spec, lib.StmData.Seq.sizeOf_spec]; omega)
+decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.StmData.Assert.sizeOf_spec, lib.StmData.Assume.sizeOf_spec, lib.StmData.Assign.sizeOf_spec, lib.StmData.AssignH.sizeOf_spec, lib.StmData.AssignR.sizeOf_spec, lib.StmData.Call.sizeOf_spec, lib.StmData.DeadEnd.sizeOf_spec, lib.StmData.Ret.sizeOf_spec, lib.StmData.If.sizeOf_spec, lib.StmData.Loop.sizeOf_spec, lib.StmData.AssertQueryNl.sizeOf_spec, lib.StmData.AssertQueryTactus.sizeOf_spec, lib.StmData.IfCtor.sizeOf_spec, lib.StmData.Skip.sizeOf_spec, lib.StmData.Seq.sizeOf_spec]; omega)
 inductive lib.CastKind where
   | IntToNat
   | NatToInt
@@ -843,6 +880,7 @@ structure lib.FnCtxData where
   param_bounds : lib.ParamBoundList
   reqs : lib.BinderList
   enss : lib.LeafList
+  closer_default : Int
   deriving Inhabited
 @[simp] noncomputable def lib.FnCtxData.height (_ : lib.FnCtxData) : Nat :=
   1
