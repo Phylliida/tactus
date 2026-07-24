@@ -52,9 +52,9 @@ const HOIST_SIDECAR: &str = r#"{"fn":"lib__hoist_pin","vcs":[{
     {"k":"all","name":"q","ty":"Int"},
     {"k":"all","name":"h_q_bound","ty":"0 ≤ q ∧ q < 18446744073709551616"},
     {"k":"all","name":"fh","ty":"lib.FrameList"},
-    {"k":"all","name":"_h_fh_hoist1","ty":"fh = lib.FrameList.FHyp 0 q 0 (Tactus.Box.mk lib.FrameList.FNil)","p":"hoist","binder":"fh"},
+    {"k":"all","name":"_h_fh_hoist1","ty":"fh = lib.FrameList.FHyp 0 q 0 (Tactus.Box.mk lib.FrameList.FNil)","p":"hoist","binder":"fh","v":"lib.FrameList.FHyp 0 q 0 (Tactus.Box.mk lib.FrameList.FNil)"},
     {"k":"all","name":"tmp__1","ty":"lib.StmData"},
-    {"k":"all","name":"_h_tmp__1_hoist1","ty":"tmp__1 = lib.StmData.Assume 0 q 0","p":"hoist","binder":"tmp__1"},
+    {"k":"all","name":"_h_tmp__1_hoist1","ty":"tmp__1 = lib.StmData.Assume 0 q 0","p":"hoist","binder":"tmp__1","v":"lib.StmData.Assume 0 q 0"},
     {"k":"all","name":"_tactus_ret_1","ty":"Unit"},
     {"k":"imp","p":"call","callee":"u_wp_assume","self":false,
      "args":[{"text":"fh","tag":"expr"},{"text":"Tactus.Box.mk tmp__1","tag":"expr"}]}
@@ -183,8 +183,9 @@ fn requires_carrying_callee_pends_loudly() {
 
 #[test]
 fn malformed_hoist_stays_other_and_pends() {
-    // ty does not start with "{binder} = " — must NOT silently
-    // misparse; the fn pends with the pre-existing reason.
+    // The writer omits `v` when the hyp is not an eq over the binder
+    // (non-eq shape / unnamed imp form) — must NOT silently misparse;
+    // the fn pends with the pre-existing reason.
     let bad = r#"{"fn":"lib__bad","vcs":[{
       "name":"_tactus_postcondition_bad_at_lib_5_1_1",
       "leaf":"True",
@@ -209,7 +210,7 @@ fn hoisted_binder_in_leaf_pends_precisely() {
       "spine":[
         {"k":"all","name":"q","ty":"Int"},
         {"k":"all","name":"fh","ty":"lib.FrameList"},
-        {"k":"all","name":"_h_fh_hoist1","ty":"fh = lib.FrameList.FNil","p":"hoist","binder":"fh"}
+        {"k":"all","name":"_h_fh_hoist1","ty":"fh = lib.FrameList.FNil","p":"hoist","binder":"fh","v":"lib.FrameList.FNil"}
       ]}]}"#;
     let sc = parse_sidecar(bad).unwrap();
     let t = Tables::new();

@@ -359,7 +359,9 @@ Independent of the critical path; pick up in gap sessions:
 | 3 | A2 — user-closer wrap-mode mirror (apply_hom) | **DONE 07-24** | b75 (closed) | — |
 | 4 | A6-short — assert-forall census tag | **DONE 07-24** | b76 (closed) | — |
 | 5 | A3 — tactus assert-query variant + arm | small-med | b69 | — (Q1 resolved) |
-| 6 | A5 — Match arm (+ D model delta; batch churn w/ A3) | medium | new | — |
+| 6 | A5 — Match arm (+ D model delta; batch churn w/ A3 + R1 per-goal-closer/force-wrap bit) | medium | new | — |
+| 6b | R2 — ledger mirror probe + walk_let recording (§10) | small-med | new | — |
+| 6c | R3 — wrap-mode Bool-let fixture (§10) | small | new | — |
 | 7 | A4 — call-mut arm (+ D model delta) | med-large | new (card first) | — |
 | 8 | A7 — stage-B callee-signature vocabulary | medium | new | — |
 | 9 | D — in-model tripwire column | small | new | — |
@@ -371,9 +373,6 @@ Independent of the critical path; pick up in gap sessions:
 
 Items 2–4 are independent of each other and of 1; parallelize freely.
 7 and 8 are the only real machinery arcs left in the program.
-
----
-
 ## 9. Open questions — all resolved 2026-07-24
 
 Danielle delegated these to Claude's judgment with the standing
@@ -400,3 +399,45 @@ hacks or half-way measures.* Resolutions under that principle:
   not optional.** No census tag is intended as permanent unless the
   construct is genuinely outside the frontend subset; assert-forall is
   not. The tag is scaffolding for b68 sequencing only.
+
+---
+
+
+
+---
+
+## 10. Self-review follow-ups (2026-07-24, Danielle-confirmed: all to be done)
+
+A review of the day's four landings, focused on low-confidence spots.
+Findings 1 (short form), 2, and 5 were FIXED same day; the rest are
+committed work items, not optional:
+
+- **R1 — per-goal-closer wrap modeling** (finding 1, the correct long
+  fix; short form = the `user-closer-assert-query` loud tag, landed).
+  Production's hoist gate is per-GOAL-closer (`emit_leaf_theorem`'s
+  `is_default` on `obl.closer`): an NL assert-query scope inside a
+  user-closer fn HOISTS (ladder closer) while the rest wraps. The
+  serializer's fn-level `wrap_mode` cannot express the mix. Model it
+  per-goal — naturally with the fn/goal-level force-wrap bit in the
+  **A3/A5 tactus-core churn** (one vocabulary edit covers both).
+- **R2 — complete the let-binder ledger mirror** (finding 3).
+  The serializer records only call-dest lets; production's `walk_let`
+  records Assign lets too (typ + `sst_actual_is_trusted` bit). A
+  claim≠actual Assign local feeding a later call arg would honest-fail
+  (loud, safe — but the mirror is knowingly partial). **Probe first**:
+  a fixture fn with exactly that shape, confirm the divergence exists,
+  then mirror `walk_let`'s recording exactly (same rctx for the trust
+  bit) and validate against the full fixture corpus.
+- **R3 — wrap-mode Bool-let fixture** (finding 4). The
+  Bool-let-classifies-plain-in-wrap-mode branch is argued-correct but
+  exercised by no fixture. Add a user-closer fixture fn with a Bool
+  temp; expected CLOSE.
+- **R4 — wrap-mode name-leaf noise** (finding 5b, cosmetic). Wrap-mode
+  certs intern unused `_h_hoist_i` name leaves. Harmless (never
+  referenced by wrap goals); tidy when touching the serializer for R1.
+
+Fixed same day (`with the review commit`): the `user-closer-assert-query`
+tag (R1 short form); the HoistEq equation RHS now travels as a
+STRUCTURED sidecar field (`"v"`, written from the eq LExpr) instead of
+being re-parsed from the pp'd `ty` text (finding 2); `WpCtx::new`'s
+param renamed to `fn_closer_is_default` (finding 5a).

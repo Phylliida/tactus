@@ -2673,6 +2673,19 @@ impl<'a> Serializer<'a> {
             // `have := by <tactic>` render, not an isolated goal list)
             // — sharper tag, still fail-loud.
             StmX::AssertQuery { mode: AssertQueryMode::NonLinear, body, .. } => {
+                // Wrap-mode fn (self-review 2026-07-24, finding 1):
+                // production's hoist gate is PER-GOAL-CLOSER, and an NL
+                // query scope carries the nonlin LADDER closer — which
+                // IS default — so its goals HOIST even inside a
+                // user-closer fn. The fn-level wrap_mode mirror cannot
+                // express that mix; reject loud rather than emit a
+                // non-bridging cert (P2). Correct long fix: per-goal-
+                // closer wrap modeling, batched with the A3/A5 churn's
+                // force-wrap bit (DESIGN-bootstrap-endgame review
+                // follow-up R1).
+                if self.wrap_mode {
+                    return Err("user-closer-assert-query".to_string());
+                }
                 self.wrap_guard()?;
                 // N1-hoist (bootstrap-74 slice 2): production's
                 // `new_scope` DROPS the enclosing hyps for the isolated
