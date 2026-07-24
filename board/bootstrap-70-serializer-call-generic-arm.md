@@ -1,6 +1,6 @@
 ---
 title: "serializer arm — call-generic (vec_read/vec_push7/fill_zeros; the whole remaining fixture gap)"
-status: in_progress
+status: done
 claimed_by:
 created: 2026-07-16T17:15:00Z
 updated: 2026-07-16T17:15:00Z
@@ -60,3 +60,16 @@ written reason; suite green.
   267/1649, call-generic AND call-forall-path both zero, one call-mut
   (copy_word) left in runtime. Full bridge-close of the new certs
   pends bootstrap-74.
+
+- (2026-07-24, fable-endgame-A1) **CLOSED via probe38
+  (`probe-w0/probe38_b70_b71_close/`, endgame A1).** Post-b74 evidence,
+  live certs: **vec_read goal 0 — the generic-instantiation Call
+  PRECONDITION goal — decide-closes per-goal** (`gl_nth_eq … 0 = 1`)
+  and the req-atom perturbation kill flips it (the pre-b74 head-goal
+  validation, re-established through the reconciled telescope). Goal 1
+  (Ret) is the documented stage-B honest-fail (view-call deref +
+  Int.ofNat CallN coercion — endgame A7) and is held by an `=0`
+  TRIPWIRE in the probe: it fires loud when the A7 vocabulary lands.
+  Sanctioned re-tags stand: vec_push7 → `call-mut`, fill_zeros →
+  `call-mut`; tgt census call-generic = 0. Suite 551/0, gate 231/0
+  (2026-07-24 battery).

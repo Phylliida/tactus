@@ -1,6 +1,6 @@
 ---
 title: "serializer arm — ∀-path Call assembly (FBind post frame; refWp side already proven)"
-status: in_progress
+status: done
 claimed_by:
 created: 2026-07-16T17:15:00Z
 updated: 2026-07-16T17:15:00Z
@@ -45,3 +45,13 @@ mutation-kill; census tag `call-forall-path` retired; suite green.
 - **tgt:** b70+b71 moved the census: call-generic 0 (was the gate),
   4× call-forall-path expected to certify with this arm (re-census in
   flight).
+
+- (2026-07-24, fable-endgame-A1) **CLOSED via probe38
+  (`probe-w0/probe38_b70_b71_close/`, endgame A1).** Post-b74, live
+  certs: **use_clamped (F21 ∀-path caller) bridge-closes full-goals**
+  (also in probe9's CLOSE set since Round B) **and both frame
+  mutation-kills flip**: dropping the ret-bound FHyp from the Call post
+  frame → 0; swapping ret-bound ↔ ens FHyps → 0. The FBind/FHyp
+  assembly is validated positively and negatively through the
+  N1-hoist mirror. Census tag `call-forall-path` = 0 on tgt (retired).
+  Suite 551/0, gate 231/0 (2026-07-24 battery).

@@ -164,11 +164,17 @@ tgt census after b74: call-generic 0, call-forall-path 0; remaining tags =
 (probe9: vec_read, head_exec; probe11: apply_hom_gen/inv, the two
 assert-forall lemmas). The arms, smallest first:
 
-### A1 — b70/71 close-out (small, unblocked)
+### A1 — b70/71 close-out — **DONE 2026-07-24**
 
-Re-run the vec_read/use_clamped bridges end-to-end to the pre-b74 limit,
-mutation-kill the ∀-path frame, close cards `bootstrap-70`/`bootstrap-71`.
-Pure follow-through; b74 cleared the blocker.
+Closed via `probe-w0/probe38_b70_b71_close/` (regenerates from live
+certs each run): use_clamped's ∀-path bridge closes full-goals with
+both frame kills flipping (drop ret-bound FHyp; swap ret-bound ↔ ens);
+vec_read's generic-Call precondition goal closes per-goal with the
+req-atom kill flipping; vec_read's Ret goal held by an `=0` stage-B
+tripwire that fires when A7 lands. `call-forall-path` census tag
+retired (0 on tgt). Cards `bootstrap-70`/`bootstrap-71` closed. The
+probe's `gl_nth`/`gl_nth_eq` make the b74 per-goal triage idiom a
+standing artifact.
 
 ### A2 — apply_hom class: call-arg temp lets + auto-ref coercion (small-medium)
 
@@ -347,7 +353,7 @@ Independent of the critical path; pick up in gap sessions:
 | # | Item | Size | Card | Gated on |
 |---|---|---|---|---|
 | 1 | C — HoistEq discharge + P1 poison mutation/contract | **DONE 07-24** | b73 (closed) | — |
-| 2 | A1 — b70/71 close-out | small | b70, b71 | — |
+| 2 | A1 — b70/71 close-out (probe38) | **DONE 07-24** | b70, b71 (closed) | — |
 | 3 | A2 — apply_hom call-arg temps + auto-ref | small-med | new (b75) | — |
 | 4 | A6-short — assert-forall census tag | small | new | — |
 | 5 | A3 — tactus assert-query variant + arm | small-med | b69 | — (Q1 resolved) |
