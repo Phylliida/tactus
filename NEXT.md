@@ -1,7 +1,10 @@
-# NEXT — bootstrap work queue (2026-07-21)
+# NEXT — bootstrap work queue (2026-07-21; superseded 2026-07-24)
 
-The single source of detail is the board (`board/*.md`); this is the
-ordered summary of what remains. Suite state: 551/0 upstream; tactus-core
+**The ordered map of everything remaining is now
+`DESIGN-bootstrap-endgame.md`** (milestones A–F + policy points P1–P4,
+agreed with Danielle 2026-07-24). The single source of per-brick detail
+is still the board (`board/*.md`); this file's sections below remain as
+the pre-endgame snapshot. Suite state: 551/0 upstream; tactus-core
 gate 231/0 + Link discharge 144/6 (the 6 = pre-existing other-hyp/HoistEq
 residual; mode flags are part of the verification-cache key, `16d301c`).
 
