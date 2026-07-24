@@ -61,9 +61,16 @@ export LEAN_PATH="$CORE_OUT:$CORE_OUT/pkg:$PRELUDE"
 # ret_typ) — in the Return arm, so the RetBind value renders `self.deref`
 # (leaf 5) and the SST RetLet 4 5 matches the goal's Let 4 5. Removed from the
 # honest-fail set; it must now close-ok.
+# NOTE (endgame A2, 2026-07-24): apply_hom_gen/inv are now expected-CLOSE.
+# The b74-sweep honest-fail was the CLOSER GATE, not arg-temp LetRaw: these
+# fns carry user tactus_tactic closers, and production's emit_leaf_theorem
+# NEVER hoists user-closer fns (positional tactic text). The serializer now
+# mirrors the shared closer_is_default gate (wrap-mode: plain Assign/FLet/
+# RetLet), renders ctx reqs via production's build_req_binders (view-arg
+# auto-ref coercion), and threads its let-binder ledger into
+# cert_call_leaves (no double Ref.mk on earlier call-dest args).
 honest_fail_reason() {
   case "$1" in
-    runtime__apply_hom_gen|runtime__apply_hom_inv) printf '%s' 'call-arg temp lets + auto-ref arg coercion unmodeled (bootstrap-74 slice 2 sweep, 2026-07-21): Verus lowers `&h.generator_images[i]` to a `tmp__N := h.deref.generator_images` arg temp whose Wp::LetRaw frame is TYP-LESS (production bails hoist_all to whole-goal wrap); the serializer typed it from local_typs and hoisted (AssignH). And the instantiated callee requires keeps the auto-ref coercion (`Tactus.Ref.mk <arg>`) which the serializer drops. New Call-arm machinery — carded follow-up.' ;;
     runtime__lemma_runtime_word_view_append|runtime__lemma_runtime_word_view_subrange) printf '%s' 'assert-forall quantifier binders unmodeled (bootstrap-74 slice 2 sweep, 2026-07-21): the fn asserts `forall |k: int| …` — production emits the skolem binder `∀ (k : Int)` in the goal telescope; stage A has no quantifier-binder arm, so the serializer instead emits the lowering bool temp as a residue let + a poisoned Assume and wraps. SHOULD be a loud census rejection (assert-forall tag), not a non-bridging cert — census-gap follow-up.' ;;
     *) printf '%s' '' ;;
   esac
