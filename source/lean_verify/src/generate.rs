@@ -5292,9 +5292,32 @@ fn write_spine_sidecar(
                                     j.push_str(",\"p\":\"height\""),
                                 Some(HypProvenance::Requires { index }) =>
                                     j.push_str(&format!(",\"p\":\"requires\",\"i\":{}", index)),
-                                Some(HypProvenance::HoistEq { binder }) =>
+                                Some(HypProvenance::HoistEq { binder }) => {
                                     j.push_str(&format!(
-                                        ",\"p\":\"hoist\",\"binder\":\"{}\"", esc(binder.as_str()))),
+                                        ",\"p\":\"hoist\",\"binder\":\"{}\"", esc(binder.as_str())));
+                                    // Structured equation RHS (self-review
+                                    // 2026-07-24, finding 2): the composer
+                                    // needs `v` to replay `let binder := v;`
+                                    // — emit it from the STRUCTURED LExpr
+                                    // here (the writer holds the eq tree),
+                                    // never re-parsed from the pp'd `ty`
+                                    // text. A non-eq / mismatched-lhs shape
+                                    // omits the field and the parser keeps
+                                    // the fn pending (loud).
+                                    if let crate::lean_ast::ExprNode::BinOp {
+                                        op: crate::lean_ast::BinOp::Eq, lhs, rhs,
+                                    } = &b.ty.node
+                                    {
+                                        if matches!(&lhs.node,
+                                            crate::lean_ast::ExprNode::Var(n)
+                                                if n.as_str() == binder.as_str())
+                                        {
+                                            j.push_str(&format!(
+                                                ",\"v\":\"{}\"",
+                                                esc(&crate::lean_pp::pp_expr(rhs))));
+                                        }
+                                    }
+                                }
                                 Some(HypProvenance::CtorEq { scrutinee, variant, .. }) =>
                                     j.push_str(&format!(
                                         ",\"p\":\"ctor\",\"scrut\":\"{}\",\"variant\":\"{}\"",

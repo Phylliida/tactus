@@ -110,17 +110,17 @@ pub fn parse_sidecar(txt: &str) -> Option<FnSidecar> {
                             },
                             "height" => Node::Height,
                             // Hoist/requires premises are usable only in
-                            // their NAMED (all+p) form — `ty` carries the
-                            // prop text. Anything malformed falls through
-                            // to Other (loud pend), never a silent
-                            // misparse.
+                            // their NAMED (all+p) form. The equation RHS
+                            // comes from the STRUCTURED `v` field (written
+                            // from the eq LExpr — self-review 2026-07-24
+                            // finding 2, no text re-parse); a sidecar
+                            // without it (non-eq shape, or the unnamed imp
+                            // form) falls through to Other (loud pend),
+                            // never a silent misparse.
                             "hoist" => (|| {
-                                let b = n.get("binder")?.as_str()?;
-                                let eq = n.get("ty")?.as_str()?;
-                                let v = eq.strip_prefix(&format!("{} = ", b))?;
                                 Some(Node::HoistEq {
-                                    binder: b.to_string(),
-                                    v: v.to_string(),
+                                    binder: n.get("binder")?.as_str()?.to_string(),
+                                    v: n.get("v")?.as_str()?.to_string(),
                                 })
                             })()
                             .unwrap_or(Node::Other),

@@ -474,7 +474,7 @@ impl<'a> WpCtx<'a> {
         // The COMBINED closer gate (attr + proof-block prefix), from
         // `closer_is_default` — the single source shared with the cert
         // serializer's wrap-mode mirror (endgame A2).
-        fn_attr_closer_is_default: bool,
+        fn_closer_is_default: bool,
         // For callee-side `&mut` body verification (#94): set of
         // sanitized param-name strings for the fn's `&mut` params.
         // Each ens_exp is rewritten so `*old(x)` → `<x>_at_pre_tactus`
@@ -591,10 +591,6 @@ impl<'a> WpCtx<'a> {
                 ))
             }).collect::<Result<Vec<_>, String>>()?
         );
-        // The combined closer gate is computed by the caller via the
-        // shared `closer_is_default` helper (also consumed by the cert
-        // serializer, endgame A2 — the two must never drift).
-        let fn_closer_is_default = fn_attr_closer_is_default;
         Ok(Self {
             fn_map,
             datatypes,
