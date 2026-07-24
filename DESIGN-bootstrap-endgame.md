@@ -128,22 +128,32 @@ first in the order.
 
 ---
 
-## 2. Milestone C — Link discharge 0-pending (first, small)
+## 2. Milestone C — Link discharge 0-pending — **DONE 2026-07-24**
 
-**Work:** teach the discharge spine composer the `HoistEq` arm — a hoisted
-`tmp__N`/let equation hyp is definitionally an equation over an in-scope
-binder; the composer rewrites with it. (The provenance variant already
-exists at `hoist_all`'s equation-binder site.)
+**Result: Link discharge 150/0** (was 144/6; 12 fix + 15 straight-line +
+123 zero-spine), tactus-core gate 231/0 + package gate kernel-verified,
+lean_verify units 406/0, e2e 551/0, probe9 all-classified, probe13/14
+green. Full log on `bootstrap-73` (now closed).
 
-**Also in this brick (P1 items 1–2):** the poison-flip mutation test and
-the faithfulness-contract doc line — same code area, same session size.
+The 6 pendings split into two classes, both composed in
+`link_discharge.rs`: **HoistEq** (4 fns — the N1 hoisted-let pair parses
+to `Node::HoistEq`, `leading_alls` trims the value binders, `replay_lets`
+replays `let x := v;` in spine order, the ∀ instantiates with the let
+name and the equation premise closes by `rfl` zeta-defeq) and **Req**
+(2 fns — the fn's own `requires` carried as a hypothesis binder, its
+contract not a woven premise). Loud-pend guards: malformed hoist strips,
+hoisted binder in a postcondition leaf, calls to requires-carrying fns,
+hoist/requires in fix fns. Six unit pins in `tests/link_discharge.rs`.
 
-**Acceptance:** tgt gate Link discharge 144/0 (or current denominator /0);
-tactus-core gate green; poison-flip mutation flips the bridge verdict;
-suite steady.
-
-**Card:** extend `bootstrap-73` (it is the discharge umbrella, in_progress)
-rather than a new card.
+**P1 items landed with it:** the serializer contract names the poison
+mark as a trusted semantic predicate (sst_serialize.rs header), and
+probe13 gained the `poison_flip` kill (zeroing ALL marks flips the
+bridge 1→0). Two live finds from its first runs, now recorded on the
+card: a single-bit flip is masked by the duplicated Assert+Assume hyp
+pair (FINDINGS §3) — the honest channel-kill zeroes all marks; and
+probe13/14 had been stale-red since the prelude split + b74 reshape —
+repaired (probe9 all-preludes glob), with the deref class parked as an
+`=0` tripwire that fires when A5 lands.
 
 ---
 
@@ -336,7 +346,7 @@ Independent of the critical path; pick up in gap sessions:
 
 | # | Item | Size | Card | Gated on |
 |---|---|---|---|---|
-| 1 | C — HoistEq discharge + P1 poison mutation/contract | small | b73 (extend) | — |
+| 1 | C — HoistEq discharge + P1 poison mutation/contract | **DONE 07-24** | b73 (closed) | — |
 | 2 | A1 — b70/71 close-out | small | b70, b71 | — |
 | 3 | A2 — apply_hom call-arg temps + auto-ref | small-med | new (b75) | — |
 | 4 | A6-short — assert-forall census tag | small | new | — |

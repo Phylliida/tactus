@@ -71,9 +71,11 @@
 //! AssertCompute, Fuel, RevealString, BreakOrContinue, OpenInvariant,
 //! ClosureInner, Air.
 //!
-//! Canonical check (live Lean, package gate — the M6.5 default):
+//! Canonical check (live Lean, package gate — the M6.5 default; proof
+//! fns always route to Lean under --lean-backend since e5f7aea, the
+//! old --lean-all-proofs flag is gone):
 //!   TACTUS_LEAN_OUT=$PWD/out ../source/target-verus/release/verus \
-//!     --crate-type=lib --lean-backend --lean-all-proofs lib.rs
+//!     --crate-type=lib --lean-backend lib.rs
 
 use vstd::prelude::*;
 

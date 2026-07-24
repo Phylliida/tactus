@@ -40,6 +40,17 @@ pub enum Node {
     Branch { test: Option<BTest> },
     Call { callee: String, is_self: bool, args: Vec<Arg> },
     Height,
+    /// N1 hoisted-let equation hyp (`_h_{binder}_hoist1 : binder = v`).
+    /// The value binder `binder` is the mid-spine All immediately
+    /// before this node; it is definitionally `v`, so the composer
+    /// replays `let {binder} := {v};` and closes this premise with
+    /// `rfl` (zeta-defeq). Not a fn param — `leading_alls` trims it.
+    HoistEq { binder: String, v: String },
+    /// The fn's OWN requires clause (named hyp, `p:"requires"`). Part
+    /// of the fn's contract, not a woven premise — carried as a
+    /// hypothesis binder of the closed theorem and fed back
+    /// positionally.
+    Req { name: String, prop: String },
     Other,
 }
 
@@ -98,6 +109,28 @@ pub fn parse_sidecar(txt: &str) -> Option<FnSidecar> {
                                 }),
                             },
                             "height" => Node::Height,
+                            // Hoist/requires premises are usable only in
+                            // their NAMED (all+p) form — `ty` carries the
+                            // prop text. Anything malformed falls through
+                            // to Other (loud pend), never a silent
+                            // misparse.
+                            "hoist" => (|| {
+                                let b = n.get("binder")?.as_str()?;
+                                let eq = n.get("ty")?.as_str()?;
+                                let v = eq.strip_prefix(&format!("{} = ", b))?;
+                                Some(Node::HoistEq {
+                                    binder: b.to_string(),
+                                    v: v.to_string(),
+                                })
+                            })()
+                            .unwrap_or(Node::Other),
+                            "requires" => (|| {
+                                Some(Node::Req {
+                                    name: n.get("name")?.as_str()?.to_string(),
+                                    prop: n.get("ty")?.as_str()?.to_string(),
+                                })
+                            })()
+                            .unwrap_or(Node::Other),
                             "call" => Node::Call {
                                 callee: n.get("callee")?.as_str()?.to_string(),
                                 is_self: n.get("self")?.as_bool()?,
@@ -481,10 +514,28 @@ fn strip_mark(s: &str) -> &str {
 /// Leading `All` prefix of a spine (the clean statement's binders).
 /// Stops at the first Unit-typed All — those are `∀`-path callee ret
 /// binders (application slots for `()`), not signature binders.
+/// The value-binder names of N1 hoisted lets in this spine. These
+/// mid-spine Alls are NOT fn params (each is followed by its HoistEq
+/// equation hyp): `leading_alls` trims them and `app_args`
+/// instantiates them with their replayed `let`.
+fn hoist_binder_names(spine: &[Node]) -> HashSet<&str> {
+    spine
+        .iter()
+        .filter_map(|n| match n {
+            Node::HoistEq { binder, .. } => Some(binder.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn leading_alls(spine: &[Node]) -> (&[Node], usize) {
+    let hoists = hoist_binder_names(spine);
     let n = spine
         .iter()
-        .take_while(|n| matches!(n, Node::All { ty, .. } if ty != "Unit"))
+        .take_while(|n| {
+            matches!(n, Node::All { name, ty }
+                if ty != "Unit" && !hoists.contains(name.as_str()))
+        })
         .count();
     (&spine[..n], n)
 }
@@ -533,6 +584,7 @@ struct AppEnv<'a> {
 fn app_args(vc: &Vc, upto: Option<usize>, env: &AppEnv) -> Result<Vec<String>, String> {
     let mut args = Vec::new();
     let (_, n_lead) = leading_alls(&vc.spine);
+    let hoists = hoist_binder_names(&vc.spine);
     let mut hdec_idx = 0usize;
     for (i, node) in vc.spine.iter().enumerate() {
         if let Some(u) = upto {
@@ -549,6 +601,11 @@ fn app_args(vc: &Vc, upto: Option<usize>, env: &AppEnv) -> Result<Vec<String>, S
                     }
                 } else if ty == "Unit" {
                     args.push("()".to_string());
+                } else if hoists.contains(name.as_str()) {
+                    // Hoisted-let value binder: its `let {name} := v;`
+                    // is replayed before the application (replay_lets),
+                    // so the binder instantiates with its own name.
+                    args.push(name.clone());
                 } else if let Some(tok) = n2_field_binder_token(name, env) {
                     // N2 match-splitting field binder ({scrut}_val{i}):
                     // instantiate with the arm's pattern binder; the
@@ -577,9 +634,23 @@ fn app_args(vc: &Vc, upto: Option<usize>, env: &AppEnv) -> Result<Vec<String>, S
                 };
                 // Interleave bound proofs per the callee's own leading-
                 // All order (params and their h_*_bound binders).
-                let callee_lead: Vec<&Node> = env
-                    .sidecars
-                    .get(if *is_self { env.fn_rel } else { callee.as_str() })
+                let callee_sc =
+                    env.sidecars.get(if *is_self { env.fn_rel } else { callee.as_str() });
+                // A requires-carrying callee's closed theorem has an
+                // extra hypothesis binder the recorded args cannot
+                // feed — pend loudly rather than emit a broken
+                // application (no such call sites exist today).
+                if callee_sc.map_or(false, |c| {
+                    c.vcs.iter().any(|v| {
+                        v.spine.iter().any(|n| matches!(n, Node::Req { .. }))
+                    })
+                }) {
+                    return Err(format!(
+                        "callee {} carries requires (call-site discharge unsupported)",
+                        callee
+                    ));
+                }
+                let callee_lead: Vec<&Node> = callee_sc
                     .and_then(|c| c.vcs.first())
                     .map(|v| leading_alls(&v.spine).0.iter().collect())
                     .unwrap_or_default();
@@ -710,6 +781,12 @@ fn app_args(vc: &Vc, upto: Option<usize>, env: &AppEnv) -> Result<Vec<String>, S
                 t.push(')');
                 args.push(t);
             }
+            // The equation premise `binder = v`: with `let binder := v`
+            // in scope (replay_lets), `rfl` closes by zeta-defeq.
+            Node::HoistEq { .. } => args.push("rfl".to_string()),
+            // The fn's own requires: fed back from the closed
+            // theorem's carried hypothesis binder of the same name.
+            Node::Req { name, .. } => args.push(name.clone()),
             Node::Other => return Err("other-hyp in spine".to_string()),
         }
     }
@@ -741,16 +818,26 @@ fn replay_lets(
     }
     let mut out = Vec::new();
     for n in &vc.spine {
-        if let Node::Let { name, v } = n {
-            if projections.contains(name) || !referenced(name, &arg_texts) {
-                continue;
-            }
-            match alias {
-                Some((an, pat)) if an == name => {
-                    out.push(format!("let {} := {};", name, pat))
+        match n {
+            Node::Let { name, v } => {
+                if projections.contains(name) || !referenced(name, &arg_texts) {
+                    continue;
                 }
-                _ => out.push(format!("let {} := {};", name, v)),
+                match alias {
+                    Some((an, pat)) if an == name => {
+                        out.push(format!("let {} := {};", name, pat))
+                    }
+                    _ => out.push(format!("let {} := {};", name, v)),
+                }
             }
+            // Hoisted-let binders replay UNCONDITIONALLY: their ∀ is
+            // always instantiated with the let-bound name, and their
+            // equation premise closes by rfl against the let value.
+            // Spine order preserves later-references-earlier chains.
+            Node::HoistEq { binder, v } => {
+                out.push(format!("let {} := {};", binder, v));
+            }
+            _ => {}
         }
     }
     out
@@ -886,6 +973,14 @@ fn close_straight_line(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, 
     }
     let p0 = posts[0];
     let (lead, _) = leading_alls(&p0.spine);
+    // A hoisted binder in a postcondition leaf would leave the closed
+    // statement ill-formed (its `let` replays in the term, not the
+    // type) — pend precisely instead of emitting a Lean error.
+    for b in hoist_binder_names(&p0.spine) {
+        if posts.iter().any(|p| referenced(b, &p.leaf)) {
+            return Err(format!("hoisted binder {} in postcondition leaf", b));
+        }
+    }
     let param_names: Vec<&str> = lead
         .iter()
         .filter_map(|n| match n {
@@ -968,6 +1063,14 @@ fn close_straight_line(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, 
             _ => unreachable!(),
         })
         .collect();
+    // The fn's own requires clauses: part of its contract, carried as
+    // hypothesis binders (mirrors the hwf_* wf hypotheses) and fed
+    // back positionally by app_args' Req arm.
+    for n in &p0.spine {
+        if let Node::Req { name, prop } = n {
+            binders.push(format!("({} : {})", name, prop));
+        }
+    }
     for (p, dt) in &wf_params {
         let base = p.strip_suffix(".deref").unwrap_or(p);
         binders.push(format!("(hwf_{} : {}Wf {})", base, dt, p));
@@ -998,6 +1101,14 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
     let terms: Vec<&Vc> = sc.vcs.iter().filter(|v| v.is_term).collect();
     if sc.vcs.iter().any(|v| !v.is_post && !v.is_term) {
         return Err("assert VCs in recursive fn".into());
+    }
+    // Hoist/requires composition is validated on the straight-line
+    // path only (no recursive instance exists today) — pend loudly
+    // rather than synthesize an unvalidated fix shape.
+    if sc.vcs.iter().any(|v| {
+        v.spine.iter().any(|n| matches!(n, Node::HoistEq { .. } | Node::Req { .. }))
+    }) {
+        return Err("hoist/requires spine in recursive fn (unvalidated)".into());
     }
     for vc in &sc.vcs {
         for n in &vc.spine {
@@ -1510,3 +1621,7 @@ pub fn try_close(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Outcome {
         Err(e) => pend(e),
     }
 }
+
+#[cfg(test)]
+#[path = "tests/link_discharge.rs"]
+mod tests;

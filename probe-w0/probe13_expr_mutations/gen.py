@@ -12,13 +12,16 @@ field accessor, wrong overflow bound) would render a "right-looking" string and
 SILENT-PASS. The deep symmetric compare against the independent `render_exp`
 must instead FLIP the bridge 1 -> 0.
 
-This harness proves it, positively and by `decide`, for the four coercion-drop
-classes — one class per fixture fn, each on its own live cert:
+This harness proves it, positively and by `decide`, for four coercion-drop
+classes plus the P1 poison-channel class, each on its own live cert:
 
   * cast_drop    (sum_to,     nat-coercion / cast class): drop an `Int.toNat`
   * deref_drop   (head_exec,  G2 auto-deref):             drop the `.deref` FieldProj
   * wrong_field  (mk_point,   G3 struct field):           emit a WRONG field accessor
   * wrong_width  (add_capped, G6 HasType overflow):       2^64 bound -> 2^32
+  * poison_flip  (add_capped, P1 trusted wrap-gate mark): poison bit 1 -> 0,
+                 SST-side — pins that a serializer mismark flips the bridge
+                 (DESIGN-bootstrap-endgame §1 P1)
 
 For each: extract the live cert's ctx/sst/goals VERBATIM, apply a single
 STRUCTURAL text mutation to the GOAL side only (`ref_wp`/ctx/sst untouched, so
@@ -116,11 +119,65 @@ def wrong_width(goals):
     return goals.replace(POW64, POW32, 1)
 
 
+def poison_drop(sst):
+    """P1 poison-channel kill (endgame policy P1, DESIGN-bootstrap-endgame §1).
+
+    The N1 wrap-gate poison mark is a SEMANTIC PREDICATE computed by the
+    trusted serializer (`hyp_poison` — "does this hyp prop mention an
+    in-scope residue name"), not a transcription — the model's gate only
+    READS it. This mutation pins that the channel is live in the bridge:
+    zero EVERY poison mark in the SST literal (the reference's INPUT) —
+    exactly what a broken `hyp_poison` (spuriously returning 0) would
+    emit — and ref_wp HOISTS goals production WRAPPED; the verdict must
+    flip. All marks, not one: production pushes a duplicated hyp pair
+    per assert (FINDINGS-b74-slice2 §3, the Assert forward hyp + the
+    following Assume carry the SAME poisoned prop), so a single-bit flip
+    is masked by the twin — discovered live by this harness's first run.
+    Note this is an SST-side mutation, unlike the four goal-side
+    coercion classes: the mark's consumer is ref_wp itself."""
+    n = 0
+
+    def flip_after(key, tail_re, sst):
+        nonlocal n
+        out, i = [], 0
+        while True:
+            j = sst.find(key, i)
+            if j == -1:
+                out.append(sst[i:])
+                return "".join(out)
+            k = match_paren(sst, j + len(key))  # end of the leading tree arg
+            m = re.match(tail_re, sst[k + 1:])
+            if m and m.group(0).endswith(" 1)"):
+                out.append(sst[i:k + 1] + m.group(0)[:-2] + "0)")
+                n += 1
+                i = k + 1 + m.end()
+            else:
+                out.append(sst[i:j + len(key)])
+                i = j + len(key)
+
+    # Assert (ob…) NAME HYP POISON) — the obligation is a paren tree.
+    sst = flip_after("lib.StmData.Assert ", r" (\d+) (\d+) 1\)", sst)
+    # Assume NAME HYP POISON) — all-numeric, plain regex.
+    sst2 = re.sub(r"(lib\.StmData\.Assume \d+ \d+) 1\)", r"\g<1> 0)", sst)
+    n += len(re.findall(r"lib\.StmData\.Assume \d+ \d+ 1\)", sst))
+    assert n > 0, "poison_drop: no poison marks set — fixture lost its poisoned pair"
+    return sst2
+
+
+# (fn, class, human description, mutation, which def the mutation edits, expect)
+#
+# expect="close": baseline bridges (=1) and the mutation kills (=0).
+# expect="divergent-parked": the fixture is a DOCUMENTED b74 honest-fail
+#   (head_exec: N2 match-split unmodeled — endgame A5); its baseline
+#   asserts =0 as a REGRESSION TRIPWIRE: the day the A5 arm lands and
+#   head_exec closes, this example fails loud and the class must be
+#   restored to expect="close" with its kill. Never a silent cap (P2).
 CLASSES = [
-    ("sum_to",     "cast_drop",   "drop an Int.toNat nat-coercion (cast class)",      drop_first_cast),
-    ("head_exec",  "deref_drop",  "drop the .deref auto-coercion (G2)",               drop_deref),
-    ("mk_point",   "wrong_field", "emit a wrong struct field accessor (G3)",          wrong_field),
-    ("add_capped", "wrong_width", "wrong HasType overflow bound width 2^64->2^32 (G6)", wrong_width),
+    ("sum_to",     "cast_drop",   "drop an Int.toNat nat-coercion (cast class)",      drop_first_cast, "goals", "close"),
+    ("head_exec",  "deref_drop",  "drop the .deref auto-coercion (G2)",               drop_deref,      "goals", "divergent-parked"),
+    ("mk_point",   "wrong_field", "emit a wrong struct field accessor (G3)",          wrong_field,     "goals", "close"),
+    ("add_capped", "wrong_width", "wrong HasType overflow bound width 2^64->2^32 (G6)", wrong_width,   "goals", "close"),
+    ("add_capped", "poison_flip", "zero ALL wrap-gate poison marks (P1 trusted-predicate channel)", poison_drop, "sst", "close"),
 ]
 
 
@@ -140,7 +197,7 @@ def main():
     L.append("")
 
     fired = 0
-    for fn, cls, human, mut_fn in CLASSES:
+    for fn, cls, human, mut_fn, side, expect in CLASSES:
         cert = CERTDIR / f"{fn}.cert.lean"
         if not cert.exists():
             sys.exit(f"missing cert: {cert} (re-emit the fixture; see board/bootstrap-15)")
@@ -148,17 +205,30 @@ def main():
         ctx   = extract_def(text, f"cert_{fn}_ctx")
         sst   = extract_def(text, f"cert_{fn}_sst")
         goals = extract_def(text, f"cert_{fn}_goals")
-        goals_mut = mut_fn(goals)
 
+        # Defs keyed by CLASS (a fixture fn may serve several classes).
         L.append(f"-- ── {cls}: {fn} — {human} ──")
-        L.append(f"@[reducible] def {fn}_ctx : lib.FnCtxData := {ctx}")
-        L.append(f"@[reducible] def {fn}_sst : lib.StmData := {sst}")
-        L.append(f"@[reducible] def {fn}_goals : lib.GoalList := {goals}")
-        L.append(f"@[reducible] def {fn}_goals_mut : lib.GoalList := {goals_mut}")
+        L.append(f"@[reducible] def {cls}_ctx : lib.FnCtxData := {ctx}")
+        L.append(f"@[reducible] def {cls}_sst : lib.StmData := {sst}")
+        L.append(f"@[reducible] def {cls}_goals : lib.GoalList := {goals}")
+        if expect == "divergent-parked":
+            L.append(f"-- PARKED (endgame A5): {fn} is a documented b74 honest-fail; this")
+            L.append(f"-- =0 example is the tripwire — when the arm lands and {fn} closes,")
+            L.append(f"-- it fails loud and the class must be restored to close+kill.")
+            L.append(f"example : lib.goals_eq (lib.ref_wp {cls}_ctx {cls}_sst) {cls}_goals = 0 := by decide")
+            L.append("")
+            fired += 1
+            continue
+        if side == "goals":
+            L.append(f"@[reducible] def {cls}_goals_mut : lib.GoalList := {mut_fn(goals)}")
+            kill = f"lib.goals_eq (lib.ref_wp {cls}_ctx {cls}_sst) {cls}_goals_mut"
+        else:  # sst-side mutation: the reference's own input is perturbed
+            L.append(f"@[reducible] def {cls}_sst_mut : lib.StmData := {mut_fn(sst)}")
+            kill = f"lib.goals_eq (lib.ref_wp {cls}_ctx {cls}_sst_mut) {cls}_goals"
         L.append(f"-- baseline: the unperturbed deep bridge closes.")
-        L.append(f"example : lib.goals_eq (lib.ref_wp {fn}_ctx {fn}_sst) {fn}_goals = 1 := by decide")
-        L.append(f"-- kill: the coercion drop FLIPS the bridge (Friction-2 caught).")
-        L.append(f"example : lib.goals_eq (lib.ref_wp {fn}_ctx {fn}_sst) {fn}_goals_mut = 0 := by decide")
+        L.append(f"example : lib.goals_eq (lib.ref_wp {cls}_ctx {cls}_sst) {cls}_goals = 1 := by decide")
+        L.append(f"-- kill: the single-edit mutation FLIPS the bridge.")
+        L.append(f"example : {kill} = 0 := by decide")
         L.append("")
         fired += 1
 
