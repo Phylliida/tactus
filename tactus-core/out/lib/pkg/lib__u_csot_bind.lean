@@ -5,6 +5,6 @@ set_option linter.unusedVariables false
 set_option maxHeartbeats 800000
 set_option autoImplicit false
 -- tactus-closer: user
-theorem _tactus_postcondition_u_csot_bind_at_lib_3910_13_1 (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (x : Int) (h_x_bound : 0 ≤ x ∧ x < 18446744073709551616) (ty : Int) (h_ty_bound : 0 ≤ ty ∧ ty < 18446744073709551616) (t : Tactus.Box lib.FrameList) (f0 : lib.FrameList) (l : lib.RawExpList) :
-    /- @rust:lib.rs:3910:13 -/ ∀ (st : Int → Int), lib.close_sem_obligs_tel hp he lv (lib.FrameList.FBind x ty t) f0 st l = (∀ (n : Int), lib.close_sem_obligs_tel hp he lv t.deref f0 (lib.upd st x n) l) := by
+theorem _tactus_postcondition_u_csot_bind_at_lib_4104_13_1 (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (x : Int) (h_x_bound : 0 ≤ x ∧ x < 18446744073709551616) (ty : Int) (h_ty_bound : 0 ≤ ty ∧ ty < 18446744073709551616) (t : Tactus.Box lib.FrameList) (f0 : lib.FrameList) (l : lib.RawExpList) :
+    /- @rust:tactus-core/lib.rs:4104:13 -/ ∀ (st : Int → Int), lib.close_sem_obligs_tel hp he lv (lib.FrameList.FBind x ty t) f0 st l = (∀ (n : Int), lib.close_sem_obligs_tel hp he lv t.deref f0 (lib.upd st x n) l) := by
   first | tactus_auto | (intros <;> rfl)
