@@ -320,4 +320,57 @@ pub fn mul_bound(a: u64, b: u64) -> (r: u64)
     a * b
 }
 
+// F22 (bootstrap-77 A5): plain-cond value-if in RETURN position — the
+// default Return route (`Wp::Let` → `walk_let`) FORKS it into per-branch
+// goals with `_h_hoist_1 : cond` / `¬cond` hyps + per-branch RetLetH.
+// The serializer mirrors via `ret_fork` → `StmData::If` (no ctor
+// upgrade — the cond is a plain comparison).
+pub fn pick_max(x: u64, y: u64) -> (r: u64)
+    ensures r >= x, r >= y,
+{
+    if x < y { y } else { x }
+}
+
+// F23 (bootstrap-77 A5): match in ASSIGN position — the whole body folds
+// into `Return(Bind(Let(m := If …), m))`, and `walk_let`'s Bind arm
+// renders the binder RHS OPAQUE (b77 E1: NO fork; the if stays inside
+// `_h_m_hoist1 : m = (if …)`). Negative control for the fork gate.
+pub fn head_via_let(t: &Tree) -> (r: u64)
+    ensures r == tree_head(*t),
+{
+    let m = match t {
+        Tree::Leaf(v) => *v,
+        Tree::Node(_l, _r) => 0,
+    };
+    m
+}
+
+// F24 (bootstrap-77 A3): Tactus-mode assert-by inside a DEFAULT-closer
+// fn — production emits a separate `_tactus_assert_*` theorem for P
+// (never hoisted: `emit_with_closer`) while the other goals hoist; the
+// mirror closes the `StmData::AssertQueryTactus` obligation under
+// `f + FUserCloser` (the R1 per-goal force-wrap, exercised nowhere in
+// tgt — every tgt assert-query fn is wrap-mode by attr/proof-block).
+pub fn assert_by_default(x: u64) -> (r: u64)
+    requires x < 100,
+    ensures r == x + 1,
+{
+    assert(x + 1 <= 100) by { omega };
+    x + 1
+}
+
+// F25 (bootstrap-77 A3): proof-block prefix (Tactus kind ProofBlock) —
+// structurally ABSENT from the mirror (the tactic rides the closer
+// prefix, not stage-A-certified) but flips the fn-level
+// `closer_is_default` DFS: this fn is wrap-mode, its Return keeps the
+// legacy folded shape, and the cert's FnCtxData carries
+// `closer_default = 0`.
+pub fn proof_block_fn(x: u64) -> (r: u64)
+    requires x < 100,
+    ensures r == x + 1,
+{
+    proof { omega }
+    x + 1
+}
+
 } // verus!

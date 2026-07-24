@@ -734,17 +734,21 @@ pub(crate) fn peel_value_position(e: &Exp) -> &Exp {
 /// pieces `branch_ctor_frames` needs (the variant ident to find the
 /// field list, the scrutinee's instantiated typ for generic field
 /// substitution).
-struct BranchIsVariant<'e> {
-    dt_path: &'e vir::ast::Path,
-    variant: &'e str,
-    scrut: crate::lean_name::LeanName,
-    scrut_typ: &'e Typ,
+/// pub(crate) since bootstrap-77: the serializer's IfCtor fork arm
+/// shares the DETECTOR (single-source, like `closer_is_default` /
+/// `collect_assert_by_vars_in`) while re-assembling the ctor frames
+/// itself — the bridge validates the assembled structure.
+pub(crate) struct BranchIsVariant<'e> {
+    pub(crate) dt_path: &'e vir::ast::Path,
+    pub(crate) variant: &'e str,
+    pub(crate) scrut: crate::lean_name::LeanName,
+    pub(crate) scrut_typ: &'e Typ,
     /// The peeled scrutinee expression itself — `branch_ctor_frames`
     /// LOWERS this through the walk's render ctx to build the
     /// equation's LHS (a `&T` scrutinee renders as `x.deref`; hand-
     /// building `Var(x)` would equate the Ref with the constructor).
-    inner: &'e Exp,
-    positive: bool,
+    pub(crate) inner: &'e Exp,
+    pub(crate) positive: bool,
 }
 
 fn branch_test_of(cond: &Exp, positive: bool) -> Option<crate::lean_ast::BranchTest> {
@@ -886,7 +890,7 @@ fn branch_ctor_frames(
     Some(frames)
 }
 
-fn branch_isvariant_of(cond: &Exp, positive: bool) -> Option<BranchIsVariant<'_>> {
+pub(crate) fn branch_isvariant_of(cond: &Exp, positive: bool) -> Option<BranchIsVariant<'_>> {
     // Fixpoint-peel every transparent wrapper the SST may interpose
     // (Loc, Box/Unbox, CoerceMode, Trigger, CustomErr spans) and fold
     // an explicit `Not` into the polarity — the lowered-match chain
