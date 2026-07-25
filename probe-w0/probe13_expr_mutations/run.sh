@@ -40,7 +40,7 @@ t0=$(date +%s%N)
 t1=$(date +%s%N)
 echo "elapsed: $(( (t1 - t0) / 1000000 ))ms   lean exit=$rc"
 if [ $rc -eq 0 ]; then
-  echo "EXPR MUTATION-KILL PASS ✓  (5 baselines close + kills flip 1->0 [incl. P1 poison-channel + the A5-restored deref class])"
+  echo "EXPR MUTATION-KILL PASS ✓  (8 baselines close + kills flip 1->0 [incl. P1 poison-channel + b77 IfCtor/AssertQueryTactus arm kills])"
 else
   echo "EXPR MUTATION-KILL FAIL ✗  (a mutation did NOT flip, a baseline broke, or the parked A5 tripwire fired — see errors above)"
 fi

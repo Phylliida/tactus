@@ -44,7 +44,7 @@
 //! class) that this contract explicitly carries as trusted until A7,
 //! when deep `ExprData` leaves let refWp derive the mark
 //! reference-side and this serializer's copy demotes to a cross-check.
-//! Pinned live by the poison-flip mutation (probe13 `mut_poison`
+//! Pinned live by the poison-flip mutation (probe13 `poison_flip`
 //! class): flipping the emitted poison bit must flip the bridge 1→0.
 //!
 //! SECOND named trusted predicate (bootstrap-77): the N2 IsVariant
@@ -59,8 +59,10 @@
 //! Like the poison mark, this is carried as trusted until the
 //! reference side can express the check (A7-era deep scrutinee
 //! leaves, or an independent serializer-side peel — b77 card
-//! follow-up); an IfCtor arm-structure mutation kill (also carded)
-//! pins the assembled frames meanwhile.
+//! follow-up); the assembled frames are pinned live meanwhile by the
+//! probe13 `ifctor_eq_drop` / `ifctor_arm_swap` mutation kills
+//! (ctor-equation hyp leaf and per-arm goal structure must each flip
+//! the bridge 1→0; only the peel DECISION remains uncovered).
 //!
 //! # Snapshot point (faithfulness anchor #1)
 //!

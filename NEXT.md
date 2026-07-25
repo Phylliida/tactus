@@ -5,16 +5,17 @@
 discharge 172/0; probe9 all-green (head_exec CLOSES via IfCtor);
 probe11 all-classified (find_cancellation = the vec_read/A7 stage-B
 class); `assert-query-tactus` census tag retired; probes 13/14/37/38 +
-units green. Remaining endgame order: **b77 follow-up mutation kills FIRST
-(next-session warm-up: probe13 `ifctor_eq_drop`/`ifctor_arm_swap`/
-`aqt_hyp_drop` classes — concrete recipe on the b77 card §Follow-ups,
-incl. the bracket-aware splitter) → A4 (call-mut, card first) →
-A7 (stage-B callee-signature vocab — closes vec_read AND
-find_cancellation) → B (b67 caching + b68 flip)**. D's in-model
-tripwire column landed with b77. NOTE the serializer header now names
-a SECOND trusted predicate (the shared N2 IsVariant detector) —
-reference-side derivation rides with A7, cross-check pin rides with
-the mutation kills.
+units green. **b77 mutation kills DONE 2026-07-24 (follow-up session):
+probe13 now 8 classes (`ifctor_eq_drop`/`ifctor_arm_swap`/`aqt_hyp_drop`
++ `take_sexpr` splitter), all baselines =1 + kills =0; N2-detector
+cross-check pin wired into the serializer header contract (cites the
+live class names; `mut_poison`→`poison_flip` drift fixed). Deviation
+noted on the b77 card: eq_drop uses the 999999 sentinel — no True leaf
+is interned in head_exec's cert.** Remaining endgame order: **A4
+(call-mut, card first) → A7 (stage-B callee-signature vocab — closes
+vec_read AND find_cancellation, derives poison + N2 detector
+reference-side) → B (b67 caching + b68 flip)**. D's in-model
+tripwire column landed with b77.
 
 **The ordered map of everything remaining is now
 `DESIGN-bootstrap-endgame.md`** (milestones A–F + policy points P1–P4,
