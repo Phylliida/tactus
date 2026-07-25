@@ -60,9 +60,12 @@
 //! reference side can express the check (A7-era deep scrutinee
 //! leaves, or an independent serializer-side peel — b77 card
 //! follow-up); the assembled frames are pinned live meanwhile by the
-//! probe13 `ifctor_eq_drop` / `ifctor_arm_swap` mutation kills
-//! (ctor-equation hyp leaf and per-arm goal structure must each flip
-//! the bridge 1→0; only the peel DECISION remains uncovered).
+//! probe13 `ifctor_eq_drop` / `ifctor_binder_drop` / `ifctor_neg_drop`
+//! / `ifctor_arm_swap` mutation kills — one per assembly output channel
+//! (ctor-equation hyp, field-binder telescope, else-branch hyp, arm
+//! attachment), each must flip the bridge 1→0. The peel DECISION and
+//! the IfCtor poison bits (both 0 in the pinned cert; the poison
+//! channel itself is pinned by `poison_flip`) remain uncovered.
 //!
 //! # Snapshot point (faithfulness anchor #1)
 //!

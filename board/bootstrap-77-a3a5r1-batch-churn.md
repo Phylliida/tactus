@@ -147,16 +147,29 @@ bootstrap_coverage in-model column.
 
 * **Mutation-kill classes for the NEW arms — DONE 2026-07-24 (follow-up
   session).** All three classes landed in probe13 `gen.py` per the plan
-  below + `take_sexpr` splitter; suite = 8 classes, all baselines =1 +
-  kills =0, lean rc=0. ONE deviation: `ifctor_eq_drop` rewrites eq_prop
-  to the 999999 SENTINEL (wrong_field precedent), not "the interned True
-  leaf id" — head_exec's cert interns NO True leaf (the recipe
-  misremembered); `goals_eq` kills on id-divergence either way. N2
-  cross-check pin wired: serializer header contract now cites
-  `ifctor_eq_drop`/`ifctor_arm_swap` as the live assembled-frames pin
-  (also fixed `mut_poison`→`poison_flip` name drift there); README +
-  CLASSES comments carry the shared-decision-vs-independent-assembly
-  scoping. Original plan (for the record):
+  below + `take_sexpr` splitter. ONE deviation: `ifctor_eq_drop` rewrites
+  eq_prop to the 999999 SENTINEL (wrong_field precedent), not "the
+  interned True leaf id" — head_exec's cert interns NO True leaf (the
+  recipe misremembered); `goals_eq` kills on id-divergence either way.
+  **REVIEW ROUND same session (Danielle asked "anything you're not
+  confident in?"): the contract sentence "only the peel DECISION remains
+  uncovered" OVERSTATED the pin — two of the four N2 frame-assembly
+  output channels (field-binder telescope, else-branch hyp) had no
+  kills. Fixed by ADDING `ifctor_binder_drop` (pos_binders → Nil) +
+  `ifctor_neg_drop` (neg_prop → sentinel) rather than softening the
+  claim: suite = 10 classes, all baselines =1 + kills =0, lean rc=0,
+  one kill per assembly channel. Also fixed gen.py's docstring drift
+  ("GOAL side only" — false since poison_flip). Consciously NOT added:
+  an AQT poison-bit kill (true value is 0; the 0→1 spurious-mark
+  direction may legitimately not flip depending on gate position —
+  channel is pinned generically by poison_flip; AQT's bit rides A7).
+  Contract sentence now enumerates the channels and names the honest
+  residue (peel decision + IfCtor poison bits).** N2 cross-check pin
+  wired: serializer header contract cites all four `ifctor_*` kills as
+  the live per-channel assembled-frames pin (also fixed
+  `mut_poison`→`poison_flip` name drift there); README + CLASSES
+  comments carry the shared-decision-vs-independent-assembly scoping.
+  Original plan (for the record):
   1. Add a bracket-aware term splitter (`take_sexpr(s, i)` — scan from
      an offset, balance parens, return the span) so a ctor's
      positional args are addressable without regex fragility.
