@@ -16,7 +16,17 @@ sentinel (no True leaf interned); binder/neg kills added in review
 after catching my own contract overstatement.** Remaining endgame order: **A4
 (call-mut, IN PROGRESS — card `board/bootstrap-78-a4-call-mut.md`,
 design frozen from step-0 evidence; S1 counter mirror DONE 2026-07-25
-`5ddbebb`, byte-neutral + battery green; S2 wf-classification ⚠
+`5ddbebb`, byte-neutral + battery green; S1 review round `a5e0917` =
+emission-time cross-check, found 3 real table bugs; **S1b DONE
+2026-07-25: both card hypotheses were WRONG — count_down+clamped_inc =
+the block() join-desugar reuses the continuation term while production
+clones `after` into both branch Wps (fix: record + replay the
+continuation's theorem consumption after the else branch, gensym-
+carrying continuations reject `call-in-branch-join`); mul_bound = the
+NL query's Done(True) `_tactus_ensures_` theorem row. Certified 32/37
+(3 restored, 0 drift), 29 certs byte-identical, probe9 all-green incl.
+the 3 restored, probes 13/14/37/38 + units 406+7/0 green**; S2
+wf-classification ⚠
 resolved read-only — NEXT = S2 FnCtxData `mut_params` churn (one edit:
 field + MutParamList Dt + refWp preamble derivation + probe14/37 mk
 arity 6→7 + real mut_param_names into build_req_binders) → S3 frame

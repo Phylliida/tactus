@@ -155,10 +155,18 @@
 //!   which is ALSO consumed by every emitted theorem — so the names
 //!   depend on how many theorems precede the call in walk order. The
 //!   serializer replays the counter (`Serializer.emit_ordinal`, threaded
-//!   into `cert_call_leaves`): Assert/AssertCompute +1, AssertQueryTactus
-//!   +1, loop entry invs +|invs| before the body walk, loop maintain +
-//!   decrease +|invs|+1 after, each Ret terminal +|obligation list|,
-//!   each call +muts+1(+1 iff requires). This row is NOT a trusted
+//!   into `cert_call_leaves`): Assert/AssertCompute +1 (incl. the
+//!   recursion pass's CheckDecreaseHeight termination asserts, which are
+//!   ordinary raw-body Asserts), AssertQueryTactus +1, AssertQueryNl
+//!   body walk + 1 for the query's `Wp::Done(True)` terminator (the
+//!   `_tactus_ensures_` theorem, S1b/mul_bound), loop entry invs
+//!   +|invs| before the body walk, loop maintain + decrease +|invs|+1
+//!   after, each Ret terminal +|obligation list|, each call
+//!   +muts+1(+1 iff requires), and the two-way-join desugar REPLAYS the
+//!   reused continuation's theorem count after the else branch —
+//!   production clones `after` into both branch Wps and consumes twice
+//!   (S1b/count_down id 5, clamped_inc ids 4-5; a gensym-consuming
+//!   continuation rejects `call-in-branch-join`). This row is NOT a trusted
 //!   predicate (unlike poison / the N2 peel): it is CHECKED twice — at
 //!   emission time, the replayed per-theorem id predictions are compared
 //!   element-wise against the ids production's goal names carry
@@ -2961,6 +2969,12 @@ impl<'a> Serializer<'a> {
                 // model closes it under the post-body frame; the
                 // obligation slot is the opaque `atom_ob("True")` (the
                 // goal side atom-matches the interned `True` text).
+                // Counter mirror (bootstrap-78 S1b): that final
+                // `Wp::Done(LitBool(true))` terminator IS an emitted
+                // theorem (mul_bound's `_tactus_ensures_mul_bound_4`) —
+                // consume its id after the body walk, exactly where
+                // production's body-Wp terminator emits it.
+                self.consume_theorem_ids(1);
                 let true_id = self.leaves.intern("True".to_string());
                 let tq = atom_ob_lit(true_id);
                 Ok(format!("({}.StmData.AssertQueryNl {} {})", NS, box_(&b), tq))
@@ -3241,7 +3255,20 @@ impl<'a> Serializer<'a> {
                     // walk paths — branch-local shadows don't leak).
                     self.hyp_ordinal = save + 1;
                     let then_body = self.stm(then_stm)?;
+                    // Counter mirror (bootstrap-78 S1b): production clones
+                    // `after` into BOTH branch Wps, so the continuation's
+                    // theorems are emitted TWICE — once per branch
+                    // (count_down id 5 / clamped_inc ids 4-5 = the
+                    // else-branch copy). The term is reused verbatim, but
+                    // the consumption must replay for the else copy.
+                    // Record the continuation's consumption during its one
+                    // serialization; replay after the else-branch walk.
+                    let cont_ord_before = self.emit_ordinal;
+                    let cont_preds_before = self.predicted_theorem_ids.len();
                     let rest = self.block(&stms[1..])?;
+                    let cont_thms =
+                        (self.predicted_theorem_ids.len() - cont_preds_before) as u64;
+                    let cont_ords = self.emit_ordinal - cont_ord_before;
                     let t = format!("({}.StmData.Seq {} {})", NS, box_(&then_body), box_(&rest));
                     self.restore_branch(bstate.clone());
                     self.hyp_ordinal = save + 1;
@@ -3249,6 +3276,15 @@ impl<'a> Serializer<'a> {
                         Some(s) => self.stm(s)?,
                         None => self.skip(),
                     };
+                    // A gensym-consuming continuation (a Call after the
+                    // join) would mint then-copy names into the single
+                    // reused term while production's else copy mints its
+                    // own — the leaves cannot match both. Reject loud
+                    // (P2; corpus population 0).
+                    if cont_ords != cont_thms {
+                        return Err("call-in-branch-join".to_string());
+                    }
+                    self.consume_theorem_ids(cont_thms);
                     let e = format!("({}.StmData.Seq {} {})", NS, box_(&else_body), box_(&rest));
                     self.restore_branch(bstate);
                     self.hyp_ordinal = save;
