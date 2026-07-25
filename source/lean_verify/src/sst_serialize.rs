@@ -149,14 +149,30 @@
 //!   DESIGN-W2-refwp.md §2.6). Restricted subset: Static + same-crate +
 //!   no-`&mut` + no-generic + ret-eq path + dest present. Every other
 //!   shape fails loud (sharp census tags below).
+//! * EMITTER-COUNTER discipline (bootstrap-78 S1, card E5): production
+//!   names its per-call gensyms (`_tactus_mut_post_<id>`,
+//!   `_tactus_ret_<id>`) from the per-fn `ObligationEmitter.counter`,
+//!   which is ALSO consumed by every emitted theorem — so the names
+//!   depend on how many theorems precede the call in walk order. The
+//!   serializer replays the counter (`Serializer.emit_ordinal`, threaded
+//!   into `cert_call_leaves`): Assert/AssertCompute +1, AssertQueryTactus
+//!   +1, loop entry invs +|invs| before the body walk, loop maintain +
+//!   decrease +|invs|+1 after, each Ret terminal +|obligation list|,
+//!   each call +muts+1(+1 iff requires). This row is TRUSTED transcription
+//!   discipline like the `_h_hoist_i` mirror: a drift diverges a gensym
+//!   leaf name from production's and fails the bridge loudly (fill_zeros
+//!   `_5`/`_6` is the pinning evidence; the per-call shell-counter-from-0
+//!   it replaced matched only single-consumer fns by accident).
 //!
 //! ## Deliberately NOT read (each a stage-A exclusion — fail-loud)
 //!
 //! * `StmX::Call` shapes OUTSIDE the restricted subset above — each a
 //!   sharp fail-loud tag (so the census pinpoints the missing arm):
 //!   `call-trait` (trait-method-impl callee), `call-crosscrate` (callee
-//!   not in `fn_map`), `call-mut` (`&mut` param — needs the existential /
-//!   rebind / prophecy machinery), `call-generic` (type params —
+//!   not in `fn_map`), `call-mut` (`&mut` param — the bootstrap-78 S3
+//!   existential/rebind arm, pending), `call-mut-ret` (`&mut` RETURN —
+//!   the returned-mut-ref prophecy-composition machinery, out of scope
+//!   with zero corpus population), `call-generic` (type params —
 //!   instantiated-typ leaves), `call-unit-dest` (unit-returning call, no
 //!   dest binder), `call-dynamic-resolved` / `call-trait-default`
 //!   (non-Static resolution), and `call-forall-path` (a callee with no
@@ -454,6 +470,25 @@ struct Serializer<'a> {
     /// (production's `new_scope` drops hyps — the sub-walk numbers
     /// independently from 0, mul_bound evidence).
     hyp_ordinal: u64,
+    /// Emitter-counter mirror (bootstrap-78 S1, card E5): production's
+    /// `ObligationEmitter.counter` replayed in walk order. The counter
+    /// feeds the `_tactus_mut_post_<id>` / `_tactus_ret_<id>` gensyms
+    /// whose NAMES enter cert leaf texts at call sites — the per-call
+    /// shell-emitter-from-0 was matching production only by accident of
+    /// single-consumer fns (fill_zeros evidence: `_5`/`_6`). Consumption
+    /// table (the faithfulness-contract rows; fill_zeros id sequence
+    /// 2026-07-24 pins every row): Assert/AssertCompute theorem +1;
+    /// AssertQueryTactus theorem +1; loop entry invariants +|invs|
+    /// BEFORE the body walk; loop maintain + decrease +|invs|+1 AFTER;
+    /// each Ret's obligation list +len (plain = |enss|, G4-folded =
+    /// |branch impls|, fork = per-branch Ret each +|enss|); each call
+    /// consumes inside `cert_call_leaves` (mut_post gensyms + fresh_ret
+    /// ALWAYS + precondition theorem iff requires non-empty), threaded
+    /// via `&mut` so multi-call fns accumulate. UNLIKE `hyp_ordinal`
+    /// there is NO branch save/restore — theorem names are fn-unique
+    /// and production never resets (head_exec `_1`/`_2` sequential
+    /// across fork arms).
+    emit_ordinal: u64,
     /// Names of residue (Bool-typed) lets in scope on the current walk
     /// path — the poison-check domain (bootstrap-74 slice 2). A hyp prop
     /// or let-equation mentioning one of these forces whole-goal wrap
@@ -2459,6 +2494,8 @@ impl<'a> Serializer<'a> {
             // hyp first (keeps it in body pre-order), then the annotated
             // obligation — the goal walk (N3b) reuses whichever id.
             StmX::Assert(_, _, e) | StmX::AssertCompute(_, e, _) => {
+                // Counter mirror: one production theorem per assert.
+                self.emit_ordinal += 1;
                 // Intern the BARE hyp first (keeps it in body pre-order), then
                 // the obligation slot (`oblig_slot` interns the span_mark'd
                 // leaf + the deep `raw_exp` atoms after it). The hyp render
@@ -2660,6 +2697,9 @@ impl<'a> Serializer<'a> {
                             // identically (and would mis-conjoin the ensures).
                             if impls.len() >= 2 {
                                 self.lifted_return_recomputes += 1;
+                                // Counter mirror: one production theorem
+                                // per branch-folded implication obligation.
+                                self.emit_ordinal += impls.len() as u64;
                                 let list = raw_exp_list(&impls);
                                 return Ok(format!(
                                     "({}.StmData.Ret {} {}.RetBind.RetNone)",
@@ -2826,6 +2866,11 @@ impl<'a> Serializer<'a> {
                     &self.fn_map,
                     &self.caller_param_typs,
                     &self.let_binder_typs,
+                    // Counter mirror (bootstrap-78 S1): the shell emitter
+                    // mints this call's gensyms from the WALK-ORDER
+                    // counter, and the consumed ids (mut_posts + fresh_ret
+                    // + precondition theorem) advance it in place.
+                    &mut self.emit_ordinal,
                 )?;
                 self.call_stm(leaves)
             }
@@ -2898,6 +2943,10 @@ impl<'a> Serializer<'a> {
                 match kind {
                     vir::ast::TactusKind::ProofBlock => Ok(self.skip()),
                     vir::ast::TactusKind::AssertBy => {
+                        // Counter mirror: one production theorem per
+                        // assert-by (emit_with_closer site; the inner
+                        // Assert is destructured here, never re-walked).
+                        self.emit_ordinal += 1;
                         // `body` is a single `StmX::Assert` carrying the
                         // asserted condition (ast_to_sst's Tactus-shortcut
                         // emission; production destructures identically).
@@ -2946,6 +2995,11 @@ impl<'a> Serializer<'a> {
     }
 
     fn ret_terminal_opt(&mut self, ret_exp: Option<&Exp>) -> Sr<String> {
+                // Counter mirror: one production theorem per ensures
+                // obligation at each Ret terminal (fork-route branch Rets
+                // each consume — head_exec `_1`/`_2`; a `return;`/no-ens fn
+                // consumes 0).
+                self.emit_ordinal += self.pending_ens_oblig.len() as u64;
                 // Annotated ensures obligation leaves drive the `Return`
                 // goal (Ret-annotation, finding-1): span_mark'd like
                 // production's `WpCtx` postcondition so the goal-side
@@ -3452,9 +3506,18 @@ impl<'a> Serializer<'a> {
         // the outer body gets `_h_hoist_10` right after the inner
         // loop's `_h_hoist_5..9`, while the inner body's own hyps
         // number from the same point).
+        // Counter mirror: production emits the ENTRY invariant theorems
+        // (one per inv) at the loop head, BEFORE walking the body
+        // (fill_zeros: entry 2,3,4 precede the in-body call's 5,6).
+        self.emit_ordinal += invs.len() as u64;
         let loop_counter_end = self.hyp_ordinal;
         let body_term = self.stm(body)?;
         self.hyp_ordinal = loop_counter_end;
+        // Counter mirror: MAINTAIN theorems (one per inv) + the DECREASE
+        // theorem, consumed after the body walk (fill_zeros: 8,9,10 then
+        // 11). `decrease.len() == 1` is enforced above; nonstandard
+        // invariants fail loud above, so |invs| is exact by construction.
+        self.emit_ordinal += invs.len() as u64 + 1;
 
         // The body-end decrease obligation — rendered AFTER the body
         // walk so the shadow renames apply to the measure

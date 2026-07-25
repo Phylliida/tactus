@@ -5104,6 +5104,18 @@ pub(crate) fn cert_call_leaves<'a>(
     // re-wraps `Tactus.Ref.mk` at the next call's arg slot and the
     // instantiated ensures leaf diverges (apply_hom class).
     let_binder_typs: &im::HashMap<crate::lean_name::LeanName, (Typ, bool)>,
+    // Emitter-counter mirror (bootstrap-78 S1, card E5): production's
+    // per-fn `ObligationEmitter.counter` value at THIS call site,
+    // replayed by the serializer's walk. The shell emitter below starts
+    // here (not 0 — the old per-call zero matched production only for
+    // fns whose call was the first consumer; fill_zeros' `_tactus_mut_
+    // post_5`/`_ret_6` is the counter-example). On success the consumed
+    // ids advance it: build_call_substitutions' gensyms (one per &mut
+    // arg + fresh_ret always, sites ~4025/4034) + one for the
+    // precondition theorem production emits iff requires is non-empty
+    // (~3634 guard) — which this fn mirrors as a leaf WITHOUT emitting,
+    // so the id is added manually.
+    emit_counter: &mut u64,
 ) -> Result<CertCallLeaves, String> {
     // ── Phase A: restricted-subset resolution (mirrors resolve_callee's
     // Static arm; everything else is a sharp fail-loud tag). ──
@@ -5129,8 +5141,18 @@ pub(crate) fn cert_call_leaves<'a>(
     // the VIR level below (`ret_typ_subst`, mirroring production's
     // dest-let binder typ) so `type_bound_predicate`/`coerce_lexpr`
     // see the concrete typ, not a bare `TypParam`.
-    // No `&mut` params — the mut-arg existential / rebind / prophecy
-    // machinery is out of the restricted subset.
+    // Returned-`&mut` callees — the returned-mut-ref PROPHECY
+    // COMPOSITION machinery (`mint_return_prophecy` + `OblCtx::
+    // prophecies` reuse across later calls) is out of the restricted
+    // subset; sharper tag than the param class since it is the harder
+    // machinery (bootstrap-78 D3; zero corpus population — a &mut
+    // return necessarily borrows from a &mut param, so check FIRST).
+    if crate::expr_shared::is_mut_ref_typ(&callee.ret.x.typ, false) {
+        return Err("call-mut-ret".to_string());
+    }
+    // No `&mut` params — the mut-arg existential / rebind machinery
+    // is the bootstrap-78 S3 arm (Var targets); until it lands every
+    // mut-param callee tags out here.
     if callee.params.iter()
         .any(|p| crate::expr_shared::is_mut_ref_typ(&p.x.typ, p.x.is_mut))
     {
@@ -5166,7 +5188,11 @@ pub(crate) fn cert_call_leaves<'a>(
     let mut emitter = ObligationEmitter {
         fn_name: String::new(),
         base_binders: Vec::new(),
-        counter: 0,
+        // Counter mirror (bootstrap-78 S1): start at the walk-order
+        // value, NOT 0 — `build_call_substitutions` mints this call's
+        // `_tactus_mut_post_<id>` / `_tactus_ret_<id>` gensyms from it
+        // and those names enter cert leaf texts.
+        counter: *emit_counter as usize,
         out: Vec::new(),
         goal_shapes: Vec::new(),
         tactic_prefix: Vec::new(),
@@ -5297,6 +5323,14 @@ pub(crate) fn cert_call_leaves<'a>(
             }
         }
     };
+
+    // Counter mirror: report the ids production consumes at this call —
+    // the shell emitter's advance (gensyms minted in Phase C: one per
+    // &mut arg + fresh_ret) plus the precondition theorem's id
+    // (production's ~3634 guard: emitted iff requires non-empty, which
+    // is exactly `precondition.is_some()` — this fn mirrors the leaf
+    // without emitting, so the id is added here).
+    *emit_counter = emitter.counter as u64 + u64::from(precondition.is_some());
 
     Ok(CertCallLeaves {
         precondition,
