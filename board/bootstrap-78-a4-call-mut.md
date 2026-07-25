@@ -260,9 +260,45 @@ row in the gate report updates automatically (tags are data-driven).
    remaining = call-mut ×2 + rawvir classes), all 29 pre-existing
    certs byte-identical, probe9 all-green incl. the 3 restored certs
    (vec_read lone hfail-ok), probes 13/14/37/38 green, units green.
-2. **S2 FnCtxData churn** — `mut_params: MutParamList` + refWp preamble
-   derivation + W5/FnCtx consumption + probe pins (14/37) + wf-sig
-   check. One edit, fresh-session-sized attention.
+2. **S2 FnCtxData churn — DONE 2026-07-25.** Landed as designed with
+   ONE at-impl deviation to D2's entry triple: slot 3 is the **deref
+   VALUE leaf** (interned `<p>.deref` text), NOT the inner typ leaf —
+   `GoalData::Let`/`FLet` carry value LEAF ids, so the derived frames
+   need the interned text (the FLetH typ/eq-leaf precedent: serializer
+   renderings of production's exact pp); the inner typ has NO S2
+   consumer (call-site typs ride `Call.post` per D1 — add a slot later
+   if S3/W5 shows a consumer). Key mechanism finding (evidence:
+   vec_push7 emitted theorem + production `hoist_all` ~2094):
+   production's preamble lets are TYP-LESS `CtxFrame::Let`s
+   (`add_pre_capture`/`add_body_shadow` ~1517) → `hoist_all` bails →
+   **every goal of a mut-param fn is WRAP-MODE**, with params/reqs
+   staying theorem binders as the emitter's BASE binders — which the
+   mirror gets for free: `mut_preamble_frame` derives two PLAIN FLets
+   per entry (at_pre first), plainness trips `has_plain_flet`, and
+   FBind→All keeps the base binders. Serializer: entries from mut-ref
+   pars + `BorrowMut` local_decls in declaration order (production's
+   initial-OblCtx loop ~1526) + `mark_flet_forced()` when non-empty
+   (freshening only runs inside hoist_all; mut-fn goals never hoist).
+   Landed: MutParamList Dt + `FnCtxData.mut_params` (position 5, .mk
+   arity 6→7) + `mut_preamble_frame` + seed_frame wiring + wrap-mode
+   non-vacuity pin (`ref_wp_mut_preamble_wrap`, decide) + serializer
+   population/`mut_param_list` builder + module-doc contract rows.
+   Churn fallout handled: 17 vendored pin files arity-bumped
+   (probe11 certs+Pinpoint, probe20 certs, probe14, probe10);
+   probe37's `hwf_c.2^5` → `.2^6` (FnCtxDataWf gained the
+   MutParamListWf conjunct); golden add_capped re-vendored from fresh
+   emission; probe20 de-staled with the probe9-style all-preludes glob
+   (its pinned prelude dir was the documented milestone-C stale-red
+   class — pre-existing, surfaced by running it). Battery: tactus-core
+   gate **256/0** + package gate kernel-verified + **Link discharge
+   172/0** (wf synthesis absorbed MutParamList automatically), fixture
+   emission certified 32/37 (same reject set; all 21 snapshot-compared
+   certs ctx-line-only diffs), probe9 all-green (24 certs), probe11
+   all-green, probes 13/14/37/38 green, probe20 all-green, units
+   406+7/0. NOTE for S3: no new certifying fn this slice (every
+   mut-param fixture fn still rejects on its CALL — `call-mut`); the
+   preamble derivation gets its first live subject when S3's `fn
+   inc(x: &mut u64)` lands with the call arm.
 3. **S3 call frame assembly** — D3 rest; vec_push7 + fill_zeros certs
    elaborate + decide-close (extend probe9 subjects).
 4. **S4 kills** (D5) + tag retirement + battery.
