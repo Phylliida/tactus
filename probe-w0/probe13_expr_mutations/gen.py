@@ -22,6 +22,15 @@ classes plus the P1 poison-channel class, each on its own live cert:
   * poison_flip  (add_capped, P1 trusted wrap-gate mark): poison bit 1 -> 0,
                  SST-side — pins that a serializer mismark flips the bridge
                  (DESIGN-bootstrap-endgame §1 P1)
+  * ifctor_eq_drop  (head_exec, b77/A5): degenerate the IfCtor ctor-equation
+                 hyp leaf, SST-side — with ifctor_arm_swap, ALSO the interim
+                 N2-detector cross-check pin (second trusted predicate,
+                 sst_serialize.rs header): frame ASSEMBLY is pinned while
+                 the peel decision stays shared until A7
+  * ifctor_arm_swap (head_exec, b77/A5): swap the fork's thn/els bodies,
+                 SST-side — per-arm goals under the wrong branch hyps
+  * aqt_hyp_drop (assert_by_default, b77/A3): drop the AssertQueryTactus
+                 AssertFact bare-P hyp leaf, SST-side
 
 For each: extract the live cert's ctx/sst/goals VERBATIM, apply a single
 STRUCTURAL text mutation to the GOAL side only (`ref_wp`/ctx/sst untouched, so
@@ -54,6 +63,23 @@ def match_paren(s, i):
             if depth == 0:
                 return j
     raise ValueError("unbalanced")
+
+
+def take_sexpr(s, i):
+    """Bracket-aware term splitter (b77 follow-up): scan from offset `i`,
+    skip leading whitespace, and return the span `(start, end)` of the next
+    term — a balanced `( … )` group or a bare atom (scalar / bare ctor).
+    Makes a ctor's POSITIONAL args addressable without regex fragility:
+    walk args by repeated `_, i = take_sexpr(s, i)`."""
+    while i < len(s) and s[i].isspace():
+        i += 1
+    assert i < len(s) and s[i] != ')', f"take_sexpr: no term at {i}"
+    if s[i] == '(':
+        return i, match_paren(s, i) + 1
+    j = i
+    while j < len(s) and not s[j].isspace() and s[j] not in '()':
+        j += 1
+    return i, j
 
 
 def extract_def(text, name):
@@ -164,6 +190,75 @@ def poison_drop(sst):
     return sst2
 
 
+def _ifctor_args(sst):
+    """Locate the (single) `lib.StmData.IfCtor` node and return the spans of
+    its positional args: (pos_binders, [6 scalar spans], thn, els). Layout
+    per tactus-core: pos_binders, eq_name, eq_prop, eq_poison, neg_name,
+    neg_prop, neg_poison, thn, els."""
+    key = "lib.StmData.IfCtor "
+    j = sst.find(key)
+    assert j != -1, "ifctor: no `lib.StmData.IfCtor` node — fixture lost its A5 fork"
+    assert sst.find(key, j + 1) == -1, "ifctor: multiple IfCtor nodes; splitter assumes one"
+    i = j + len(key)
+    binders = take_sexpr(sst, i)
+    scalars, i = [], binders[1]
+    for _ in range(6):
+        sp = take_sexpr(sst, i)
+        assert sst[sp[0]:sp[1]].isdigit(), f"ifctor: expected scalar, got {sst[sp[0]:sp[1]]!r}"
+        scalars.append(sp)
+        i = sp[1]
+    thn = take_sexpr(sst, i)
+    els = take_sexpr(sst, thn[1])
+    assert sst[thn[0]] == '(' and sst[els[0]] == '(', "ifctor: thn/els not paren groups"
+    return binders, scalars, thn, els
+
+
+def ifctor_eq_drop(sst):
+    """A5/N2 kill (SST-side): degenerate the IfCtor ctor-equation hyp —
+    rewrite the `eq_prop` leaf scalar (the annotated `scrut = Dt.Variant fs`
+    prop the shared N2 detector's frame assembly produced) to the 999999
+    sentinel no real leaf interns (wrong_field precedent; the card's
+    "interned True leaf" does not exist in this cert — head_exec interns no
+    True, and `goals_eq` kills on id-divergence either way). Models a broken
+    frame assembly emitting a wrong/degenerate equation hyp: refWp emits
+    `All eq_name 999999` where production goals carry the real eq_prop."""
+    _, scalars, _, _ = _ifctor_args(sst)
+    s, e = scalars[1]  # eq_prop
+    assert sst[s:e] != "999999", "ifctor_eq_drop: eq_prop already sentinel?"
+    return sst[:s] + "999999" + sst[e:]
+
+
+def ifctor_arm_swap(sst):
+    """A5 kill (SST-side): swap the IfCtor `thn`/`els` boxed bodies — the
+    per-arm continuation goals emit under the WRONG branch hypotheses
+    (then-goals under ¬cond, else-goals under the ctor equation + field
+    binders), so refWp's goal list diverges from production's."""
+    _, _, (t0, t1), (e0, e1) = _ifctor_args(sst)
+    thn, els = sst[t0:t1], sst[e0:e1]
+    assert thn != els, "ifctor_arm_swap: thn == els — swap would be a no-op"
+    return sst[:t0] + els + sst[t1:e0] + thn + sst[e1:]
+
+
+def aqt_hyp_drop(sst):
+    """A3 kill (SST-side): drop the AssertQueryTactus AssertFact hyp —
+    rewrite the bare-P leaf scalar (2nd-from-last arg: obligation, hyp_name,
+    bare_P, poison) to 0. The continuation goals lose the proven-inline
+    fact: refWp emits `All hyp_name 0` where production goals carry the
+    real bare-P leaf. (The following Assume still carries the real leaf, so
+    the kill isolates the AQT arm's own hyp push.)"""
+    key = "lib.StmData.AssertQueryTactus "
+    j = sst.find(key)
+    assert j != -1, "aqt: no `lib.StmData.AssertQueryTactus` node — fixture lost its A3 assert-by"
+    i = j + len(key)
+    oblig = take_sexpr(sst, i)
+    assert sst[oblig[0]] == '(', "aqt: obligation not a paren group"
+    name = take_sexpr(sst, oblig[1])
+    bare = take_sexpr(sst, name[1])
+    s, e = bare
+    assert sst[s:e].isdigit() and sst[s:e] != "0", f"aqt_hyp_drop: bare-P scalar {sst[s:e]!r} unusable"
+    return sst[:s] + "0" + sst[e:]
+
+
 # (fn, class, human description, mutation, which def the mutation edits, expect)
 #
 # expect="close": baseline bridges (=1) and the mutation kills (=0).
@@ -182,6 +277,17 @@ CLASSES = [
     ("mk_point",   "wrong_field", "emit a wrong struct field accessor (G3)",          wrong_field,     "goals", "close"),
     ("add_capped", "wrong_width", "wrong HasType overflow bound width 2^64->2^32 (G6)", wrong_width,   "goals", "close"),
     ("add_capped", "poison_flip", "zero ALL wrap-gate poison marks (P1 trusted-predicate channel)", poison_drop, "sst", "close"),
+    # b77 arm-structure kills (card §Follow-ups): pin the NEW IfCtor /
+    # AssertQueryTactus arms. The two IfCtor kills are ALSO the interim
+    # N2-detector cross-check pin (serializer header contract, second
+    # trusted predicate): the peel-to-IsVariant DECISION is shared
+    # common-mode, but the FRAME ASSEMBLY is recomputed independently —
+    # these kills prove the assembled frames (ctor-equation hyp, per-arm
+    # goal structure) are load-bearing in the bridge until A7 derives the
+    # detector reference-side.
+    ("head_exec",  "ifctor_eq_drop",  "IfCtor: degenerate the ctor-equation hyp leaf (A5/N2 frame assembly)", ifctor_eq_drop,  "sst", "close"),
+    ("head_exec",  "ifctor_arm_swap", "IfCtor: swap thn/els arm bodies (A5 fork structure)",                   ifctor_arm_swap, "sst", "close"),
+    ("assert_by_default", "aqt_hyp_drop", "AssertQueryTactus: drop the AssertFact bare-P hyp (A3)",            aqt_hyp_drop,    "sst", "close"),
 ]
 
 
@@ -192,12 +298,13 @@ def main():
     L.append("set_option autoImplicit false")
     L.append("set_option maxRecDepth 8000")
     L.append("")
-    L.append("-- W6e expression-level mutation-kill suite (bootstrap-24), GENERATED by")
-    L.append("-- gen.py from the LIVE fixture certs. For each of the four coercion-drop")
-    L.append("-- classes: the unperturbed deep bridge closes (=1); a single GOAL-side")
-    L.append("-- coercion drop must FLIP the verdict to 0 (proved positively by decide),")
-    L.append("-- because ref_wp INDEPENDENTLY re-derives the correct structure. If any")
-    L.append("-- mutation still equalled 1, its `= 0` example would error.")
+    L.append("-- W6e expression-level mutation-kill suite (bootstrap-24; b77 arm kills")
+    L.append("-- added), GENERATED by gen.py from the LIVE fixture certs. For each class:")
+    L.append("-- the unperturbed deep bridge closes (=1); a single structural mutation")
+    L.append("-- (GOAL-side coercion drop, or SST-side mark/arm perturbation) must FLIP")
+    L.append("-- the verdict to 0 (proved positively by decide), because ref_wp")
+    L.append("-- INDEPENDENTLY re-derives the correct structure. If any mutation still")
+    L.append("-- equalled 1, its `= 0` example would error.")
     L.append("")
 
     fired = 0

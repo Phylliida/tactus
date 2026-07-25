@@ -145,9 +145,18 @@ bootstrap_coverage in-model column.
   `post_condition.dest` Option) — probe9 re-pinned all-green on the
   rebuilt binary.
 
-* **Mutation-kill classes for the NEW arms — NEXT SESSION'S WARM-UP**
-  (acceptance item, explicitly deferred; also queued in NEXT.md).
-  Concrete plan for probe13 `gen.py`:
+* **Mutation-kill classes for the NEW arms — DONE 2026-07-24 (follow-up
+  session).** All three classes landed in probe13 `gen.py` per the plan
+  below + `take_sexpr` splitter; suite = 8 classes, all baselines =1 +
+  kills =0, lean rc=0. ONE deviation: `ifctor_eq_drop` rewrites eq_prop
+  to the 999999 SENTINEL (wrong_field precedent), not "the interned True
+  leaf id" — head_exec's cert interns NO True leaf (the recipe
+  misremembered); `goals_eq` kills on id-divergence either way. N2
+  cross-check pin wired: serializer header contract now cites
+  `ifctor_eq_drop`/`ifctor_arm_swap` as the live assembled-frames pin
+  (also fixed `mut_poison`→`poison_flip` name drift there); README +
+  CLASSES comments carry the shared-decision-vs-independent-assembly
+  scoping. Original plan (for the record):
   1. Add a bracket-aware term splitter (`take_sexpr(s, i)` — scan from
      an offset, balance parens, return the span) so a ctor's
      positional args are addressable without regex fragility.

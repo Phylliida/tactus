@@ -22,14 +22,26 @@ The deep symmetric compare against the independent `render_exp` must instead
 **FLIP** the bridge `1 -> 0`.
 
 probe13 demonstrates the flip, positively and by `decide`, for **four
-coercion-drop classes**, one per fixture fn on its own live cert:
+coercion-drop classes** (GOAL-side) plus **four trusted-channel / arm-structure
+classes** (SST-side), each on its own live cert:
 
-| class | fn | gap | mutation (GOAL side) |
+| class | fn | gap | mutation |
 |---|---|---|---|
-| `cast_drop`   | `sum_to`     | nat-coercion | drop one `Int.toNat`: `Cast IntToNat (Atom N)` → `Atom N` |
-| `deref_drop`  | `head_exec`  | G2 auto-deref | drop the `.deref`: `FieldProj (Atom N) 0` → `Atom N` |
-| `wrong_field` | `mk_point`   | G3 struct field | wrong accessor: `FieldProj (Atom N) F` → `FieldProj (Atom N) 999999` |
-| `wrong_width` | `add_capped` | G6 HasType | wrong overflow bound: `Lit 2^64` → `Lit 2^32` |
+| `cast_drop`   | `sum_to`     | nat-coercion | GOAL: drop one `Int.toNat`: `Cast IntToNat (Atom N)` → `Atom N` |
+| `deref_drop`  | `head_exec`  | G2 auto-deref | GOAL: drop the `.deref`: `FieldProj (Atom N) 0` → `Atom N` |
+| `wrong_field` | `mk_point`   | G3 struct field | GOAL: wrong accessor: `FieldProj (Atom N) F` → `FieldProj (Atom N) 999999` |
+| `wrong_width` | `add_capped` | G6 HasType | GOAL: wrong overflow bound: `Lit 2^64` → `Lit 2^32` |
+| `poison_flip` | `add_capped` | P1 trusted wrap-gate mark | SST: zero ALL poison marks — a serializer mismark must flip |
+| `ifctor_eq_drop` | `head_exec` | b77/A5 + N2 frame assembly | SST: degenerate the `IfCtor` ctor-equation hyp leaf (sentinel id) |
+| `ifctor_arm_swap` | `head_exec` | b77/A5 fork structure | SST: swap the `thn`/`els` boxed bodies |
+| `aqt_hyp_drop` | `assert_by_default` | b77/A3 AssertFact hyp | SST: bare-P leaf → 0 — continuation goals lose the proven-inline fact |
+
+The two `ifctor_*` kills are also the **interim N2-detector cross-check pin**
+(the serializer header contract's second trusted predicate): the
+peel-to-IsVariant *decision* is shared common-mode with production, but the
+frame *assembly* is recomputed independently — these kills prove the assembled
+frames are load-bearing in the bridge until A7 derives the detector
+reference-side.
 
 For each class the generated `ExprMutations.lean` asserts, all by `decide`:
 
