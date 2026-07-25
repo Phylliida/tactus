@@ -466,6 +466,40 @@ fn span_mark_render_preserves_loc_verbatim() {
     );
 }
 
+/// A rust_loc containing Lean comment delimiters must NOT break the
+/// `/- @rust:LOC -/` marker (2026-07-25 audit). Lean block comments
+/// nest: a path with `/-` (any directory whose name starts with `-`,
+/// e.g. `/tmp/claude-1000/-home-x/f.rs`) opens a NESTED comment and
+/// the marker's closing ` -/` leaves the outer comment unterminated —
+/// a parse error on the whole generated file. Unlike the newline
+/// case above, this can't be fixed at the producer: the path is the
+/// user's real path, and the LANDMARK must keep it verbatim for
+/// error mapping — only the debug-comment text is sanitized.
+#[test]
+fn span_mark_comment_delimiters_sanitized() {
+    use crate::lean_ast::AssertKind;
+    use crate::lean_ast::ObligationKind;
+    for loc in ["/tmp/claude-1000/-home-x/probe.rs:1:2", "/tmp/a-/b.rs:3:4"] {
+        let marked = Expr::new(ExprNode::SpanMark {
+            rust_loc: loc.to_string(),
+            rust_span: None,
+            kind: AssertKind::Obligation(ObligationKind::Plain),
+            inner: Box::new(lit(42)),
+        });
+        let mut out = String::new();
+        let mut lm = Landmarks { tactic_starts: Vec::new(), span_marks: Vec::new(), theorem_heads: Vec::new() };
+        write_expr(&mut out, &marked, 0, &mut lm);
+        // The rendered comment text must contain neither delimiter
+        // beyond the marker's own open/close pair.
+        let open_count = out.matches("/-").count();
+        let close_count = out.matches("-/").count();
+        assert_eq!((open_count, close_count), (1, 1),
+            "marker must be the only comment pair for {loc:?}, got: {out:?}");
+        // The landmark keeps the path verbatim.
+        assert_eq!(lm.span_marks[0].loc, loc, "landmark verbatim for {loc:?}");
+    }
+}
+
 /// Pins that representative span-loc shapes produced by
 /// Tactus's path are single-line. If `Span::start_loc` ever
 /// becomes multi-line for some input, this test fires and the

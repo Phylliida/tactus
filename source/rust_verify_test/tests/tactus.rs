@@ -8439,6 +8439,137 @@ test_verify_one_file_with_options! {
     } => Ok(())
 }
 
+// AUDIT PROBE (2026-07-25, mut_ref_normalize review): a FALSE
+// post-call assert on a simple-var `&mut` arg must FAIL. Guards the
+// callee-ensures inlining against rendering the post-state
+// (`MutRefFuture`) hypothesis vacuously or as pre-state.
+// Context: `rewrite_varat_for_mut_params` is a SINGLE post-order
+// pass; its SST twin documents (and two-pass-splits around) a
+// rewrite-order race for `MutRefFuture(_, VarAt(x, Pre))` — the
+// inner VarAt renames first and the outer op no longer recognizes a
+// mut-param ref, so the generic Unary passthrough renders the
+// PRE-state name. If that shape ever reaches the AST inlining path,
+// the inlined ensures becomes `pre == pre + 1` (False) and this
+// assert would verify — this probe is the tripwire.
+test_verify_one_file_with_options! {
+    #[test] audit_probe_mut_arg_false_assert_fails ["new-mut-ref"] => verus_code! {
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn bump(x: &mut u8)
+            requires *old(x) < 100
+            ensures *x == *old(x) + 1
+        {
+            *x = *x + 1;
+        }
+
+        #[verifier::tactus_auto]
+        fn call_mut_wrong()
+        {
+            let mut y: u8 = 5;
+            bump(&mut y);
+            assert(y == 5); // FALSE — y is 6 here
+        }
+    } => Err(err) => {
+        let s = format!("{:?}", err);
+        assert!(s.contains("tactus_auto failed") || s.contains("assert"),
+            "expected a verification failure (not a panic / not Ok), got: {}", s);
+    }
+}
+
+// AUDIT PROBE (2026-07-25, mut_ref_normalize review): a `&mut` call
+// in a WHILE CONDITION. `collect_borrow_mut_links` walks
+// `StmX::Loop { body, .. }` but not the `cond` setup Stm — if Verus
+// keeps this loop's `cond: Some((setup, exp))` with the BorrowMut
+// linkage Assign inside the setup, the indirection there is never
+// collected/eliminated. Acceptable outcomes: graceful rejection or a
+// genuine verification failure. NOT acceptable: a panic, or Ok (the
+// fn's ensures is FALSE — y ends at 0, not 77 — so an Ok would mean
+// the missed linkage produced a vacuous/false hypothesis).
+test_verify_one_file_with_options! {
+    #[test] audit_probe_mut_arg_in_while_cond ["new-mut-ref"] => verus_code! {
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn halve(x: &mut u8) -> (r: bool)
+            ensures *x == *old(x) / 2, r == (*x > 0)
+        {
+            *x = *x / 2;
+            *x > 0
+        }
+
+        #[verifier::tactus_auto]
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn drain() -> (r: u8)
+            ensures r == 77  // FALSE — the loop drains y to 0
+        {
+            let mut y: u8 = 200;
+            while halve(&mut y)
+                decreases y
+            {
+            }
+            y
+        }
+    } => Err(err) => {
+        let s = format!("{:?}", err);
+        assert!(!s.contains("panicked"),
+            "must fail gracefully, not panic: {}", s);
+    }
+}
+
+// AUDIT SOUNDNESS PIN (2026-07-25): before the
+// `cond_setup_user_mutation` gate, this VERIFIED its blatantly false
+// ensures — the cond call zeroes `y` on the way out of the loop, but
+// the BorrowMut pre-passes and `collect_modifications` walk only the
+// loop BODY, so post-loop reasoning kept `y` at its pre-loop value
+// (`r == 5` proved; reality `r == 0`). The gate now rejects
+// user-local mutation inside a loop condition with a hoist-into-body
+// workaround message. If loop-cond mutation support ever lands, this
+// test must flip to a genuine verification failure of the false
+// ensures — never Ok.
+test_verify_one_file_with_options! {
+    #[test] audit_probe_while_cond_mutation_unsound ["new-mut-ref"] => verus_code! {
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn set_zero(x: &mut u8) -> (r: bool)
+            ensures *x == 0, r == false
+        {
+            *x = 0;
+            false
+        }
+
+        #[verifier::tactus_auto]
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn probe() -> (r: u8)
+            ensures r == 5  // FALSE — the cond call zeroes y
+        {
+            let mut y: u8 = 5;
+            while set_zero(&mut y)
+                decreases y
+            {
+            }
+            y
+        }
+    } => Err(err) => {
+        let s = format!("{:?}", err);
+        assert!(s.contains("loop condition mutates") || s.contains("tactus_auto failed")
+                || s.contains("postcondition"),
+            "false ensures must NOT verify (soundness); got: {}", s);
+    }
+}
+
+// AUDIT FIX PIN (2026-07-25): a `&u8` param carries its refinement
+// bound on the Lean side. `type_bound_predicate` previously returned
+// `None` for decoration-wrapped typs (`Decorate(Ref, U(8))`), losing
+// the `0 ≤ p.deref < 256` hypothesis that AIR's `typ_invariant`
+// (which undecorates) gives the Z3 path — this ensures needs the
+// upper bound, so it pins the fix.
+test_verify_one_file! {
+    #[test] test_exec_ref_param_carries_bound verus_code! {
+        #[verifier::tactus_auto]
+        fn ref_param_bound(p: &u8) -> (r: u16)
+            ensures r <= 255
+        {
+            *p as u16
+        }
+    } => Ok(())
+}
+
 // #93 closure probes — characterize what the renderer rejects so a
 // future implementation has tests to flip. Two distinct shapes in the
 // SST:
