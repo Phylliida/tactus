@@ -230,6 +230,36 @@ row in the gate report updates automatically (tags are data-driven).
    406+7/0. Battery evidence that S1's replay is correct for every
    currently-CLOSING shape (sum_to's loop rows pass) — the 3 finds are
    in never-validated corners, which is exactly what F2 was for.
+
+   **S1b DONE 2026-07-25 — diagnosis CORRECTED both card hypotheses**
+   (the queue's guesses above were wrong in instructive ways):
+   * `count_down` + `clamped_inc` = ONE bug, and it is NOT a missing
+     termination row or a route mismatch: the `block()` two-way-join
+     desugar (`Seq(If,rest)` → `If(t;rest, e;rest)`, bootstrap-19)
+     serializes the continuation ONCE and reuses the term verbatim in
+     the else branch — but production's Wp tree CLONES `after` into
+     both branch Wps (`walk_obligations` `Wp::Branch` arm comment
+     ~3064) and consumes its theorem ids TWICE. The termination assert
+     was already counted correctly (it is an ordinary raw-body
+     `StmX::Assert` from the recursion pass — count_down prediction 3)
+     and the call's fresh_ret gensym was already consumed (ordinal 4);
+     the missing id was the ELSE-branch copy of the continuation
+     (count_down id 5 = else-path postcondition; clamped_inc ids 4-5 =
+     else-path × 2 ensures). FIX: record the continuation's
+     (ordinal, prediction) deltas during its single serialization,
+     replay `consume_theorem_ids` after the else-branch walk; a
+     gensym-consuming continuation (a Call after the join) rejects
+     loud `call-in-branch-join` — its minted names could not match
+     both production copies (corpus population 0).
+   * `mul_bound` = as hypothesized: the NL query's body Wp is built
+     with a `Wp::Done(LitBool(true))` terminator (~6903) and the Done
+     arm emits it as the `_tactus_ensures_` theorem — the NL arm now
+     consumes +1 after the body walk.
+   Header contract table updated with all three rows. Validation:
+   fixture emission certified 32/37 (the 3 drift rejects cleared,
+   remaining = call-mut ×2 + rawvir classes), all 29 pre-existing
+   certs byte-identical, probe9 all-green incl. the 3 restored certs
+   (vec_read lone hfail-ok), probes 13/14/37/38 green, units green.
 2. **S2 FnCtxData churn** — `mut_params: MutParamList` + refWp preamble
    derivation + W5/FnCtx consumption + probe pins (14/37) + wf-sig
    check. One edit, fresh-session-sized attention.
