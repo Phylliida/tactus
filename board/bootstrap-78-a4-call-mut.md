@@ -194,6 +194,42 @@ row in the gate report updates automatically (tags are data-driven).
    ~4025 (Var/Field targets); ~4348 is the returned-mut-ref path
    (tagged out). Prophecy-REUSE consumes 0 ids (skip site) — also
    tagged out with `call-mut-ret`.
+
+   **S1 REVIEW ROUND (2026-07-25, Danielle-prompted "anything you're
+   not confident in?"):** two fixes + one big find.
+   (F1) header row mislabeled the counter "TRUSTED" — reworded: it is
+   CHECKED (gensym drift = loud bridge red; and now the F2 check).
+   (F2, the more-right-way find) **emission-time cross-check landed**:
+   `predicted_theorem_ids` records every replayed theorem-id
+   consumption; after the goal walk they compare element-wise against
+   the ids production's theorem names carry (ALL `theorems`, not the
+   spine-filtered `goal_names`); mismatch = sharp `emit-counter-drift`
+   census reject. Validates the whole table (loop rows, wrap-mode
+   walk-order timing) on EVERY cert — not only where gensym names print.
+   **THE CHECK IMMEDIATELY FOUND 3 REAL TABLE BUGS** (invisible to the
+   byte-diff — none of these fns print gensyms; all three would have
+   silently shifted gensym ids in S3+ shapes): the three certs now
+   census-reject with `emit-counter-drift` (honest P2 fail-louds, NOT
+   regressions — a cert embedding a wrong counter should reject).
+   **S1b QUEUE (diagnose fresh, BEFORE the S2 churn):**
+   * `count_down` [1,2,3,5]≠[1,2,3]: production emits a
+     `_tactus_termination_` theorem at the RECURSIVE call site (id 3,
+     before the call's gensym 4) — a consumption row the table lacks
+     (decreases-check theorem; find the emit site in walk_call, add
+     the row + prediction for self/decreases-carrying callees).
+   * `clamped_inc` [1..5]≠[1,2,3]: production emits per-branch × per-
+     ensures postcondition theorems (4) for the value-if return; the
+     mirror's Ret route predicted ONE Ret of 2 — route mismatch to
+     diagnose (which route does the mirror take here, and was this fn
+     ever a close subject or an unclassified cert-emitter?).
+   * `mul_bound` [1..7]≠[1..6]: one theorem more than predicted around
+     the NL query — the AssertQueryNl consumption row is incomplete
+     (does the query emit its own theorem BESIDES the body walk's?).
+   Post-review state: 29/32 certs emit byte-identical to pre-S1; the 3
+   rejects are the drift finds; probes 9/13/14/38 all green; units
+   406+7/0. Battery evidence that S1's replay is correct for every
+   currently-CLOSING shape (sum_to's loop rows pass) — the 3 finds are
+   in never-validated corners, which is exactly what F2 was for.
 2. **S2 FnCtxData churn** — `mut_params: MutParamList` + refWp preamble
    derivation + W5/FnCtx consumption + probe pins (14/37) + wf-sig
    check. One edit, fresh-session-sized attention.
