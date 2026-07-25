@@ -216,4 +216,14 @@ row in the gate report updates automatically (tags are data-driven).
   only dest-less ones (E1 shows dest-less; a `let _ = f(&mut v)` shape
   would pin the other; not in corpus — leave to the arg-shape tag if
   weird).
-- MutParamList wf-classification interaction (D2 ⚠) — check first in S2.
+- ~~MutParamList wf-classification interaction (D2 ⚠)~~ **RESOLVED
+  2026-07-25 (read-only check, S2 opener):** the b77 Dt-precedence fix
+  (generate.rs:4779 — Dt-classification wins for datatype-typed params;
+  wf hyp subsumes projected bounds) covers the new field: FnCtxData
+  stays Dt-classified, MutParamList (u64-carrying cons-list, the
+  ParamBoundList shape) gets its own synthesized DtWf like every
+  scalar-carrying Dt. S2's churn checklist is therefore just the
+  standard set: FnCtxData.mk arity 6→7 in the vendored probe pins
+  (probe14/probe37), refWp preamble derivation, W5/FnCtx consumption,
+  serializer FnCtx path passes real `mut_param_names` into the
+  `build_req_binders` reuse.

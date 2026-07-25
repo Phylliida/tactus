@@ -14,10 +14,17 @@ contract per-channel, honest residue named (peel decision + IfCtor
 poison bits). Deviations on the b77 card: eq_drop uses the 999999
 sentinel (no True leaf interned); binder/neg kills added in review
 after catching my own contract overstatement.** Remaining endgame order: **A4
-(call-mut, card first) → A7 (stage-B callee-signature vocab — closes
-vec_read AND find_cancellation, derives poison + N2 detector
-reference-side) → B (b67 caching + b68 flip)**. D's in-model
-tripwire column landed with b77.
+(call-mut, IN PROGRESS — card `board/bootstrap-78-a4-call-mut.md`,
+design frozen from step-0 evidence; S1 counter mirror DONE 2026-07-25
+`5ddbebb`, byte-neutral + battery green; S2 wf-classification ⚠
+resolved read-only — NEXT = S2 FnCtxData `mut_params` churn (one edit:
+field + MutParamList Dt + refWp preamble derivation + probe14/37 mk
+arity 6→7 + real mut_param_names into build_req_binders) → S3 frame
+assembly + fixture closes + spine byte-match → S4 kills → S5 scoped
+tgt copy_word) → A7 (stage-B callee-signature vocab — closes vec_read
+AND find_cancellation, derives poison + N2 detector reference-side) →
+B (b67 caching + b68 flip)**. D's in-model tripwire column landed
+with b77.
 
 **The ordered map of everything remaining is now
 `DESIGN-bootstrap-endgame.md`** (milestones A–F + policy points P1–P4,
