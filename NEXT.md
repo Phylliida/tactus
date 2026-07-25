@@ -25,12 +25,17 @@ continuation's theorem consumption after the else branch, gensym-
 carrying continuations reject `call-in-branch-join`); mul_bound = the
 NL query's Done(True) `_tactus_ensures_` theorem row. Certified 32/37
 (3 restored, 0 drift), 29 certs byte-identical, probe9 all-green incl.
-the 3 restored, probes 13/14/37/38 + units 406+7/0 green**; S2
-wf-classification ⚠
-resolved read-only — NEXT = S2 FnCtxData `mut_params` churn (one edit:
-field + MutParamList Dt + refWp preamble derivation + probe14/37 mk
-arity 6→7 + real mut_param_names into build_req_binders) → S3 frame
-assembly + fixture closes + spine byte-match → S4 kills → S5 scoped
+the 3 restored, probes 13/14/37/38 + units 406+7/0 green**; **S2 DONE
+same day: FnCtxData `mut_params` churn landed** (MutParamList Dt +
+mut_preamble_frame two-plain-FLet derivation — mut-param fns are
+WRAP-MODE via hoist_all's typ-less-let bail, base binders survive;
+slot 3 = deref VALUE leaf not inner-typ, at-impl D2 amendment; .mk
+arity 7; 17 vendored pins bumped + probe37 wf-projection +1 + golden
+re-vendored + probe20 de-staled). Battery: core gate 256/0 +
+discharge 172/0, emission 32/37 ctx-only diffs, probes
+9/11/13/14/20/37/38 + units all green. NEXT = S3 frame
+assembly + fixture closes + spine byte-match (incl. `fn inc(x: &mut
+u64)` minimal subject) → S4 kills → S5 scoped
 tgt copy_word) → A7 (stage-B callee-signature vocab — closes vec_read
 AND find_cancellation, derives poison + N2 detector reference-side) →
 B (b67 caching + b68 flip)**. D's in-model tripwire column landed

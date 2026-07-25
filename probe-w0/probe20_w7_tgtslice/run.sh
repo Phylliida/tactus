@@ -11,7 +11,11 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CERT_DIR="$ROOT/probe-w0/probe20_w7_tgtslice/out/lib/cert"
 CORE_OUT="$ROOT/tactus-core/out/lib"
-PRELUDE="${TACTUS_PRELUDE:-$HOME/.cache/tactus/prelude-e81fbf9a86375c12}"
+# All prelude caches (probe9/13-style glob, milestone-C de-staling: the
+# slim-prelude split ships bare TactusDefs inside the prelude, and new
+# emitter builds mint new hashes — a single pinned dir goes stale).
+PRELUDES="$(ls -d "$HOME"/.cache/tactus/prelude-* 2>/dev/null | tr '\n' ':')"
+PRELUDE="${TACTUS_PRELUDE:-${PRELUDES%:}}"
 LEAN_BIN="${LEAN:-$(command -v lean)}"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 

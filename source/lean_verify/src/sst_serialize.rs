@@ -99,6 +99,14 @@
 //!   `NoBound`; finding-2: production renders these as NAMED ∀-binders).
 //! * `check.reqs` — requires exps → `FnCtxData.reqs` `BinderList` of
 //!   `(h_req<i> name leaf, req-prop leaf)` (finding-2: NAMED ∀-binders).
+//! * mut-ref pars + `BorrowMut` local_decls → `FnCtxData.mut_params`
+//!   `MutParamList` of `(param name, <p>_at_pre_tactus name, <p>.deref
+//!   value leaf)` in production's declaration order (bootstrap-78 S2).
+//!   refWp derives the two typ-less fn-entry FLets per entry
+//!   (`mut_preamble_frame`) — plainness trips the wrap gate exactly as
+//!   production's `hoist_all` bails on the typ-less preamble lets, so
+//!   every goal of a mut-param fn renders wrap-mode (and the walk's
+//!   shadow-freshening is off, `mark_flet_forced`).
 //! * `check.post_condition.ens_exps` — ensures exps read TWICE: bare via
 //!   `exp_leaf` → `FnCtxData.enss` (refWp does not read this slot), and
 //!   ANNOTATED via `oblig_leaf` → the `StmData::Ret` obligation leaves (the
@@ -3705,6 +3713,17 @@ impl<'a> Serializer<'a> {
         term
     }
 
+    /// `lib.MutParamList` from `(param, at_pre, deref-value)` leaf
+    /// triples (order preserved) — the `&mut`-param fn-entry preamble
+    /// entries (bootstrap-78 S2).
+    fn mut_param_list(&self, entries: &[(u64, u64, u64)]) -> String {
+        let mut term = format!("{}.MutParamList.Nil", NS);
+        for &(p, at_pre, dv) in entries.iter().rev() {
+            term = format!("{}.MutParamList.Cons {} {} {} {}", NS, p, at_pre, dv, box_(&term));
+        }
+        term
+    }
+
     // ── Goal walk (GoalData / GoalList literal) — N3b ────────────────
 
     /// Intern an already-built `LExpr` (a goal-spine leaf) by its
@@ -3996,6 +4015,48 @@ fn serialize<'a>(
         req_entries.push((hname, prop));
     }
 
+    // `&mut`-param fn-entry preamble entries → `FnCtxData.mut_params`
+    // (bootstrap-78 S2). Mirrors production's initial-OblCtx loop
+    // (sst_to_lean ~1526): per mut-ref PAR then per `BorrowMut` local,
+    // in declaration order — (param name, `<p>_at_pre_tactus` name,
+    // interned `<p>.deref` value text). refWp derives the two typ-less
+    // frame lets per entry (`mut_preamble_frame`); their plainness
+    // trips the wrap gate exactly as production's `hoist_all` bails on
+    // the typ-less `CtxFrame::Let`s.
+    let mut mut_names: Vec<(crate::lean_name::LeanName, String)> = Vec::new();
+    for par in fn_sst.x.pars.iter() {
+        if crate::expr_shared::is_mut_ref_typ(&par.x.typ, par.x.is_mut) {
+            mut_names.push((
+                crate::lean_name::LeanName::from_var_ident(&par.x.name),
+                crate::to_lean_type::sanitize(&par.x.name.0),
+            ));
+        }
+    }
+    for decl in check.local_decls.iter() {
+        if matches!(decl.kind, vir::sst::LocalDeclKind::BorrowMut) {
+            mut_names.push((
+                crate::lean_name::LeanName::from_var_ident(&decl.ident),
+                crate::to_lean_type::sanitize(&decl.ident.0),
+            ));
+        }
+    }
+    let mut mut_entries: Vec<(u64, u64, u64)> = Vec::new();
+    for (lean_name, raw_name) in mut_names.iter() {
+        let p = s.text_leaf(lean_name.as_str());
+        let at_pre = s.text_leaf(&crate::expr_shared::varat_pre_name(raw_name));
+        let deref_val = s.leaves.intern(pp_expr(&LExpr::field_proj(
+            LExpr::var(lean_name.clone()),
+            "deref",
+        )));
+        mut_entries.push((p, at_pre, deref_val));
+    }
+    if !mut_entries.is_empty() {
+        // Every goal of a mut-param fn wraps (production's hoist bail),
+        // so the shadow-freshening never runs — same off-switch as the
+        // attr-fn case (`rename_frame_vars` only runs inside hoist_all).
+        s.mark_flet_forced();
+    }
+
     // Shadow-mirror seed (bootstrap-74 slice 2 Round D): production's
     // `taken_names` = the base binders — value params, their `h_<p>_bound`
     // names, and the `h_req<i>` names (sst_to_lean.rs:2499-2503).
@@ -4112,17 +4173,18 @@ fn serialize<'a>(
 
     // Assemble the FnCtxData term. `.mk` positional order matches the
     // emitted `structure lib.FnCtxData`: typ_params, params, param_bounds,
-    // reqs, enss, closer_default. The closer bit (R1, bootstrap-77) seeds
-    // refWp's `FUserCloser` wrap-forcer — the fn-level `closer_is_default`
-    // DFS (attr + proof-block prefix) rendered as data instead of the
-    // retired all-lets-plain collapse.
+    // reqs, mut_params, enss, closer_default. The closer bit (R1,
+    // bootstrap-77) seeds refWp's `FUserCloser` wrap-forcer — the
+    // fn-level `closer_is_default` DFS (attr + proof-block prefix)
+    // rendered as data instead of the retired all-lets-plain collapse.
     let ctx_term = format!(
-        "({}.FnCtxData.mk {} {} {} {} {} {})",
+        "({}.FnCtxData.mk {} {} {} {} {} {} {})",
         NS,
         paren(&s.binder_list(&typ_param_entries)),
         paren(&s.binder_list(&param_entries)),
         paren(&s.param_bound_list(&param_bounds)),
         paren(&s.binder_list(&req_entries)),
+        paren(&s.mut_param_list(&mut_entries)),
         paren(&s.leaf_list(&ens_leaves)),
         if s.attr_user_closer { 0 } else { 1 },
     );

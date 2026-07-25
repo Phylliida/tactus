@@ -76,6 +76,26 @@ inductive lib.ParamBoundList where
   match s with | lib.ParamBoundList.Nil => 1 | lib.ParamBoundList.NoBound val0 => 1 + lib.ParamBoundList.height val0.deref | lib.ParamBoundList.Bound _ _ val2 => 1 + lib.ParamBoundList.height val2.deref
 termination_by sizeOf s
 decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.ParamBoundList.Nil.sizeOf_spec, lib.ParamBoundList.NoBound.sizeOf_spec, lib.ParamBoundList.Bound.sizeOf_spec]; omega)
+inductive lib.MutParamList where
+  | Nil
+  | Cons (val0 : Int) (val1 : Int) (val2 : Int) (val3 : Tactus.Box lib.MutParamList)
+  deriving Inhabited
+@[simp] noncomputable def lib.MutParamList.isNil (x : lib.MutParamList) : Prop :=
+  match x with | lib.MutParamList.Nil => True | _ => False
+@[simp] noncomputable def lib.MutParamList.isCons (x : lib.MutParamList) : Prop :=
+  match x with | lib.MutParamList.Cons _ _ _ _ => True | _ => False
+@[simp] noncomputable def lib.MutParamList.Cons_val0 (x : lib.MutParamList) : Int :=
+  match x with | lib.MutParamList.Cons val0 _ _ _ => val0 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.MutParamList.Cons_val1 (x : lib.MutParamList) : Int :=
+  match x with | lib.MutParamList.Cons _ val1 _ _ => val1 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.MutParamList.Cons_val2 (x : lib.MutParamList) : Int :=
+  match x with | lib.MutParamList.Cons _ _ val2 _ => val2 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.MutParamList.Cons_val3 (x : lib.MutParamList) : Tactus.Box lib.MutParamList :=
+  match x with | lib.MutParamList.Cons _ _ _ val3 => val3 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.MutParamList.height (s : lib.MutParamList) : Nat :=
+  match s with | lib.MutParamList.Nil => 1 | lib.MutParamList.Cons _ _ _ val3 => 1 + lib.MutParamList.height val3.deref
+termination_by sizeOf s
+decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.MutParamList.Nil.sizeOf_spec, lib.MutParamList.Cons.sizeOf_spec]; omega)
 inductive lib.RetBind where
   | RetNone
   | RetLet (val0 : Int) (val1 : Int)
@@ -879,6 +899,7 @@ structure lib.FnCtxData where
   params : lib.BinderList
   param_bounds : lib.ParamBoundList
   reqs : lib.BinderList
+  mut_params : lib.MutParamList
   enss : lib.LeafList
   closer_default : Int
   deriving Inhabited

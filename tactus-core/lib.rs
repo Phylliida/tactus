@@ -122,6 +122,33 @@ pub enum ParamBoundList {
     Bound(u64, u64, Box<ParamBoundList>),
 }
 
+// ── `&mut`-param fn-entry preamble entries (bootstrap-78 S2) ────────
+// One entry per `&mut` param (and per `BorrowMut` local, production's
+// #107 synthetic mut_ref class), in production's declaration order:
+// `Cons(param name leaf, at_pre name leaf, deref value leaf, tail)`.
+// `at_pre` is the `<p>_at_pre_tactus` old()-snapshot name; the deref
+// value leaf is the interned `<p>.deref` text (production's exact pp,
+// the FLetH typ/eq-leaf precedent — the entry's inner typ has no S2
+// consumer and is NOT carried; the call-site mut frames get their typs
+// per-call in `Call.post`, D1). refWp DERIVES the two fn-entry frames
+// structurally per entry (`mut_preamble_frame`):
+//
+//   FLet(at_pre, deref)   -- old() snapshot:  let <p>_at_pre_tactus := <p>.deref
+//   FLet(p,      deref)   -- body shadow:     let <p> := <p>.deref
+//
+// Both PLAIN FLets: production builds them as TYP-LESS `CtxFrame::Let`s
+// (`add_pre_capture`/`add_body_shadow`, sst_to_lean ~1517), so
+// `hoist_all` bails and every goal of a mut-param fn renders in WRAP
+// mode — which the mirror gets for free from `has_plain_flet` over the
+// seeded frame (vec_push7 evidence: params + reqs stay theorem binders
+// via FBind→All; the preamble lets and everything after render
+// goal-position).
+
+pub enum MutParamList {
+    Nil,
+    Cons(u64, u64, u64, Box<MutParamList>),
+}
+
 // ── Return-value binding (finding-4) ────────────────────────────────
 // Production binds the returned value as a frame `let` before the
 // postcondition obligation: a `return e` / tail-expression whose fn
@@ -719,6 +746,11 @@ pub struct FnCtxData {
     // so `reqs` is a `BinderList` (name, prop) — folded via binders_to_frame
     // into `FBind` spine entries, not anonymous `FHyp`s.
     pub reqs: BinderList,
+    // `&mut`-param preamble entries (bootstrap-78 S2, see `MutParamList`):
+    // `seed_frame` derives the two fn-entry FLets per entry AFTER the req
+    // binders (production's frame order — the reqs are theorem-level base
+    // binders; the preamble lets are the first OblCtx frames).
+    pub mut_params: MutParamList,
     pub enss: LeafList,
     // R1 (bootstrap-77): the fn-level closer class — 1 = default
     // (`tactus_auto`), 0 = user. AMENDED post-landing (proof_block_fn
@@ -2758,19 +2790,40 @@ pub open spec fn wp_stm(f: FrameList, s: StmData) -> GoalList
     }
 }
 
+// The `&mut`-param fn-entry preamble (bootstrap-78 S2): two plain FLets
+// per entry, at_pre snapshot FIRST then the body shadow (production's
+// `add_pre_capture` then `add_body_shadow` insertion order, sst_to_lean
+// ~1526). Plain FLets trip `has_plain_flet` → every goal of a mut-param
+// fn renders in WRAP mode, exactly production's `hoist_all` bail on the
+// typ-less preamble lets (vec_push7 evidence).
+#[verifier::structural_decreases]
+pub open spec fn mut_preamble_frame(m: MutParamList) -> FrameList
+    decreases m
+{
+    match m {
+        MutParamList::Nil => FrameList::FNil,
+        MutParamList::Cons(p, at_pre, deref_val, t) =>
+            FrameList::FLet(at_pre, deref_val,
+                Box::new(FrameList::FLet(p, deref_val,
+                    Box::new(mut_preamble_frame(*t))))),
+    }
+}
+
 // Seed the initial frame from the signature (DESIGN §2.2): typ-params,
-// then value params interleaved with bound hyps, then reqs. reqs are NAMED
-// ∀-binders (finding-2), so they fold in via `binders_to_frame`, not
+// then value params interleaved with bound hyps, then reqs, then the
+// `&mut`-param fn-entry preamble lets. reqs are NAMED ∀-binders
+// (finding-2), so they fold in via `binders_to_frame`, not
 // `hyps_of_leaves`.
 pub open spec fn seed_frame(c: FnCtxData) -> FrameList {
     frame_append(binders_to_frame(c.typ_params),
         frame_append(seed_params(c.params, c.param_bounds),
             frame_append(binders_to_frame(c.reqs),
-                // R1: non-default fn-level closer → the wrap-forcing
-                // marker rides at the seed's tail (renders nothing;
-                // position is immaterial to the emitted goals).
-                if c.closer_default == 1 { FrameList::FNil }
-                else { FrameList::FUserCloser(Box::new(FrameList::FNil)) })))
+                frame_append(mut_preamble_frame(c.mut_params),
+                    // R1: non-default fn-level closer → the wrap-forcing
+                    // marker rides at the seed's tail (renders nothing;
+                    // position is immaterial to the emitted goals).
+                    if c.closer_default == 1 { FrameList::FNil }
+                    else { FrameList::FUserCloser(Box::new(FrameList::FNil)) }))))
 }
 
 // refWp: the certificate LHS. Seed the frame, then walk the body. The
@@ -2948,6 +3001,7 @@ proof fn probe_ref_wp()
             params: BinderList::Nil,
             param_bounds: ParamBoundList::Nil,
             reqs: BinderList::Nil,
+            mut_params: MutParamList::Nil,
             enss: LeafList::Nil,
             closer_default: 1,
         }, StmData::Assert(atom_ob(9), 0, 9, 0))) == 1
@@ -2969,6 +3023,7 @@ proof fn ref_wp_seed_and_assert()
                     params: BinderList::Cons(0, 1, Box::new(BinderList::Nil)),
                     param_bounds: ParamBoundList::Bound(19, 2, Box::new(ParamBoundList::Nil)),
                     reqs: BinderList::Nil,
+                    mut_params: MutParamList::Nil,
                     enss: LeafList::Nil,
                     closer_default: 1,
                 },
@@ -2986,12 +3041,47 @@ proof fn ref_wp_seed_and_assert()
                 params: BinderList::Cons(0, 1, Box::new(BinderList::Nil)),
                 param_bounds: ParamBoundList::Bound(19, 2, Box::new(ParamBoundList::Nil)),
                 reqs: BinderList::Nil,
+                mut_params: MutParamList::Nil,
                 enss: LeafList::Cons(5, Box::new(LeafList::Cons(6, Box::new(LeafList::Nil)))),
                 closer_default: 1,
             },
             StmData::Ret(Box::new(RawExpList::Cons(Box::new(atom_ob(5)), Box::new(RawExpList::Cons(Box::new(atom_ob(6)), Box::new(RawExpList::Nil))))),
                 RetBind::RetNone),
         )) == 2
+by { decide }
+
+// ── bootstrap-78 S2: mut-param fn-entry preamble (the vec_push7 shape) ──
+// One `&mut` param (name leaf 0, MutRef wrapper typ leaf 1, no bound),
+// one req binder (h_req0 = 3, prop 2), one preamble entry (at_pre name
+// 4, deref value leaf 5). The derived plain FLets trip the wrap gate:
+// params + reqs stay FBind→All (the theorem's base binders) and the
+// preamble renders as goal-position Lets, at_pre first — production's
+// `hoist_all` bail shape (E1/vec_push7 evidence, board bootstrap-78).
+pub open spec fn s2_mut_ctx() -> FnCtxData {
+    FnCtxData {
+        typ_params: BinderList::Nil,
+        params: BinderList::Cons(0, 1, Box::new(BinderList::Nil)),
+        param_bounds: ParamBoundList::NoBound(Box::new(ParamBoundList::Nil)),
+        reqs: BinderList::Cons(3, 2, Box::new(BinderList::Nil)),
+        mut_params: MutParamList::Cons(0, 4, 5, Box::new(MutParamList::Nil)),
+        enss: LeafList::Nil,
+        closer_default: 1,
+    }
+}
+
+proof fn ref_wp_mut_preamble_wrap()
+    ensures
+        gate_wrap(seed_frame(s2_mut_ctx())) == 1,
+        goals_eq(
+            ref_wp(s2_mut_ctx(), StmData::Assert(atom_ob(9), 0, 9, 0)),
+            GoalList::Cons(
+                Box::new(GoalData::All(0, 1,
+                    Box::new(GoalData::All(3, 2,
+                        Box::new(GoalData::Let(4, 5,
+                            Box::new(GoalData::Let(0, 5,
+                                Box::new(GoalData::LeafE(ExprData::Atom(9))))))))))),
+                Box::new(GoalList::Nil)),
+        ) == 1
 by { decide }
 
 // Seq threads frameAfter: the second Assert sees the first as a forward
@@ -3011,6 +3101,7 @@ proof fn ref_wp_seq_threads_frame()
                     params: BinderList::Cons(0, 1, Box::new(BinderList::Nil)),
                     param_bounds: ParamBoundList::Bound(19, 2, Box::new(ParamBoundList::Nil)),
                     reqs: BinderList::Nil,
+                    mut_params: MutParamList::Nil,
                     enss: LeafList::Nil,
                     closer_default: 1,
                 },
@@ -3046,6 +3137,7 @@ proof fn ref_wp_add_capped_seed_spine()
                     param_bounds: ParamBoundList::Bound(3, 2,
                         Box::new(ParamBoundList::Bound(6, 5, Box::new(ParamBoundList::Nil)))),
                     reqs: BinderList::Cons(8, 7, Box::new(BinderList::Cons(10, 9, Box::new(BinderList::Nil)))),
+                    mut_params: MutParamList::Nil,
                     enss: LeafList::Cons(11, Box::new(LeafList::Nil)),
                     closer_default: 1,
                 },
@@ -3125,6 +3217,7 @@ proof fn ref_wp_sum_to_loop()
                     params: BinderList::Cons(0, 1, Box::new(BinderList::Nil)),
                     param_bounds: ParamBoundList::Bound(3, 2, Box::new(ParamBoundList::Nil)),
                     reqs: BinderList::Cons(5, 4, Box::new(BinderList::Nil)),
+                    mut_params: MutParamList::Nil,
                     enss: LeafList::Cons(6, Box::new(LeafList::Nil)),
                     closer_default: 1,
                 },
@@ -3370,7 +3463,7 @@ by { decide }
 // stops reproducing the join from the desugared SST, this decide flips.
 // Mutation-kill: refWp's goal 0 (then-branch postcond) binds `let tmp__3 := 0`
 // (val leaf 11 from the cloned then-branch); a goal 0 expecting `:= 99` fails.
-pub open spec fn cd19_ctx() -> FnCtxData { FnCtxData { typ_params: BinderList::Nil, params: BinderList::Cons(0, 1, Box::new(BinderList::Nil)), param_bounds: ParamBoundList::Bound(3, 2, Box::new(ParamBoundList::Nil)), reqs: BinderList::Nil, enss: LeafList::Cons(4, Box::new(LeafList::Nil)), closer_default: 1 } }
+pub open spec fn cd19_ctx() -> FnCtxData { FnCtxData { typ_params: BinderList::Nil, params: BinderList::Cons(0, 1, Box::new(BinderList::Nil)), param_bounds: ParamBoundList::Bound(3, 2, Box::new(ParamBoundList::Nil)), reqs: BinderList::Nil, mut_params: MutParamList::Nil, enss: LeafList::Cons(4, Box::new(LeafList::Nil)), closer_default: 1 } }
 pub open spec fn cd19_sst() -> StmData { StmData::Seq(Box::new(StmData::Assign(7, 0)), Box::new(StmData::If(8, 0, 9, 0, 0, Box::new(StmData::Seq(Box::new(StmData::Assign(10, 11)), Box::new(StmData::Ret(Box::new(RawExpList::Cons(Box::new(atom_ob(5)), Box::new(RawExpList::Nil))), RetBind::RetLet(6, 10))))), Box::new(StmData::Seq(Box::new(StmData::Seq(Box::new(StmData::Seq(Box::new(StmData::Assert(atom_ob(13), 0, 12, 0)), Box::new(StmData::Seq(Box::new(StmData::Assume(0, 12, 0)), Box::new(StmData::Seq(Box::new(StmData::Assign(14, 15)), Box::new(StmData::Seq(Box::new(StmData::Assert(atom_ob(17), 0, 16, 0)), Box::new(StmData::Call { reqs: Box::new(RawExpList::Nil), post: Box::new(FrameList::FHyp(0, 20, 0, Box::new(FrameList::FLet(18, 19, Box::new(FrameList::FNil))))) }))))))))), Box::new(StmData::Assign(10, 18)))), Box::new(StmData::Ret(Box::new(RawExpList::Cons(Box::new(atom_ob(5)), Box::new(RawExpList::Nil))), RetBind::RetLet(6, 10)))))))) }
 pub open spec fn cd19_goals() -> GoalList { GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(8, Box::new(GoalData::Let(10, 11, Box::new(GoalData::Let(6, 10, Box::new(GoalData::LeafE(ExprData::Atom(5))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(9, Box::new(GoalData::LeafE(ExprData::Atom(13))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(9, Box::new(GoalData::Imp(12, Box::new(GoalData::Imp(12, Box::new(GoalData::Let(14, 15, Box::new(GoalData::LeafE(ExprData::Atom(17))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(9, Box::new(GoalData::Imp(12, Box::new(GoalData::Imp(12, Box::new(GoalData::Let(14, 15, Box::new(GoalData::Imp(16, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(18, 19, Box::new(GoalData::Let(10, 18, Box::new(GoalData::Let(6, 10, Box::new(GoalData::LeafE(ExprData::Atom(5))))))))))))))))))))))))))), Box::new(GoalList::Nil)))))))) }
 
@@ -3582,6 +3675,7 @@ proof fn amended_shapes_kernel_compute()
             param_bounds: ParamBoundList::Bound(199, 200,
                 Box::new(ParamBoundList::NoBound(Box::new(ParamBoundList::Nil)))),
             reqs: BinderList::Nil,
+            mut_params: MutParamList::Nil,
             enss: LeafList::Cons(300, Box::new(LeafList::Nil)),
             closer_default: 1,
         }) == 2
