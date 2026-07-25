@@ -158,9 +158,14 @@
 //!   into `cert_call_leaves`): Assert/AssertCompute +1, AssertQueryTactus
 //!   +1, loop entry invs +|invs| before the body walk, loop maintain +
 //!   decrease +|invs|+1 after, each Ret terminal +|obligation list|,
-//!   each call +muts+1(+1 iff requires). This row is TRUSTED transcription
-//!   discipline like the `_h_hoist_i` mirror: a drift diverges a gensym
-//!   leaf name from production's and fails the bridge loudly (fill_zeros
+//!   each call +muts+1(+1 iff requires). This row is NOT a trusted
+//!   predicate (unlike poison / the N2 peel): it is CHECKED twice — at
+//!   emission time, the replayed per-theorem id predictions are compared
+//!   element-wise against the ids production's goal names carry
+//!   (`emit-counter-drift` reject on mismatch, validating the whole
+//!   table incl. loop rows + wrap-mode walk-order timing on every
+//!   cert), and any surviving gensym-name drift diverges cert leaf ids
+//!   from production's goals and fails the W2 bridge loudly (fill_zeros
 //!   `_5`/`_6` is the pinning evidence; the per-call shell-counter-from-0
 //!   it replaced matched only single-consumer fns by accident).
 //!
@@ -487,8 +492,26 @@ struct Serializer<'a> {
     /// via `&mut` so multi-call fns accumulate. UNLIKE `hyp_ordinal`
     /// there is NO branch save/restore — theorem names are fn-unique
     /// and production never resets (head_exec `_1`/`_2` sequential
-    /// across fork arms).
+    /// across fork arms). NOT a trusted predicate (S1 review): the
+    /// serializer-minted gensym names land in cert leaf/binder ids
+    /// while production's goals carry production's own names, so any
+    /// drift is a structurally LOUD bridge red — and the
+    /// `predicted_theorem_ids` cross-check below catches table drift
+    /// even earlier, at emission time.
     emit_ordinal: u64,
+    /// Emission-time cross-check companion (bootstrap-78 S1 review):
+    /// the predicted id of every THEOREM consumption, in walk order
+    /// (gensym consumptions advance `emit_ordinal` without a
+    /// prediction). Production's theorem names carry their consumed
+    /// ids (`build_theorem_name`'s trailing `_<id>`), so after the
+    /// goal walk the predictions are compared element-wise against the
+    /// ids parsed from `goal_names` — a mis-counted site or an
+    /// unmodeled consumer rejects the cert with a sharp
+    /// `emit-counter-drift` tag instead of surfacing later as an
+    /// opaque leaf diff. This validates the whole consumption table
+    /// (including the loop rows and wrap-mode walk-order timing) on
+    /// EVERY emitted cert, not only on fns whose gensym names print.
+    predicted_theorem_ids: Vec<u64>,
     /// Names of residue (Bool-typed) lets in scope on the current walk
     /// path — the poison-check domain (bootstrap-74 slice 2). A hyp prop
     /// or let-equation mentioning one of these forces whole-goal wrap
@@ -751,6 +774,17 @@ impl<'a> Serializer<'a> {
     fn next_hyp_name(&mut self) -> u64 {
         self.hyp_ordinal += 1;
         self.text_leaf(&format!("_h_hoist_{}", self.hyp_ordinal))
+    }
+
+    /// Counter mirror: consume `n` production THEOREM ids, recording
+    /// each predicted id for the emission-time cross-check. (Gensym
+    /// consumption — call sites, inside `cert_call_leaves` — advances
+    /// `emit_ordinal` without predictions.)
+    fn consume_theorem_ids(&mut self, n: u64) {
+        for _ in 0..n {
+            self.emit_ordinal += 1;
+            self.predicted_theorem_ids.push(self.emit_ordinal);
+        }
     }
 
     /// The shadow mirror's freshening (Round D) — production's `fresh()`
@@ -2495,7 +2529,7 @@ impl<'a> Serializer<'a> {
             // obligation — the goal walk (N3b) reuses whichever id.
             StmX::Assert(_, _, e) | StmX::AssertCompute(_, e, _) => {
                 // Counter mirror: one production theorem per assert.
-                self.emit_ordinal += 1;
+                self.consume_theorem_ids(1);
                 // Intern the BARE hyp first (keeps it in body pre-order), then
                 // the obligation slot (`oblig_slot` interns the span_mark'd
                 // leaf + the deep `raw_exp` atoms after it). The hyp render
@@ -2699,7 +2733,7 @@ impl<'a> Serializer<'a> {
                                 self.lifted_return_recomputes += 1;
                                 // Counter mirror: one production theorem
                                 // per branch-folded implication obligation.
-                                self.emit_ordinal += impls.len() as u64;
+                                self.consume_theorem_ids(impls.len() as u64);
                                 let list = raw_exp_list(&impls);
                                 return Ok(format!(
                                     "({}.StmData.Ret {} {}.RetBind.RetNone)",
@@ -2872,6 +2906,13 @@ impl<'a> Serializer<'a> {
                     // + precondition theorem) advance it in place.
                     &mut self.emit_ordinal,
                 )?;
+                // Cross-check prediction: the precondition THEOREM's id was
+                // the last consumed in the advance (after the gensyms), so
+                // it equals the counter's current value. Gensyms predict
+                // nothing (they never name a theorem).
+                if leaves.precondition.is_some() {
+                    self.predicted_theorem_ids.push(self.emit_ordinal);
+                }
                 self.call_stm(leaves)
             }
             // Fail-loud stage-A exclusions.
@@ -2946,7 +2987,7 @@ impl<'a> Serializer<'a> {
                         // Counter mirror: one production theorem per
                         // assert-by (emit_with_closer site; the inner
                         // Assert is destructured here, never re-walked).
-                        self.emit_ordinal += 1;
+                        self.consume_theorem_ids(1);
                         // `body` is a single `StmX::Assert` carrying the
                         // asserted condition (ast_to_sst's Tactus-shortcut
                         // emission; production destructures identically).
@@ -2999,7 +3040,7 @@ impl<'a> Serializer<'a> {
                 // obligation at each Ret terminal (fork-route branch Rets
                 // each consume — head_exec `_1`/`_2`; a `return;`/no-ens fn
                 // consumes 0).
-                self.emit_ordinal += self.pending_ens_oblig.len() as u64;
+                self.consume_theorem_ids(self.pending_ens_oblig.len() as u64);
                 // Annotated ensures obligation leaves drive the `Return`
                 // goal (Ret-annotation, finding-1): span_mark'd like
                 // production's `WpCtx` postcondition so the goal-side
@@ -3509,7 +3550,7 @@ impl<'a> Serializer<'a> {
         // Counter mirror: production emits the ENTRY invariant theorems
         // (one per inv) at the loop head, BEFORE walking the body
         // (fill_zeros: entry 2,3,4 precede the in-body call's 5,6).
-        self.emit_ordinal += invs.len() as u64;
+        self.consume_theorem_ids(invs.len() as u64);
         let loop_counter_end = self.hyp_ordinal;
         let body_term = self.stm(body)?;
         self.hyp_ordinal = loop_counter_end;
@@ -3517,7 +3558,7 @@ impl<'a> Serializer<'a> {
         // theorem, consumed after the body walk (fill_zeros: 8,9,10 then
         // 11). `decrease.len() == 1` is enforced above; nonstandard
         // invariants fail loud above, so |invs| is exact by construction.
-        self.emit_ordinal += invs.len() as u64 + 1;
+        self.consume_theorem_ids(invs.len() as u64 + 1);
 
         // The body-end decrease obligation — rendered AFTER the body
         // walk so the shadow renames apply to the measure
@@ -4054,6 +4095,36 @@ fn serialize<'a>(
     // matching goal leaves reuse them. One `GoalData` per obligation that
     // carried a spine; `None` (bit_vector/query) are skipped.
     let (goal_term, goal_names) = s.goal_list(theorems, goal_shapes);
+
+    // Emitter-counter cross-check (bootstrap-78 S1 review): production's
+    // theorem names carry their consumed ids (`build_theorem_name`'s
+    // trailing `_<id>`); the walk's replayed predictions must match them
+    // element-wise. A mis-counted site or an unmodeled consumer rejects
+    // the cert HERE with a sharp tag instead of surfacing downstream as
+    // an opaque leaf diff (or, for fns whose gensym names never print,
+    // not at all until a mut cert diverges in S3). This also pins
+    // walk-order emission timing for wrap-mode fns on every cert.
+    // Checked against ALL production theorems, not `goal_names` —
+    // `goal_list` filters to spine-carrying theorems, but every theorem
+    // consumed an id regardless.
+    let parsed: Vec<u64> = theorems
+        .iter()
+        .map(|t| {
+            t.name
+                .rsplit('_')
+                .next()
+                .and_then(|tail| tail.parse::<u64>().ok())
+                .ok_or_else(|| {
+                    format!("emit-counter-drift: unparseable theorem name {:?}", t.name)
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    if parsed != s.predicted_theorem_ids {
+        return Err(format!(
+            "emit-counter-drift: production theorem ids {:?} != replayed predictions {:?}",
+            parsed, s.predicted_theorem_ids
+        ));
+    }
 
     Ok(CertBody {
         ctx_term,
