@@ -1,1 +1,0 @@
-{"fn":"lib__u_close_e_nil","vcs":[{"name":"_tactus_postcondition_u_close_e_nil_at_lib_3433_13_1","leaf":"/- @rust:lib.rs:3433:13 -/ lib.close_e lib.FrameList.FNil ob = lib.GoalData.LeafE (lib.render_exp ob)","spine":[{"k":"all","name":"ob","ty":"lib.RawExp"}]}]}

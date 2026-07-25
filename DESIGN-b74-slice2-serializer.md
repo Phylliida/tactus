@@ -53,6 +53,60 @@ loop evidence shows `split_leading_binders` is gone, the model's
 needs redesign — **stop and card that before proceeding** (it changes
 slice scope).
 
+## 2b. Step-0 evidence table (2026-07-21, certs regenerated)
+
+Certs regenerated with current production (post-N3, `417de34`):
+`--crate-type=lib --lean-backend --emit-lean --tactus-emit-cert`
+(fixture: 32/39 certified — `call-generic` rejections GONE, only
+2×call-mut + rawvir-poly remain; tgt runtime: the 3 exec certs +
+2 lemma certs). All name texts below read straight off the fresh
+leaf tables.
+
+| Family | Evidence | Answers |
+|---|---|---|
+| call ret-eq (use_clamped) | leaf 16 = literally `_h_hoist_1`; RetLet pair = `All 8 1 (All 13 14 …)` with 13 = `_h_r_hoist1`, 14 = `r = t`. FHyp ordinals run in frame order (bound hyp → 1, ensures → 2). | name texts confirmed exactly as designed |
+| call ret-eq (vec_read) | dest `tmp__1 : Tactus.Ref Int` (non-Bool) HOISTS: `_h_tmp__1_hoist1`, eq `tmp__1 = Tactus.Ref.mk (…)`; RetLet eq = `r = tmp__1.deref` (deref in eq RHS — comes from the RetBind-value deref path). | FLetH classification confirmed; eq-prop text = `x = v` pp'd AFTER the value-side deref |
+| asserts/seq (add_capped) | **ALL THREE SHAPES IN ONE FN.** goal 0: pure hoist. goal 1: hoist + RESIDUE (`tmp__1 := s < 2000` Bool let → goal-position let around the leaf, leaf 28 = `let tmp__1 := s < 2000; ⏎…tmp__1`). goals 2–3: FULL WRAP (`Imp`/`Let` shape) — a hyp `tmp__1` (the asserted Bool as proposition) MENTIONS the residue name → production's bail check fires. Seed numbering unchanged; `_h_hoist_1/2` per goal. | residue is per-goal and monotone along the frame prefix; see §2c |
+| if-join (count_down) | cond hyp = `_h_hoist_1` in BOTH branches (`n = 0` then / `¬(n = 0)` else) → per-branch counter snapshot/restore confirmed. `decrease_init0` let hoists (`_h_decrease_init0_hoist1`). Same tmp names recur across branches (`tmp__3` in both, distinct eqs) — NO cross-branch freshening. | branch numbering identical, as expected |
+| loop (sum_to) | `_tactus_d_old_0_0` HOISTS (`All _tactus_d_old_0_0 (All _h__tactus_d_old_0_0_hoist1 …)`). Inv hyps in goals are `_h_hoist_3..6` — **`_h_ctx_N` is GONE from goal shapes** (survives only in the SST `Loop` `inv_hyps` side-table). Havoc'd-var bound hyps = `_h_hoist_1/2`; cond = `_h_hoist_7`. **SHADOWING IS REAL**: body assignment `i := i + 1` freshens to `i_hoist1` with eq-hyp `_h_i_hoist1_hoist1` (double suffix — `_h_i_hoist1` was already taken). | §6's "expected: none" for shadow freshening is WRONG for loops — the rename mirror is IN SCOPE (census shows hits in every loop-body rebind) |
+| nested loop (find_square) | Outer and inner frames compose by FLAT CONCATENATION under ONE per-goal counter (outer bound/inv/cond = 1–4, inner bound/inv/cond = 5–9, inner `_tactus_d_old_1_0` hoists too). The leading/non-leading distinction is GONE from goal shapes. | loop-telescope redesign trigger TRIPPED — see §2c |
+| assert-query (mul_bound) | AQNl-stripped goals hoist cleanly and independently (`_h_hoist_1..5` per goal; the queried fact enters as a `_h_hoist_i` hyp). | no special strip×hoist interaction |
+
+tgt exec certs (probe11): all three regenerated
+(`runtime__apply_hom_gen`, `runtime__apply_hom_inv`,
+`runtime__impl__4__clone`); shapes to be read at §5 sweep time.
+
+## 2c. Scope updates decided from the evidence (2026-07-21)
+
+1. **Three goal modes, not two.** Production (post-`8dcac64` partial
+   hoist) has: full-wrap (typ-less let, or a binder/hyp TYPE
+   mentioning a residue name), hoist, and hoist+residue (Bool lets
+   fold as goal-position lets around the leaf). Danielle's call
+   (2026-07-21): **mirror residue in the model** rather than
+   honest-failing residue goals. The mode gate is per-goal and
+   monotone along the frame prefix (add_capped: goal 1 hoists,
+   goals 2–3 wrap off the SAME shared prefix plus one poisoning hyp).
+2. **"Mentions residue" is serializer-computed.** The model's leaves
+   are opaque ids — it cannot test `lexpr_mentions_var`. The
+   serializer (which holds the interned texts) marks each FHyp whose
+   prop mentions an in-scope residue name (poison), and the model's
+   gate reads the mark: any poisoned frame OR typ-less FLet ⇒
+   whole-goal wrap; else hoist, folding residue FLets around the
+   leaf. (Faithful alternative — model-level text analysis — is
+   impossible without breaking leaf opacity.)
+3. **Shadow-rename mirror is IN SCOPE** (was §6-deferred): every
+   loop-body rebind hits it (`i_hoist1`, `_h_i_hoist1_hoist1`).
+   Serializer must freshen shadowed let names AND rewrite downstream
+   leaf texts, exactly as production's `rename_frame_vars` does.
+4. **Loop-telescope redesign trigger tripped** (§2's stop-and-card):
+   `split_leading_binders` naming (`_h_ctx_N`) is gone from goal
+   shapes; leading/non-leading is gone; nested loops are flat
+   concatenation under one per-goal counter. `loop_maintain_frame`/
+   `loop_use_frame` simplify accordingly (carded on b74).
+5. Follow-up item partially pre-landed: `HypProvenance::HoistEq`
+   already exists (main `9a88b6c`) — discharge Q1 shrinks to the
+   composer arm.
+
 ## 3. Serializer work items (sst_serialize.rs)
 
 ### 3a. Hyp naming — the `_h_hoist_i` mirror

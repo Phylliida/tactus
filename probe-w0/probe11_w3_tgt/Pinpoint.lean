@@ -46,7 +46,7 @@ set_option maxRecDepth 8000
 namespace w3pin
 
 @[reducible] def ctx : lib.FnCtxData :=
-  (lib.FnCtxData.mk lib.BinderList.Nil (lib.BinderList.Cons 0 1 (Tactus.Box.mk lib.BinderList.Nil)) (lib.ParamBoundList.NoBound (Tactus.Box.mk lib.ParamBoundList.Nil)) lib.BinderList.Nil (lib.LeafList.Cons 2 (Tactus.Box.mk lib.LeafList.Nil)))
+  (lib.FnCtxData.mk lib.BinderList.Nil (lib.BinderList.Cons 0 1 (Tactus.Box.mk lib.BinderList.Nil)) (lib.ParamBoundList.NoBound (Tactus.Box.mk lib.ParamBoundList.Nil)) lib.BinderList.Nil (lib.MutParamList.Nil) (lib.LeafList.Cons 2 (Tactus.Box.mk lib.LeafList.Nil)))
 
 @[reducible] def sst : lib.StmData :=
   (lib.StmData.Ret (Tactus.Box.mk (lib.LeafList.Cons 3 (Tactus.Box.mk lib.LeafList.Nil))) (lib.RetBind.RetLet 4 0))

@@ -419,8 +419,12 @@ impl<'a, 'e> Synth<'a, 'e> {
                 let c = self.subst_pp(cond);
                 let pt = self.term(then_, want)?;
                 let pe = self.term(e2, want)?;
+                // Parenthesized: this term lands in ARGUMENT position
+                // (a callee-lemma wf slot — seed_frame_wf's closer
+                // branch, bootstrap-77); a bare `if` there is a Lean
+                // syntax error ("unexpected token 'if'").
                 Ok(format!(
-                    "if {} : {} then\n        (congrArg {}Wf (if_pos {})).mpr ({})\n      else\n        (congrArg {}Wf (if_neg {})).mpr ({})",
+                    "(if {} : {} then\n        (congrArg {}Wf (if_pos {})).mpr ({})\n      else\n        (congrArg {}Wf (if_neg {})).mpr ({}))",
                     hn, c, want, hn, pt, want, hn, pe
                 ))
             }
