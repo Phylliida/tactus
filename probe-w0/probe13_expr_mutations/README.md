@@ -33,15 +33,20 @@ classes** (SST-side), each on its own live cert:
 | `wrong_width` | `add_capped` | G6 HasType | GOAL: wrong overflow bound: `Lit 2^64` → `Lit 2^32` |
 | `poison_flip` | `add_capped` | P1 trusted wrap-gate mark | SST: zero ALL poison marks — a serializer mismark must flip |
 | `ifctor_eq_drop` | `head_exec` | b77/A5 + N2 frame assembly | SST: degenerate the `IfCtor` ctor-equation hyp leaf (sentinel id) |
+| `ifctor_binder_drop` | `head_exec` | b77/A5 + N2 frame assembly | SST: drop the field-binder telescope (`pos_binders` → Nil) |
+| `ifctor_neg_drop` | `head_exec` | b77/A5 + N2 frame assembly | SST: degenerate the else-branch `¬cond` hyp leaf (sentinel id) |
 | `ifctor_arm_swap` | `head_exec` | b77/A5 fork structure | SST: swap the `thn`/`els` boxed bodies |
 | `aqt_hyp_drop` | `assert_by_default` | b77/A3 AssertFact hyp | SST: bare-P leaf → 0 — continuation goals lose the proven-inline fact |
 
-The two `ifctor_*` kills are also the **interim N2-detector cross-check pin**
+The four `ifctor_*` kills are also the **interim N2-detector cross-check pin**
 (the serializer header contract's second trusted predicate): the
 peel-to-IsVariant *decision* is shared common-mode with production, but the
-frame *assembly* is recomputed independently — these kills prove the assembled
-frames are load-bearing in the bridge until A7 derives the detector
-reference-side.
+frame *assembly* is recomputed independently — one kill per assembly output
+channel (ctor-equation hyp, field-binder telescope, else-branch hyp, arm
+attachment) proves each is load-bearing in the bridge until A7 derives the
+detector reference-side. Uncovered: the peel decision itself, and the IfCtor
+poison bits (both 0 in the pinned cert; the poison channel is pinned by
+`poison_flip`).
 
 For each class the generated `ExprMutations.lean` asserts, all by `decide`:
 

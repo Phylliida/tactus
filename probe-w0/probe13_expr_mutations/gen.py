@@ -22,19 +22,22 @@ classes plus the P1 poison-channel class, each on its own live cert:
   * poison_flip  (add_capped, P1 trusted wrap-gate mark): poison bit 1 -> 0,
                  SST-side — pins that a serializer mismark flips the bridge
                  (DESIGN-bootstrap-endgame §1 P1)
-  * ifctor_eq_drop  (head_exec, b77/A5): degenerate the IfCtor ctor-equation
-                 hyp leaf, SST-side — with ifctor_arm_swap, ALSO the interim
+  * ifctor_eq_drop / ifctor_binder_drop / ifctor_neg_drop / ifctor_arm_swap
+                 (head_exec, b77/A5, all SST-side): the four N2 frame-assembly
+                 output channels — ctor-equation hyp, field-binder telescope,
+                 else-branch hyp, arm attachment. Together the interim
                  N2-detector cross-check pin (second trusted predicate,
-                 sst_serialize.rs header): frame ASSEMBLY is pinned while
-                 the peel decision stays shared until A7
-  * ifctor_arm_swap (head_exec, b77/A5): swap the fork's thn/els bodies,
-                 SST-side — per-arm goals under the wrong branch hyps
+                 sst_serialize.rs header): the ASSEMBLY is pinned per-channel
+                 while the peel-to-IsVariant DECISION stays shared until A7
   * aqt_hyp_drop (assert_by_default, b77/A3): drop the AssertQueryTactus
                  AssertFact bare-P hyp leaf, SST-side
 
 For each: extract the live cert's ctx/sst/goals VERBATIM, apply a single
-STRUCTURAL text mutation to the GOAL side only (`ref_wp`/ctx/sst untouched, so
-the reference re-derivation stays correct), and assert BOTH
+STRUCTURAL text mutation — GOAL-side for the coercion classes (`ref_wp`/ctx/sst
+untouched, so the reference re-derivation stays correct: models a serializer
+that emitted wrong goals), SST-side for the trusted-channel/arm classes (the
+reference's own INPUT is perturbed: models a serializer that emitted a wrong
+literal, so refWp derives goals production didn't emit) — and assert BOTH
     goals_eq (ref_wp ctx sst) goals      = 1 := by decide   (baseline closes)
     goals_eq (ref_wp ctx sst) goals_mut  = 0 := by decide   (the kill flips)
 A single `lean` elaboration with rc=0 proves every baseline closes AND every
@@ -228,6 +231,29 @@ def ifctor_eq_drop(sst):
     return sst[:s] + "999999" + sst[e:]
 
 
+def ifctor_binder_drop(sst):
+    """A5/N2 kill (SST-side): drop the IfCtor FIELD-BINDER telescope — the
+    most N2-specific assembly output (`tmp___val0 : Int` etc., the binders
+    the ctor upgrade introduces). Replace the pos_binders Cons-list with
+    Nil: refWp's then-goal loses its `All field typ` frames while
+    production goals still carry them."""
+    (b0, b1), _, _, _ = _ifctor_args(sst)
+    binders = sst[b0:b1]
+    assert "lib.BinderList.Cons" in binders, "ifctor_binder_drop: pos_binders already empty"
+    return sst[:b0] + "(Tactus.Box.mk lib.BinderList.Nil)" + sst[b1:]
+
+
+def ifctor_neg_drop(sst):
+    """A5/N2 kill (SST-side): degenerate the IfCtor ELSE-branch hyp —
+    rewrite the `neg_prop` leaf scalar (the plain `¬cond` discriminator;
+    negative tests never upgrade) to the 999999 sentinel. refWp's
+    else-goal telescope diverges from production's `All neg_name ¬cond`."""
+    _, scalars, _, _ = _ifctor_args(sst)
+    s, e = scalars[4]  # neg_prop
+    assert sst[s:e] != "999999", "ifctor_neg_drop: neg_prop already sentinel?"
+    return sst[:s] + "999999" + sst[e:]
+
+
 def ifctor_arm_swap(sst):
     """A5 kill (SST-side): swap the IfCtor `thn`/`els` boxed bodies — the
     per-arm continuation goals emit under the WRONG branch hypotheses
@@ -278,14 +304,17 @@ CLASSES = [
     ("add_capped", "wrong_width", "wrong HasType overflow bound width 2^64->2^32 (G6)", wrong_width,   "goals", "close"),
     ("add_capped", "poison_flip", "zero ALL wrap-gate poison marks (P1 trusted-predicate channel)", poison_drop, "sst", "close"),
     # b77 arm-structure kills (card §Follow-ups): pin the NEW IfCtor /
-    # AssertQueryTactus arms. The two IfCtor kills are ALSO the interim
+    # AssertQueryTactus arms. The four IfCtor kills are ALSO the interim
     # N2-detector cross-check pin (serializer header contract, second
     # trusted predicate): the peel-to-IsVariant DECISION is shared
     # common-mode, but the FRAME ASSEMBLY is recomputed independently —
-    # these kills prove the assembled frames (ctor-equation hyp, per-arm
-    # goal structure) are load-bearing in the bridge until A7 derives the
-    # detector reference-side.
+    # one kill per assembly output channel (ctor-equation hyp,
+    # field-binder telescope, else-branch hyp, arm attachment) proves
+    # each is load-bearing in the bridge until A7 derives the detector
+    # reference-side.
     ("head_exec",  "ifctor_eq_drop",  "IfCtor: degenerate the ctor-equation hyp leaf (A5/N2 frame assembly)", ifctor_eq_drop,  "sst", "close"),
+    ("head_exec",  "ifctor_binder_drop", "IfCtor: drop the field-binder telescope (A5/N2 frame assembly)",    ifctor_binder_drop, "sst", "close"),
+    ("head_exec",  "ifctor_neg_drop", "IfCtor: degenerate the else-branch neg hyp leaf (A5/N2 frame assembly)", ifctor_neg_drop, "sst", "close"),
     ("head_exec",  "ifctor_arm_swap", "IfCtor: swap thn/els arm bodies (A5 fork structure)",                   ifctor_arm_swap, "sst", "close"),
     ("assert_by_default", "aqt_hyp_drop", "AssertQueryTactus: drop the AssertFact bare-P hyp (A3)",            aqt_hyp_drop,    "sst", "close"),
 ]

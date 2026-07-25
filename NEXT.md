@@ -5,13 +5,15 @@
 discharge 172/0; probe9 all-green (head_exec CLOSES via IfCtor);
 probe11 all-classified (find_cancellation = the vec_read/A7 stage-B
 class); `assert-query-tactus` census tag retired; probes 13/14/37/38 +
-units green. **b77 mutation kills DONE 2026-07-24 (follow-up session):
-probe13 now 8 classes (`ifctor_eq_drop`/`ifctor_arm_swap`/`aqt_hyp_drop`
-+ `take_sexpr` splitter), all baselines =1 + kills =0; N2-detector
-cross-check pin wired into the serializer header contract (cites the
-live class names; `mut_poison`→`poison_flip` drift fixed). Deviation
-noted on the b77 card: eq_drop uses the 999999 sentinel — no True leaf
-is interned in head_exec's cert.** Remaining endgame order: **A4
+units green. **b77 mutation kills DONE 2026-07-24 (follow-up session,
++ review round): probe13 now 10 classes (`take_sexpr` splitter; four
+IfCtor kills = one per N2 frame-assembly output channel
+eq/binders/neg/arm-swap, + `aqt_hyp_drop`), all baselines =1 + kills
+=0; N2-detector cross-check pin wired into the serializer header
+contract per-channel, honest residue named (peel decision + IfCtor
+poison bits). Deviations on the b77 card: eq_drop uses the 999999
+sentinel (no True leaf interned); binder/neg kills added in review
+after catching my own contract overstatement.** Remaining endgame order: **A4
 (call-mut, card first) → A7 (stage-B callee-signature vocab — closes
 vec_read AND find_cancellation, derives poison + N2 detector
 reference-side) → B (b67 caching + b68 flip)**. D's in-model
