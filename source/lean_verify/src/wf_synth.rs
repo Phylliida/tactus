@@ -97,8 +97,18 @@ impl<'a, 'e> Synth<'a, 'e> {
     /// are not in scope in the lemma.
     fn subst_pp(&self, e: &Expr) -> String {
         let mut t = crate::lean_pp::pp_expr(e);
-        // Fixpoint: values may reference earlier lets.
-        loop {
+        // Fixpoint: values may reference earlier lets. BOUNDED — a
+        // self-referential value (a shadowing `let x := x.deref` /
+        // `let x := x + 1`) reintroduces its own name on every round
+        // and the textual fixpoint never converges; without the cap
+        // this loop hangs with unbounded string growth. Each round
+        // substitutes every inline let once, so `env.len() + 1`
+        // rounds suffice for any non-shadowing chain (values only
+        // reference EARLIER lets). On cap-out we return the partial
+        // text: the leftover name is unbound in the lemma, Lean
+        // elaboration fails, and the driver censuses it — the honest
+        // failure mode this module promises (never a hang).
+        for _ in 0..=self.env.len() {
             let mut changed = false;
             for (n, r) in self.env.iter().rev() {
                 if let Res::Inline(v) = r {
@@ -110,9 +120,10 @@ impl<'a, 'e> Synth<'a, 'e> {
                 }
             }
             if !changed {
-                return t;
+                break;
             }
         }
+        t
     }
 
     /// A proof of the BOUND conjunct for `e` — named hypotheses when
@@ -528,4 +539,143 @@ pub fn synth_wf_lemma(
         t
     };
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    //! First unit coverage for the wf-lemma synthesizer (2026-07-25
+    //! audit) — the `subst_pp` textual fixpoint (incl. the
+    //! self-referential-shadow termination guard) and the top-level
+    //! ctor happy path of `synth_wf_lemma`.
+    use super::*;
+    use crate::lean_ast::{Binder, BinderKind, BinOp, Def, Expr};
+
+    fn empty_ctx<'a>(
+        dts: &'a HashMap<String, DtWfSpec>,
+        sigs: &'a HashMap<String, FnWfSig>,
+        accessors: &'a HashMap<String, Vec<(String, Vec<String>)>>,
+        done: &'a std::collections::HashSet<String>,
+    ) -> SynthCtx<'a> {
+        SynthCtx { ns: "lib", dts, sigs, accessors, done }
+    }
+
+    /// A shadowing inline value (`let x := x + 1`) reintroduces its
+    /// own name on every substitution round — the textual fixpoint
+    /// can never converge. Before the audit fix this looped forever
+    /// with unbounded string growth; now the bound caps it and the
+    /// partial text fails downstream at Lean elaboration (the
+    /// module's honest-failure contract: Err/census, never a hang).
+    #[test]
+    fn subst_pp_self_referential_shadow_terminates() {
+        let dts = HashMap::new();
+        let sigs = HashMap::new();
+        let accessors = HashMap::new();
+        let done = std::collections::HashSet::new();
+        let ctx = empty_ctx(&dts, &sigs, &accessors, &done);
+        let val = Expr::binop(BinOp::Add, Expr::var_synthetic("x"), Expr::lit_int("1"));
+        let s = Synth {
+            ctx: &ctx,
+            rel: "g",
+            env: vec![("x".to_string(), Res::Inline(&val))],
+            fresh: 0,
+            recursive: false,
+        };
+        // Must return (bounded), not hang.
+        let out = s.subst_pp(&Expr::var_synthetic("x"));
+        assert!(out.contains('1'), "at least one substitution round ran: {}", out);
+    }
+
+    /// Well-behaved chains (values referencing EARLIER lets only)
+    /// still substitute to a closed form under the bound.
+    #[test]
+    fn subst_pp_chain_reaches_fixpoint() {
+        let dts = HashMap::new();
+        let sigs = HashMap::new();
+        let accessors = HashMap::new();
+        let done = std::collections::HashSet::new();
+        let ctx = empty_ctx(&dts, &sigs, &accessors, &done);
+        let a_val = Expr::lit_int("7");
+        let b_val = Expr::binop(BinOp::Add, Expr::var_synthetic("a"), Expr::lit_int("2"));
+        let s = Synth {
+            ctx: &ctx,
+            rel: "g",
+            env: vec![
+                ("a".to_string(), Res::Inline(&a_val)),
+                ("b".to_string(), Res::Inline(&b_val)),
+            ],
+            fresh: 0,
+            recursive: false,
+        };
+        let out = s.subst_pp(&Expr::var_synthetic("b"));
+        assert!(out.contains('7') && out.contains('2'), "fully substituted: {}", out);
+        assert!(!out.contains('a') && !out.contains('b'), "no let names remain: {}", out);
+    }
+
+    /// Happy path: `g (x : u64) = D.mk x` synthesizes a lemma whose
+    /// proof is the param's bound hypothesis.
+    #[test]
+    fn synth_simple_ctor_lemma() {
+        let mut dts = HashMap::new();
+        dts.insert(
+            "D".to_string(),
+            DtWfSpec {
+                variants: HashMap::from([("mk".to_string(), vec![(0usize, ConjKind::Bound)])]),
+            },
+        );
+        let mut sigs = HashMap::new();
+        sigs.insert(
+            "g".to_string(),
+            FnWfSig {
+                params: vec![(
+                    "x".to_string(),
+                    ParamKind::Bounded("0 ≤ x ∧ x < 256".to_string()),
+                )],
+                ret_dt: "D".to_string(),
+            },
+        );
+        let accessors = HashMap::new();
+        let done = std::collections::HashSet::new();
+        let ctx = empty_ctx(&dts, &sigs, &accessors, &done);
+        let def = Def {
+            attrs: vec![],
+            name: "lib.g".to_string(),
+            binders: vec![Binder {
+                name: Some(crate::lean_name::LeanName::synthetic("x")),
+                ty: Expr::var_lit("Int"),
+                kind: BinderKind::Explicit,
+            }],
+            ret_ty: Expr::var_lit("lib.D"),
+            body: Expr::app(Expr::var_synthetic("lib.D.mk"), vec![Expr::var_synthetic("x")]),
+            termination_by: vec![],
+            termination_structural: false,
+            decreasing_by: None,
+        };
+        let sig = sigs["g"].clone();
+        let text = synth_wf_lemma(&ctx, "g", &def, &sig).expect("simple ctor synthesizes");
+        assert!(text.contains("theorem g_wf"), "{}", text);
+        assert!(text.contains("(h_x_bound : 0 ≤ x ∧ x < 256)"), "{}", text);
+        assert!(text.contains("DWf (lib.g x)"), "{}", text);
+        assert!(text.trim_end().ends_with("h_x_bound"), "proof is the bound hyp: {}", text);
+    }
+
+    /// A ctor arg the synthesizer has no wf source for is an honest
+    /// Err (never a panic).
+    #[test]
+    fn synth_unknown_var_is_err() {
+        let mut dts = HashMap::new();
+        dts.insert(
+            "D".to_string(),
+            DtWfSpec {
+                variants: HashMap::from([("mk".to_string(), vec![(0usize, ConjKind::Bound)])]),
+            },
+        );
+        let sigs_empty: HashMap<String, FnWfSig> = HashMap::new();
+        let accessors = HashMap::new();
+        let done = std::collections::HashSet::new();
+        let ctx = empty_ctx(&dts, &sigs_empty, &accessors, &done);
+        let mut s = Synth { ctx: &ctx, rel: "g", env: vec![], fresh: 0, recursive: false };
+        let e = Expr::var_synthetic("mystery");
+        let err = s.term(&e, "D").expect_err("no wf source");
+        assert!(err.contains("mystery"), "{}", err);
+    }
 }

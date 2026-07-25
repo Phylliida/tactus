@@ -942,8 +942,19 @@ fn write_expr_body(out: &mut String, node: &ExprNode, lm: &mut Landmarks) {
                 rust_span: rust_span.clone(),
                 kind: *kind,
             });
+            // Comment-delimiter sanitization (2026-07-25 audit): Lean
+            // block comments NEST — a path containing `/-` (e.g., any
+            // directory whose name starts with `-`, giving `…/-name…`)
+            // opens a nested comment inside the marker, and the
+            // closing ` -/` then leaves the OUTER comment unterminated
+            // — a hard parse error on the whole generated file. A path
+            // containing `-/` would end the marker early instead. Only
+            // the debug-comment text is sanitized; the structured
+            // landmark above keeps the verbatim loc (error mapping
+            // reads the landmark, never the comment).
+            let safe_loc = rust_loc.replace("/-", "/ -").replace("-/", "- /");
             out.push_str("/- @rust:");
-            out.push_str(rust_loc);
+            out.push_str(&safe_loc);
             out.push_str(" -/ ");
             write_expr_body(out, &inner.node, lm);
         }

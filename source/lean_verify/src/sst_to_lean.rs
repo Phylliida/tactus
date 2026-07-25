@@ -7276,6 +7276,78 @@ fn build_call_mut_args<'a>(
     Ok(mut_args)
 }
 
+/// Does this loop-cond setup Stm mutate a USER-visible local — one
+/// whose name survives outside the condition evaluation? Returns the
+/// first offending (sanitized) name for the error message, or `None`
+/// for the pure shapes #114 accepts.
+///
+/// Verus-synthetic temps (`%`-containing idents — `expr_to_stm_opt`'s
+/// tmp% family, call-result dests, short-circuit temps, BorrowMut
+/// locals) are the EXPECTED pure-cond setup shape. Anything beyond
+/// that mutates enclosing state once per cond evaluation — a shape
+/// the loop encoding does not model: the BorrowMut elimination
+/// pre-passes (`collect_borrow_mut_links`) and `collect_modifications`
+/// walk only the loop BODY, so a cond-mutated local keeps its
+/// pre-loop value in maintain/exit reasoning. The 2026-07-25 audit
+/// probe (`while set_zero(&mut y) {}` then `y == 5` post-loop)
+/// VERIFIED a false ensures through exactly this gap — reject loudly
+/// instead. Two mutation channels are gated:
+///
+/// * `Assign` whose dest is a user-named local — the new-mut-ref
+///   BorrowMut linkage (`Assign(y, Var(tmp%))`) and any direct
+///   block-cond assignment (`while { y = y - 1; y > 0 }`).
+/// * `Call` args carrying an lvalue (`Loc(...)` / `VarLoc`) rooted at
+///   a user-named local — legacy-mode `&mut y` args (belt for shapes
+///   the legacy path doesn't already reject).
+///
+/// Rust identifiers can't contain `%`, so a `%`-free ident is
+/// user-named by construction; misclassification can only
+/// over-reject (safe). User `let`s inside a block cond also land
+/// here — over-rejection with a workaround message, accepted.
+/// The workaround preserves semantics exactly: `loop { let c = <cond>;
+/// if !c { break; } <body> }` routes the mutation through the BODY
+/// machinery, which handles it (the tested `&mut`-call path).
+fn cond_setup_user_mutation(stm: &Stm) -> Option<String> {
+    fn is_user_ident(v: &VarIdent) -> bool {
+        !v.0.contains('%')
+    }
+    /// Does this arg Exp carry an lvalue rooted at a user local?
+    fn exp_has_user_lvalue(e: &Exp) -> Option<String> {
+        match &e.x {
+            ExpX::VarLoc(v) if is_user_ident(v) => {
+                Some(crate::to_lean_type::sanitize(&v.0))
+            }
+            ExpX::Loc(inner) => exp_has_user_lvalue(inner),
+            ExpX::Unary(_, inner) | ExpX::UnaryOpr(_, inner) => exp_has_user_lvalue(inner),
+            _ => None,
+        }
+    }
+    match &stm.x {
+        StmX::Assign { lhs: Dest { dest, is_init: _ }, rhs: _ } => {
+            extract_simple_var_ident(dest)
+                .filter(|v| is_user_ident(v))
+                .map(|v| crate::to_lean_type::sanitize(&v.0))
+        }
+        StmX::Call { args, .. } => args.iter().find_map(exp_has_user_lvalue),
+        StmX::Block(ss) => ss.iter().find_map(cond_setup_user_mutation),
+        StmX::If(_, t, e) => cond_setup_user_mutation(t)
+            .or_else(|| e.as_ref().and_then(|s| cond_setup_user_mutation(s))),
+        StmX::Loop { body, .. } => cond_setup_user_mutation(body),
+        StmX::DeadEnd(s) | StmX::OpenInvariant(s) => cond_setup_user_mutation(s),
+        StmX::AssertQuery { body, .. } => cond_setup_user_mutation(body),
+        StmX::ClosureInner { body, .. } => cond_setup_user_mutation(body),
+        StmX::Assert(..)
+        | StmX::AssertBitVector { .. }
+        | StmX::AssertCompute(..)
+        | StmX::Assume(_)
+        | StmX::Fuel(..)
+        | StmX::RevealString(_)
+        | StmX::Return { .. }
+        | StmX::BreakOrContinue { .. }
+        | StmX::Air(_) => None,
+    }
+}
+
 /// Validate and build a `Wp::Loop`. Takes the destructured `StmX::Loop`
 /// fields directly (#104) — the wrong-variant case is unrepresentable
 /// because the function never sees a `Stm`. The explicit field
@@ -7411,6 +7483,20 @@ fn build_wp_loop<'a>(
                 // Empty setup — fast path; walk_loop pushes cond hyp.
                 (Some(cond_validated), None)
             } else {
+                // Soundness gate (2026-07-25 audit): a cond setup
+                // that mutates a user local is NOT modeled — see
+                // `cond_setup_user_mutation`'s doc for the probe that
+                // verified a false ensures through this gap.
+                if let Some(name) = cond_setup_user_mutation(cond_setup) {
+                    return Err(format!(
+                        "loop condition mutates `{}` (a `&mut {}` call or an \
+                         assignment inside the condition) — not supported: the \
+                         loop encoding would lose the mutation. Hoist the \
+                         condition into the body instead: `loop {{ let c = \
+                         <cond>; if !c {{ break; }} <body> }}`",
+                        name, name,
+                    ));
+                }
                 // Render ¬cond at LExpr level (no synthesised SST
                 // Exp needed). The wrapper below uses Wp::Assume for
                 // cond and Wp::Hyp for ¬cond around the body/after.

@@ -492,16 +492,53 @@ pub fn author_v1(
 /// (later binders reference earlier ones), so the fixpoint exists;
 /// the iteration cap is a belt-and-suspenders bound.
 fn apply_let_substs(e: &Expr, substs: &[(String, Expr)]) -> Expr {
+    // SELF-referential equations (`x := …x…` — shadow rebinds, mut
+    // post-state chains) violate the acyclic-hoist-graph premise
+    // above: every fixpoint round multiplies the binder's
+    // occurrences, so the 16 rounds turn k self-occurrences into
+    // ~k^16 nodes — observed as a multi-GB memory runaway on
+    // `test_exec_call_mut_arg_whole_tuple_field` (2026-07-25 audit).
+    // A self-referential subst can never help the textual compare
+    // converge; drop it from the list.
+    let substs: Vec<&(String, Expr)> = substs
+        .iter()
+        .filter(|(name, val)| !expr_mentions_var(val, name))
+        .collect();
     let mut out = e.clone();
+    let mut prev_pp = crate::lean_pp::pp_expr(&out);
     for _ in 0..16 {
-        let next = substs.iter().fold(out.clone(), |cur, (name, val)| subst_var(&cur, name, val));
-        if crate::lean_pp::pp_expr(&next) == crate::lean_pp::pp_expr(&out) {
-            out = next;
+        let next = substs
+            .iter()
+            .fold(out.clone(), |cur, (name, val)| subst_var(&cur, name, val));
+        let next_pp = crate::lean_pp::pp_expr(&next);
+        let converged = next_pp == prev_pp;
+        // Belt for MUTUAL cycles (`a := …b…; b := …a…`): divergence
+        // shows up as unbounded text growth. Past any plausible goal
+        // size, stop substituting — form C then honestly declines on
+        // the textual mismatch instead of allocating gigabytes.
+        let diverging = next_pp.len() > 1_000_000;
+        out = next;
+        prev_pp = next_pp;
+        if converged || diverging {
             break;
         }
-        out = next;
     }
     crate::lean_ast::strip_transparent(&out)
+}
+
+/// Does `e` mention `Var(name)` anywhere? Used to detect
+/// self-referential hoist equations in `apply_let_substs`.
+fn expr_mentions_var(e: &Expr, name: &str) -> bool {
+    if matches!(&e.node, ExprNode::Var(n) if n.as_str() == name) {
+        return true;
+    }
+    let mut found = false;
+    e.for_each_child(|c| {
+        if !found && expr_mentions_var(c, name) {
+            found = true;
+        }
+    });
+    found
 }
 
 /// Form C (§11.2): the goal core, after applying the goal's own

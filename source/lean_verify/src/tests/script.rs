@@ -357,3 +357,38 @@ fn form_c_matches_despite_span_mark_asymmetry() {
     let text = render_script(&moves);
     assert!(text.contains("refine ⟨_h_hoist_8, _h_hoist_8⟩"), "{text}");
 }
+
+#[test]
+fn apply_let_substs_self_referential_no_blowup() {
+    // A shadow-rebind equation (`x := f x x x`) is SELF-referential:
+    // its textual fixpoint can never converge, and before the
+    // 2026-07-25 audit fix each of the 16 fixpoint rounds multiplied
+    // the `x`-occurrences (~3^16 nodes) — observed as a multi-GB
+    // memory runaway on `test_exec_call_mut_arg_whole_tuple_field`.
+    // Self-referential substs are now dropped up front (they cannot
+    // help the textual compare); the call must return promptly with
+    // bounded output.
+    let val = app("lib.f", vec![var("x"), var("x"), var("x")]);
+    let e = app("lib.g", vec![var("x")]);
+    let out = apply_let_substs(&e, &[("x".to_string(), val)]);
+    let s = crate::lean_pp::pp_expr(&out);
+    assert!(s.len() < 1000, "self-referential subst must not expand: {}", s.len());
+    assert!(s.contains('x'), "the binder stays unexpanded: {s}");
+}
+
+#[test]
+fn apply_let_substs_mutual_cycle_bounded() {
+    // MUTUAL cycle (`a := f b b; b := g a a`): not caught by the
+    // self-reference filter, but the growth guard stops the doubling
+    // once the pp text passes the divergence bound. Bounded output,
+    // prompt return — form C then declines on the textual mismatch.
+    let out = apply_let_substs(
+        &app("lib.h", vec![var("a")]),
+        &[
+            ("a".to_string(), app("lib.f", vec![var("b"), var("b")])),
+            ("b".to_string(), app("lib.g", vec![var("a"), var("a")])),
+        ],
+    );
+    let s = crate::lean_pp::pp_expr(&out);
+    assert!(s.len() <= 8_000_000, "growth guard must bound divergence: {}", s.len());
+}

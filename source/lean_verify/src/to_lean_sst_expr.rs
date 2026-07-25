@@ -248,8 +248,8 @@ pub fn integer_type_bound_from_vir(
     inner: &Expr,
 ) -> LExpr {
     if matches!(kind, IntegerTypeBoundKind::ArchWordBits) {
-        // Fall through to the shared helper's panic so the message
-        // matches regardless of which pipeline tripped it.
+        // The shared helper renders ArchWordBits as the prelude's
+        // `arch_word_bits` axiom reference (bits arg ignored).
         return LExpr::new(integer_type_bound_node(kind, 0));
     }
     if let ExprX::UnaryOpr(vir::ast::UnaryOpr::IntegerTypeBound(IntegerTypeBoundKind::ArchWordBits, _), _) = &inner.x {
@@ -365,6 +365,31 @@ fn type_bound_predicate_rec(
     // Transparent: unbox before examining.
     if let TypX::Boxed(inner) = &**ty {
         return type_bound_predicate_rec(e, inner, visited);
+    }
+    // Decorations: AIR's `typ_invariant` peels ALL of them
+    // (`undecorate_typ`) before emitting bounds, so a `&u8` param
+    // carries `0 ≤ x < 256` on the Z3 side. Mirror that here — but
+    // wrapper-RENDERED decorations (Ref/Box/Rc/Arc — see
+    // `decoration_wrapper`) put the rendered value at Lean type
+    // `Tactus.Ref Int` etc., so the bound must read the inner value
+    // via `.deref`. Transparent decorations (Ghost/Tracked/...) pass
+    // through unchanged. Callers pass the value at the DECORATED
+    // depth (the `&mut`-specific pre-deref convention is the separate
+    // `TypX::MutRef` arm below).
+    if let TypX::Decorate(deco, _, inner) = &**ty {
+        let e2 = match deco {
+            // `&mut` params in their legacy `Decorate(MutRef, …)`
+            // shape: callers pre-deref the value (the
+            // `is_mut_ref_typ` convention — `bound_value = x.deref`),
+            // exactly like the `TypX::MutRef` arm below. Adding a
+            // deref here would double-peel.
+            vir::ast::TypDecoration::MutRef => e.clone(),
+            _ if crate::expr_shared::decoration_wrapper(*deco).is_some() => {
+                crate::expr_shared::apply_deref_chain(e.clone(), 1)
+            }
+            _ => e.clone(),
+        };
+        return type_bound_predicate_rec(&e2, inner, visited);
     }
     // `&mut T` params (in new-mut-ref mode after migration) carry
     // `TypX::MutRef(T)`; the binder type renders as `T` (see
@@ -1045,6 +1070,24 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
             ))?;
             integer_type_bound_node(kind, bits)
         }
+        // `has_resolved(x)` → uninterpreted Prop, mirroring the VIR-AST
+        // path (#122). The catch-all below would render it as the bare
+        // argument (`has_resolved v` → `v`) — a value in Prop position
+        // ("type expected") for non-bool `v`, and a silently WRONG
+        // proposition for bool-typed places. Top-level synthetic
+        // `Assume(HasResolved(_))` injections are dropped upstream
+        // (`is_synthetic_assume_to_drop`); this arm covers HasResolved
+        // NESTED inside a larger obligation expression (e.g., vstd
+        // ensures mentioning `has_resolved`).
+        ExpX::UnaryOpr(UnaryOpr::HasResolved(_), inner) => {
+            LExpr::app(
+                LExpr::var_lit("Tactus.hasResolved"),
+                vec![sst_exp_to_ast_checked_with_ctx(inner, ctx)?],
+            ).node
+        }
+        // Remaining UnaryOprs (CustomErr, ProofNote — diagnostic
+        // wrappers) are transparent. ToDyn also lands here today,
+        // matching the VIR-AST path's passthrough.
         ExpX::UnaryOpr(_, inner) => exp_to_node_checked(inner, ctx)?,
 
         ExpX::Binary(op, lhs, rhs) => {
@@ -1795,6 +1838,10 @@ fn bv_unsupported_shape_name(x: &ExpX) -> &'static str {
         ExpX::Interp(..) => "ExpX::Interp",
         ExpX::NullaryOpr(..) => "ExpX::NullaryOpr",
         ExpX::UnaryOpr(..) => "ExpX::UnaryOpr",
+        // `Unary` reaches here for every op EXCEPT `Not` (handled in
+        // the main match) — most commonly `Clip` (`x as u8`
+        // truncation), which users do write inside bit_vector asserts.
+        ExpX::Unary(..) => "ExpX::Unary",
         // Note: Var, Const, Binary, Unary handled in the main match;
         // their arms produce LExpr directly, never reach this helper.
         _ => "<unknown ExpX variant>",
@@ -1879,4 +1926,134 @@ fn collect_choose_rec(
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit coverage for the pure helpers in this module — bounds
+    //! predicates (incl. the decoration peel), the HasResolved SST
+    //! arm, bit-vector-mode error naming, and the
+    //! `IntegerTypeBound` literal table. These paths previously had
+    //! only indirect e2e coverage (2026-07-25 audit).
+    use super::*;
+    use crate::lean_pp::pp_expr;
+    use std::sync::Arc;
+    use vir::ast::{TypDecoration, VarIdentDisambiguate};
+
+    fn mk_exp(x: ExpX, typ: Typ) -> Exp {
+        Arc::new(vir::ast::SpannedTyped { span: vir::messages::Span::dummy(), typ, x })
+    }
+    fn tvar(name: &str) -> VarIdent {
+        VarIdent(Arc::new(name.to_string()), VarIdentDisambiguate::AirLocal)
+    }
+    fn t_u8() -> Typ {
+        Arc::new(TypX::Int(IntRange::U(8)))
+    }
+    fn t_nat() -> Typ {
+        Arc::new(TypX::Int(IntRange::Nat))
+    }
+    fn deco(d: TypDecoration, inner: Typ) -> Typ {
+        Arc::new(TypX::Decorate(d, None, inner))
+    }
+
+    #[test]
+    fn type_bound_plain_u8() {
+        let pred = type_bound_predicate(&LExpr::var_synthetic("p"), &t_u8())
+            .expect("u8 must carry a bound");
+        let s = pp_expr(&pred);
+        assert!(s.contains("256"), "missing upper bound: {}", s);
+        assert!(!s.contains("deref"), "no wrapper -> no deref: {}", s);
+    }
+
+    /// `&u8` params render at `Tactus.Ref Int`; the bound must read
+    /// the inner value via `.deref`. Before the audit fix this
+    /// returned `None` (bounds silently lost for every `&T`/`Box<T>`
+    /// fixed-width param, where AIR's `typ_invariant` undecorates).
+    #[test]
+    fn type_bound_ref_u8_derefs() {
+        let pred = type_bound_predicate(&LExpr::var_synthetic("p"), &deco(TypDecoration::Ref, t_u8()))
+            .expect("&u8 must carry a bound (AIR emits one)");
+        let s = pp_expr(&pred);
+        assert!(s.contains("256"), "missing upper bound: {}", s);
+        assert!(s.contains("deref"), "wrapper-decorated bound must deref: {}", s);
+    }
+
+    /// Ghost decoration renders transparently — bound without deref.
+    #[test]
+    fn type_bound_ghost_u8_transparent() {
+        let pred = type_bound_predicate(&LExpr::var_synthetic("p"), &deco(TypDecoration::Ghost, t_u8()))
+            .expect("Ghost<u8> must carry a bound");
+        let s = pp_expr(&pred);
+        assert!(s.contains("256"), "missing upper bound: {}", s);
+        assert!(!s.contains("deref"), "Ghost is transparent, no deref: {}", s);
+    }
+
+    /// Stacked wrapper decorations peel one deref per rendered layer.
+    #[test]
+    fn type_bound_box_ref_u8_double_deref() {
+        let t = deco(TypDecoration::Box, deco(TypDecoration::Ref, t_u8()));
+        let pred = type_bound_predicate(&LExpr::var_synthetic("p"), &t)
+            .expect("Box<&u8> must carry a bound");
+        let s = pp_expr(&pred);
+        assert_eq!(s.matches("deref").count() / 2, 2,
+            "two wrapper layers -> two derefs on each of the two conjunct sides: {}", s);
+    }
+
+    /// Unbounded targets stay bound-free even under decorations.
+    #[test]
+    fn type_bound_ref_nat_none() {
+        assert!(type_bound_predicate(
+            &LExpr::var_synthetic("p"),
+            &deco(TypDecoration::Ref, t_nat()),
+        ).is_none());
+    }
+
+    /// `HasResolved` nested in an SST obligation renders as the
+    /// uninterpreted `Tactus.hasResolved` Prop (mirroring the VIR-AST
+    /// path, #122) — NOT as the bare inner value, which would be a
+    /// wrong proposition for bool-typed places and a type error
+    /// otherwise.
+    #[test]
+    fn has_resolved_renders_uninterpreted() {
+        let t_bool: Typ = Arc::new(TypX::Bool);
+        let v = mk_exp(ExpX::Var(tvar("v")), t_bool.clone());
+        let hr = mk_exp(
+            ExpX::UnaryOpr(UnaryOpr::HasResolved(t_bool.clone()), v),
+            t_bool,
+        );
+        let out = sst_exp_to_ast_checked(&hr).expect("HasResolved renders");
+        let s = pp_expr(&out);
+        assert!(s.contains("Tactus.hasResolved"), "got: {}", s);
+        assert_ne!(s.trim(), "v", "must not collapse to the bare value");
+    }
+
+    /// `Clip` (an `x as u8` truncation) inside `by(bit_vector)` is
+    /// rejected with the variant NAMED — previously the shape-name
+    /// helper had no `ExpX::Unary` arm and reported
+    /// "<unknown ExpX variant>" for the most common rejected shape.
+    #[test]
+    fn bit_vector_clip_error_names_unary() {
+        let v = mk_exp(ExpX::Var(tvar("x")), t_u8());
+        let clip = mk_exp(
+            ExpX::Unary(UnaryOp::Clip { range: IntRange::U(8), truncate: true }, v),
+            t_u8(),
+        );
+        let err = sst_exp_to_bit_vector_ast(&clip).expect_err("Clip unsupported in bv mode");
+        assert!(err.contains("ExpX::Unary"), "error must name the variant: {}", err);
+    }
+
+    /// The `IntegerTypeBound` literal table at the u128 boundary and
+    /// the 1-bit / 0-bit edges.
+    #[test]
+    fn integer_type_bound_lit_edges() {
+        let pp = |k: IntegerTypeBoundKind, bits: u32| pp_expr(&integer_type_bound_lit(k, bits));
+        assert_eq!(pp(IntegerTypeBoundKind::UnsignedMax, 128), "340282366920938463463374607431768211455");
+        assert_eq!(pp(IntegerTypeBoundKind::UnsignedMax, 0), "0");
+        assert_eq!(pp(IntegerTypeBoundKind::UnsignedMax, 8), "255");
+        assert_eq!(pp(IntegerTypeBoundKind::SignedMax, 128), "170141183460469231731687303715884105727");
+        // Negative literals pp parenthesized.
+        assert_eq!(pp(IntegerTypeBoundKind::SignedMin, 1), "(-1)");
+        assert_eq!(pp(IntegerTypeBoundKind::SignedMin, 8), "(-128)");
+        assert_eq!(two_pow_str(128), "340282366920938463463374607431768211456");
+    }
 }
