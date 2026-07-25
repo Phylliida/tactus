@@ -173,12 +173,27 @@ row in the gate report updates automatically (tags are data-driven).
 
 ## Slices (each ends green: suite + gates + probes)
 
-1. **S1 counter mirror + census sub-tags** — serializer-only, no churn.
-   Validation: vec_push7/fill_zeros certs emit with names `_1/_2` and
-   `_5/_6` byte-matching the spine sidecars (fill_zeros is the
-   discriminating case); existing certs byte-identical (counter mirror
-   must not perturb non-mut fns — fresh_ret ids already accidentally
-   correct for single-call fns; add a multi-call non-mut fixture check).
+1. **S1 counter mirror + census sub-tags — DONE 2026-07-25.**
+   `Serializer.emit_ordinal` (consumption table in the field doc +
+   serializer header contract row) threaded into `cert_call_leaves`
+   (`&mut`, shell emitter starts at the walk value; advance = Phase-C
+   gensyms + precondition-theorem id iff `precondition.is_some()`,
+   matching production's ~3634 guard). `call-mut-ret` split out (checked
+   FIRST — a `&mut` return borrows from a `&mut` param). Validation
+   AMENDED from the original card text: existing certs contain NO
+   gensym names at all (all certified calls are ret-eq/dest-name paths)
+   so S1 is provably byte-neutral — confirmed by cold regen + full-dir
+   diff (32 certs identical); the `_1/_2`-`_5/_6` spine byte-match
+   moves to S3 acceptance where mut certs first emit. NL arm recurses
+   through `stm()` (inner Assert carries the +1); AQT destructures
+   inline (own +1); ProofBlock emits nothing (+0). Battery: units
+   406+7/0 (golden pin included), probes 9/13/14/37/38 green,
+   fixture 24v/9e (the known closer-failure set + a mul_bound
+   Mathlib-LEAN_PATH environment artifact under direct invocation).
+   S3 note: mut_post mint site inside `build_call_substitutions` is
+   ~4025 (Var/Field targets); ~4348 is the returned-mut-ref path
+   (tagged out). Prophecy-REUSE consumes 0 ids (skip site) — also
+   tagged out with `call-mut-ret`.
 2. **S2 FnCtxData churn** — `mut_params: MutParamList` + refWp preamble
    derivation + W5/FnCtx consumption + probe pins (14/37) + wf-sig
    check. One edit, fresh-session-sized attention.
