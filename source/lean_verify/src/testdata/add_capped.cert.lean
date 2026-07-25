@@ -23,37 +23,48 @@ set_option autoImplicit false
 -- leaf 9: ⟦y < 1000⟧
 -- leaf 10: ⟦h_req1⟧
 -- leaf 11: ⟦r = x + y⟧
--- leaf 12: ⟦/- @rust:bootstrap-fixture/lib.rs:85:13 -/ r = x + y⟧
+-- leaf 12: ⟦/- @rust:bootstrap-fixture/lib.rs:134:13 -/ r = x + y⟧
 -- leaf 13: ⟦r⟧
--- leaf 14: ⟦bootstrap-fixture/lib.rs:85:13⟧
+-- leaf 14: ⟦bootstrap-fixture/lib.rs:134:13⟧
 -- leaf 15: ⟦0 ≤ x + y ∧ x + y < 18446744073709551616⟧
--- leaf 16: ⟦/- @rust:bootstrap-fixture/lib.rs:87:17 -/ 0 ≤ x + y ∧ x + y < 18446744073709551616⟧
--- leaf 17: ⟦bootstrap-fixture/lib.rs:87:17⟧
--- leaf 18: ⟦s⟧
--- leaf 19: ⟦x + y⟧
--- leaf 20: ⟦tmp__1⟧
--- leaf 21: ⟦s < 2000⟧
--- leaf 22: ⟦/- @rust:bootstrap-fixture/lib.rs:88:12 -/ tmp__1⟧
--- leaf 23: ⟦bootstrap-fixture/lib.rs:88:12⟧
--- leaf 24: ⟦0 ≤ s + 0 ∧ s + 0 < 18446744073709551616⟧
--- leaf 25: ⟦/- @rust:bootstrap-fixture/lib.rs:89:9 -/ 0 ≤ s + 0 ∧ s + 0 < 18446744073709551616⟧
--- leaf 26: ⟦bootstrap-fixture/lib.rs:89:9⟧
--- leaf 27: ⟦s + 0⟧
+-- leaf 16: ⟦_h_hoist_1⟧
+-- leaf 17: ⟦/- @rust:bootstrap-fixture/lib.rs:136:17 -/ 0 ≤ x + y ∧ x + y < 18446744073709551616⟧
+-- leaf 18: ⟦bootstrap-fixture/lib.rs:136:17⟧
+-- leaf 19: ⟦_h_hoist_2⟧
+-- leaf 20: ⟦x + y⟧
+-- leaf 21: ⟦s⟧
+-- leaf 22: ⟦s = x + y⟧
+-- leaf 23: ⟦_h_s_hoist1⟧
+-- leaf 24: ⟦s < 2000⟧
+-- leaf 25: ⟦tmp__1⟧
+-- leaf 26: ⟦_h_hoist_3⟧
+-- leaf 27: ⟦/- @rust:bootstrap-fixture/lib.rs:137:12 -/ tmp__1⟧
+-- leaf 28: ⟦bootstrap-fixture/lib.rs:137:12⟧
+-- leaf 29: ⟦_h_hoist_4⟧
+-- leaf 30: ⟦0 ≤ s + 0 ∧ s + 0 < 18446744073709551616⟧
+-- leaf 31: ⟦_h_hoist_5⟧
+-- leaf 32: ⟦/- @rust:bootstrap-fixture/lib.rs:138:9 -/ 0 ≤ s + 0 ∧ s + 0 < 18446744073709551616⟧
+-- leaf 33: ⟦bootstrap-fixture/lib.rs:138:9⟧
+-- leaf 34: ⟦_h_hoist_6⟧
+-- leaf 35: ⟦s + 0⟧
+-- leaf 36: ⟦s = s + 0⟧
+-- leaf 37: ⟦r = s⟧
+-- leaf 38: ⟦_h_r_hoist1⟧
 
 @[reducible] def cert_add_capped_ctx : lib.FnCtxData :=
-  (lib.FnCtxData.mk lib.BinderList.Nil (lib.BinderList.Cons 0 1 (Tactus.Box.mk (lib.BinderList.Cons 4 1 (Tactus.Box.mk lib.BinderList.Nil)))) (lib.ParamBoundList.Bound 3 2 (Tactus.Box.mk (lib.ParamBoundList.Bound 6 5 (Tactus.Box.mk lib.ParamBoundList.Nil)))) (lib.BinderList.Cons 8 7 (Tactus.Box.mk (lib.BinderList.Cons 10 9 (Tactus.Box.mk lib.BinderList.Nil)))) (lib.LeafList.Cons 11 (Tactus.Box.mk lib.LeafList.Nil)))
+  (lib.FnCtxData.mk lib.BinderList.Nil (lib.BinderList.Cons 0 1 (Tactus.Box.mk (lib.BinderList.Cons 4 1 (Tactus.Box.mk lib.BinderList.Nil)))) (lib.ParamBoundList.Bound 3 2 (Tactus.Box.mk (lib.ParamBoundList.Bound 6 5 (Tactus.Box.mk lib.ParamBoundList.Nil)))) (lib.BinderList.Cons 8 7 (Tactus.Box.mk (lib.BinderList.Cons 10 9 (Tactus.Box.mk lib.BinderList.Nil)))) lib.MutParamList.Nil (lib.LeafList.Cons 11 (Tactus.Box.mk lib.LeafList.Nil)) 1)
 
 @[reducible] def cert_add_capped_sst : lib.StmData :=
-  (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assert (lib.RawExp.Span 17 (Tactus.Box.mk (lib.RawExp.HasType 64 (Tactus.Box.mk (lib.RawExp.BinOp 6 lib.TypData.TyInt (Tactus.Box.mk (lib.RawExp.Var 0 lib.TypData.TyInt)) (Tactus.Box.mk (lib.RawExp.Var 4 lib.TypData.TyInt))))))) 15)) (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assume 15)) (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assign 18 19)) (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assign 20 21)) (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assert (lib.RawExp.Span 23 (Tactus.Box.mk (lib.RawExp.Var 20 lib.TypData.TyBool))) 20)) (Tactus.Box.mk (lib.StmData.Assume 20)))))) (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assert (lib.RawExp.Span 26 (Tactus.Box.mk (lib.RawExp.HasType 64 (Tactus.Box.mk (lib.RawExp.BinOp 6 lib.TypData.TyInt (Tactus.Box.mk (lib.RawExp.Var 18 lib.TypData.TyInt)) (Tactus.Box.mk (lib.RawExp.Lit 0 lib.TypData.TyInt))))))) 24)) (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assume 24)) (Tactus.Box.mk (lib.StmData.Assign 18 27)))))))))))))) (Tactus.Box.mk (lib.StmData.Ret (Tactus.Box.mk (lib.RawExpList.Cons (Tactus.Box.mk (lib.RawExp.Span 14 (Tactus.Box.mk (lib.RawExp.BinOp 0 lib.TypData.TyBool (Tactus.Box.mk (lib.RawExp.Var 13 lib.TypData.TyInt)) (Tactus.Box.mk (lib.RawExp.BinOp 6 lib.TypData.TyInt (Tactus.Box.mk (lib.RawExp.Var 0 lib.TypData.TyInt)) (Tactus.Box.mk (lib.RawExp.Var 4 lib.TypData.TyInt)))))))) (Tactus.Box.mk lib.RawExpList.Nil))) (lib.RetBind.RetLet 13 18))))
+  (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assert (lib.RawExp.Span 18 (Tactus.Box.mk (lib.RawExp.HasType 64 (Tactus.Box.mk (lib.RawExp.BinOp 6 lib.TypData.TyInt (Tactus.Box.mk (lib.RawExp.Var 0 lib.TypData.TyInt)) (Tactus.Box.mk (lib.RawExp.Var 4 lib.TypData.TyInt))))))) 16 15 0)) (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assume 19 15 0)) (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.AssignH 21 1 20 23 22)) (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.AssignR 25 24)) (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assert (lib.RawExp.Span 28 (Tactus.Box.mk (lib.RawExp.Var 25 lib.TypData.TyBool))) 26 25 1)) (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assume 29 25 1)) (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assert (lib.RawExp.Span 33 (Tactus.Box.mk (lib.RawExp.HasType 64 (Tactus.Box.mk (lib.RawExp.BinOp 6 lib.TypData.TyInt (Tactus.Box.mk (lib.RawExp.Var 21 lib.TypData.TyInt)) (Tactus.Box.mk (lib.RawExp.Lit 0 lib.TypData.TyInt))))))) 31 30 0)) (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Assume 34 30 0)) (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.AssignH 21 1 35 23 36)) (Tactus.Box.mk (lib.StmData.Ret (Tactus.Box.mk (lib.RawExpList.Cons (Tactus.Box.mk (lib.RawExp.Span 14 (Tactus.Box.mk (lib.RawExp.BinOp 0 lib.TypData.TyBool (Tactus.Box.mk (lib.RawExp.Var 13 lib.TypData.TyInt)) (Tactus.Box.mk (lib.RawExp.BinOp 6 lib.TypData.TyInt (Tactus.Box.mk (lib.RawExp.Var 0 lib.TypData.TyInt)) (Tactus.Box.mk (lib.RawExp.Var 4 lib.TypData.TyInt)))))))) (Tactus.Box.mk lib.RawExpList.Nil))) (lib.RetBind.RetLetH 13 1 21 38 37))))))))))))))))))))
 
 example : lib.stm_size cert_add_capped_sst = 20 := by decide
 
 -- ── production goals (N3b) ──────────────────────────────────
--- goal 0: _tactus_assert_add_capped_at_lib_87_17_1
--- goal 1: _tactus_assert_add_capped_at_lib_88_12_2
--- goal 2: _tactus_assert_add_capped_at_lib_89_9_3
--- goal 3: _tactus_postcondition_add_capped_at_lib_85_13_4
+-- goal 0: _tactus_assert_add_capped_at_lib_136_17_1
+-- goal 1: _tactus_assert_add_capped_at_lib_137_12_2
+-- goal 2: _tactus_assert_add_capped_at_lib_138_9_3
+-- goal 3: _tactus_postcondition_add_capped_at_lib_134_13_4
 @[reducible] def cert_add_capped_goals : lib.GoalList :=
-  lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 3 2 (Tactus.Box.mk (lib.GoalData.All 4 1 (Tactus.Box.mk (lib.GoalData.All 6 5 (Tactus.Box.mk (lib.GoalData.All 8 7 (Tactus.Box.mk (lib.GoalData.All 10 9 (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.SpanMark 17 (Tactus.Box.mk (lib.ExprData.BinOp 11 (Tactus.Box.mk (lib.ExprData.BinOp 3 (Tactus.Box.mk (lib.ExprData.Lit 0)) (Tactus.Box.mk (lib.ExprData.BinOp 6 (Tactus.Box.mk (lib.ExprData.Atom 0)) (Tactus.Box.mk (lib.ExprData.Atom 4)))))) (Tactus.Box.mk (lib.ExprData.BinOp 2 (Tactus.Box.mk (lib.ExprData.BinOp 6 (Tactus.Box.mk (lib.ExprData.Atom 0)) (Tactus.Box.mk (lib.ExprData.Atom 4)))) (Tactus.Box.mk (lib.ExprData.Lit 18446744073709551616))))))))))))))))))))) (Tactus.Box.mk (lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 3 2 (Tactus.Box.mk (lib.GoalData.All 4 1 (Tactus.Box.mk (lib.GoalData.All 6 5 (Tactus.Box.mk (lib.GoalData.All 8 7 (Tactus.Box.mk (lib.GoalData.All 10 9 (Tactus.Box.mk (lib.GoalData.Imp 15 (Tactus.Box.mk (lib.GoalData.Imp 15 (Tactus.Box.mk (lib.GoalData.Let 18 19 (Tactus.Box.mk (lib.GoalData.Let 20 21 (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.SpanMark 23 (Tactus.Box.mk (lib.ExprData.Atom 20))))))))))))))))))))))))) (Tactus.Box.mk (lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 3 2 (Tactus.Box.mk (lib.GoalData.All 4 1 (Tactus.Box.mk (lib.GoalData.All 6 5 (Tactus.Box.mk (lib.GoalData.All 8 7 (Tactus.Box.mk (lib.GoalData.All 10 9 (Tactus.Box.mk (lib.GoalData.Imp 15 (Tactus.Box.mk (lib.GoalData.Imp 15 (Tactus.Box.mk (lib.GoalData.Let 18 19 (Tactus.Box.mk (lib.GoalData.Let 20 21 (Tactus.Box.mk (lib.GoalData.Imp 20 (Tactus.Box.mk (lib.GoalData.Imp 20 (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.SpanMark 26 (Tactus.Box.mk (lib.ExprData.BinOp 11 (Tactus.Box.mk (lib.ExprData.BinOp 3 (Tactus.Box.mk (lib.ExprData.Lit 0)) (Tactus.Box.mk (lib.ExprData.BinOp 6 (Tactus.Box.mk (lib.ExprData.Atom 18)) (Tactus.Box.mk (lib.ExprData.Lit 0)))))) (Tactus.Box.mk (lib.ExprData.BinOp 2 (Tactus.Box.mk (lib.ExprData.BinOp 6 (Tactus.Box.mk (lib.ExprData.Atom 18)) (Tactus.Box.mk (lib.ExprData.Lit 0)))) (Tactus.Box.mk (lib.ExprData.Lit 18446744073709551616))))))))))))))))))))))))))))))))) (Tactus.Box.mk (lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 3 2 (Tactus.Box.mk (lib.GoalData.All 4 1 (Tactus.Box.mk (lib.GoalData.All 6 5 (Tactus.Box.mk (lib.GoalData.All 8 7 (Tactus.Box.mk (lib.GoalData.All 10 9 (Tactus.Box.mk (lib.GoalData.Imp 15 (Tactus.Box.mk (lib.GoalData.Imp 15 (Tactus.Box.mk (lib.GoalData.Let 18 19 (Tactus.Box.mk (lib.GoalData.Let 20 21 (Tactus.Box.mk (lib.GoalData.Imp 20 (Tactus.Box.mk (lib.GoalData.Imp 20 (Tactus.Box.mk (lib.GoalData.Imp 24 (Tactus.Box.mk (lib.GoalData.Imp 24 (Tactus.Box.mk (lib.GoalData.Let 18 27 (Tactus.Box.mk (lib.GoalData.Let 13 18 (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.SpanMark 14 (Tactus.Box.mk (lib.ExprData.BinOp 0 (Tactus.Box.mk (lib.ExprData.Atom 13)) (Tactus.Box.mk (lib.ExprData.BinOp 6 (Tactus.Box.mk (lib.ExprData.Atom 0)) (Tactus.Box.mk (lib.ExprData.Atom 4))))))))))))))))))))))))))))))))))))))))) (Tactus.Box.mk lib.GoalList.Nil)))))))
+  lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 3 2 (Tactus.Box.mk (lib.GoalData.All 4 1 (Tactus.Box.mk (lib.GoalData.All 6 5 (Tactus.Box.mk (lib.GoalData.All 8 7 (Tactus.Box.mk (lib.GoalData.All 10 9 (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.SpanMark 18 (Tactus.Box.mk (lib.ExprData.BinOp 11 (Tactus.Box.mk (lib.ExprData.BinOp 3 (Tactus.Box.mk (lib.ExprData.Lit 0)) (Tactus.Box.mk (lib.ExprData.BinOp 6 (Tactus.Box.mk (lib.ExprData.Atom 0)) (Tactus.Box.mk (lib.ExprData.Atom 4)))))) (Tactus.Box.mk (lib.ExprData.BinOp 2 (Tactus.Box.mk (lib.ExprData.BinOp 6 (Tactus.Box.mk (lib.ExprData.Atom 0)) (Tactus.Box.mk (lib.ExprData.Atom 4)))) (Tactus.Box.mk (lib.ExprData.Lit 18446744073709551616))))))))))))))))))))) (Tactus.Box.mk (lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 3 2 (Tactus.Box.mk (lib.GoalData.All 4 1 (Tactus.Box.mk (lib.GoalData.All 6 5 (Tactus.Box.mk (lib.GoalData.All 8 7 (Tactus.Box.mk (lib.GoalData.All 10 9 (Tactus.Box.mk (lib.GoalData.All 16 15 (Tactus.Box.mk (lib.GoalData.All 19 15 (Tactus.Box.mk (lib.GoalData.All 21 1 (Tactus.Box.mk (lib.GoalData.All 23 22 (Tactus.Box.mk (lib.GoalData.Let 25 24 (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.SpanMark 28 (Tactus.Box.mk (lib.ExprData.Atom 25))))))))))))))))))))))))))) (Tactus.Box.mk (lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 3 2 (Tactus.Box.mk (lib.GoalData.All 4 1 (Tactus.Box.mk (lib.GoalData.All 6 5 (Tactus.Box.mk (lib.GoalData.All 8 7 (Tactus.Box.mk (lib.GoalData.All 10 9 (Tactus.Box.mk (lib.GoalData.Imp 15 (Tactus.Box.mk (lib.GoalData.Imp 15 (Tactus.Box.mk (lib.GoalData.Let 21 20 (Tactus.Box.mk (lib.GoalData.Let 25 24 (Tactus.Box.mk (lib.GoalData.Imp 25 (Tactus.Box.mk (lib.GoalData.Imp 25 (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.SpanMark 33 (Tactus.Box.mk (lib.ExprData.BinOp 11 (Tactus.Box.mk (lib.ExprData.BinOp 3 (Tactus.Box.mk (lib.ExprData.Lit 0)) (Tactus.Box.mk (lib.ExprData.BinOp 6 (Tactus.Box.mk (lib.ExprData.Atom 21)) (Tactus.Box.mk (lib.ExprData.Lit 0)))))) (Tactus.Box.mk (lib.ExprData.BinOp 2 (Tactus.Box.mk (lib.ExprData.BinOp 6 (Tactus.Box.mk (lib.ExprData.Atom 21)) (Tactus.Box.mk (lib.ExprData.Lit 0)))) (Tactus.Box.mk (lib.ExprData.Lit 18446744073709551616))))))))))))))))))))))))))))))))) (Tactus.Box.mk (lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 3 2 (Tactus.Box.mk (lib.GoalData.All 4 1 (Tactus.Box.mk (lib.GoalData.All 6 5 (Tactus.Box.mk (lib.GoalData.All 8 7 (Tactus.Box.mk (lib.GoalData.All 10 9 (Tactus.Box.mk (lib.GoalData.Imp 15 (Tactus.Box.mk (lib.GoalData.Imp 15 (Tactus.Box.mk (lib.GoalData.Let 21 20 (Tactus.Box.mk (lib.GoalData.Let 25 24 (Tactus.Box.mk (lib.GoalData.Imp 25 (Tactus.Box.mk (lib.GoalData.Imp 25 (Tactus.Box.mk (lib.GoalData.Imp 30 (Tactus.Box.mk (lib.GoalData.Imp 30 (Tactus.Box.mk (lib.GoalData.Let 21 35 (Tactus.Box.mk (lib.GoalData.Let 13 21 (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.SpanMark 14 (Tactus.Box.mk (lib.ExprData.BinOp 0 (Tactus.Box.mk (lib.ExprData.Atom 13)) (Tactus.Box.mk (lib.ExprData.BinOp 6 (Tactus.Box.mk (lib.ExprData.Atom 0)) (Tactus.Box.mk (lib.ExprData.Atom 4))))))))))))))))))))))))))))))))))))))))) (Tactus.Box.mk lib.GoalList.Nil)))))))
 
 example : lib.goal_count cert_add_capped_goals = 4 := by decide

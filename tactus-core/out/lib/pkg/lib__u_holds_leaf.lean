@@ -4,6 +4,7 @@ import TactusSearch
 set_option linter.unusedVariables false
 set_option maxHeartbeats 800000
 set_option autoImplicit false
-theorem _tactus_postcondition_u_holds_leaf_at_lib_3405_13_1 (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (id : Int) (h_id_bound : 0 ≤ id ∧ id < 18446744073709551616) :
-    /- @rust:lib.rs:3405:13 -/ ∀ (st : Int → Int), lib.holds hp he lv (lib.GoalData.Leaf id) st = hp id st := by
+-- tactus-closer: user
+theorem _tactus_postcondition_u_holds_leaf_at_lib_3962_13_1 (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (id : Int) (h_id_bound : 0 ≤ id ∧ id < 18446744073709551616) :
+    /- @rust:tactus-core/lib.rs:3962:13 -/ ∀ (st : Int → Int), lib.holds hp he lv (lib.GoalData.Leaf id) st = hp id st := by
   first | tactus_auto | (intros <;> rfl)

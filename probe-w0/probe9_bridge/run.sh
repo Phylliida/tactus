@@ -60,6 +60,12 @@ honest_fail_reason() {
     # the FROZEN refWp reproduces production's 4 goals via its flat If/Seq
     # arms. (Option 1 — teach refWp — was proven infeasible: it forces
     # WellFounded.fix, which `decide` cannot reduce.) Now expected-CLOSE.
+    vec_read)   printf '%s' 'stage-B reference-renderer coercion derivation (bootstrap-74 slice 2, 2026-07-21): the binder telescope matches production EXACTLY (FLetH/RetLetH + _h_hoist names all correct — the N1-hoist mirror is faithful). The remaining gap is leaf RENDERING: render_exp of the reference RawExp derives `v.deref` where production writes `v` (View.view call arg — the mirror tags a Ref-wrapped binder as dereferenceable in a slot that wants the wrapper) and misses the `Int.ofNat` cast on the Seq.index CallN arg (per-arg spec-call coercions need the callee signature, which the fixed-vocabulary mirror does not carry). Stage-A assembly is certified; this is a stage-B deep-leaf coverage gap — carded on b74 (follow-up queue §7.7).' ;;
+    # NOTE (bootstrap-77, 2026-07-24): head_exec is expected-CLOSE again —
+    # the A5 `ret_fork`/`StmData::IfCtor` arm mirrors production's
+    # walk_let fork (N2 ctor frames on the positive branch, per-branch
+    # RetLetH). If it reverts to failing, that is a fork-mirror
+    # regression, not a reclassify.
     *)         printf '%s' '' ;;
   esac
 }

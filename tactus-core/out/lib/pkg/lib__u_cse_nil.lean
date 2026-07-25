@@ -4,6 +4,7 @@ import TactusSearch
 set_option linter.unusedVariables false
 set_option maxHeartbeats 800000
 set_option autoImplicit false
-theorem _tactus_postcondition_u_cse_nil_at_lib_3446_13_1 (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (o : lib.RawExp) :
-    /- @rust:lib.rs:3446:13 -/ ∀ (st : Int → Int), lib.close_sem_e hp he lv lib.FrameList.FNil st o = he (lib.render_exp o) st := by
+-- tactus-closer: user
+theorem _tactus_postcondition_u_cse_nil_at_lib_4003_13_1 (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (o : lib.RawExp) :
+    /- @rust:tactus-core/lib.rs:4003:13 -/ ∀ (st : Int → Int), lib.close_sem_e hp he lv lib.FrameList.FNil st o = he (lib.render_exp o) st := by
   first | tactus_auto | (intros <;> rfl)

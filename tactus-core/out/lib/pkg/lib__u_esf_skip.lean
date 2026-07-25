@@ -4,6 +4,7 @@ import TactusSearch
 set_option linter.unusedVariables false
 set_option maxHeartbeats 800000
 set_option autoImplicit false
-theorem _tactus_postcondition_u_esf_skip_at_lib_3644_13_1 (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (f : lib.FrameList) :
-    /- @rust:lib.rs:3644:13 -/ ∀ (st : Int → Int), lib.exec_safe_f hp he lv f lib.StmData.Skip st = True := by
+-- tactus-closer: user
+theorem _tactus_postcondition_u_esf_skip_at_lib_4349_13_1 (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (f : lib.FrameList) :
+    /- @rust:tactus-core/lib.rs:4349:13 -/ ∀ (st : Int → Int), lib.exec_safe_f hp he lv f lib.StmData.Skip st = True := by
   first | tactus_auto | (intros <;> rfl)

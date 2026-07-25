@@ -61,8 +61,22 @@ export LEAN_PATH="$CORE_OUT:$CORE_OUT/pkg:$PRELUDE"
 # ret_typ) — in the Return arm, so the RetBind value renders `self.deref`
 # (leaf 5) and the SST RetLet 4 5 matches the goal's Let 4 5. Removed from the
 # honest-fail set; it must now close-ok.
+# NOTE (endgame A6-short, 2026-07-24): the lemma_runtime_word_view_* fns now
+# census-reject at emission (`assert-forall` tag — skolem binders unmodeled at
+# stage A; detection = production's own collect_assert_by_vars). They emit NO
+# cert and are no longer bridge subjects; if one ever reappears with a cert
+# and no quantifier-binder arm, it lands UNCLASSIFIED and fails this runner.
+# NOTE (endgame A2, 2026-07-24): apply_hom_gen/inv are now expected-CLOSE.
+# The b74-sweep honest-fail was the CLOSER GATE, not arg-temp LetRaw: these
+# fns carry user tactus_tactic closers, and production's emit_leaf_theorem
+# NEVER hoists user-closer fns (positional tactic text). The serializer now
+# mirrors the shared closer_is_default gate (wrap-mode: plain Assign/FLet/
+# RetLet), renders ctx reqs via production's build_req_binders (view-arg
+# auto-ref coercion), and threads its let-binder ledger into
+# cert_call_leaves (no double Ref.mk on earlier call-dest args).
 honest_fail_reason() {
   case "$1" in
+    runtime__find_cancellation_exec) printf '%s' 'stage-B reference-renderer coercion derivation (bootstrap-77, 2026-07-24): the vec_read class, newly VISIBLE because the fn finally serializes (its assert-query-tactus census tag retired). Stage-A assembly matches (goal count 21 = production; spines align); the per-goal divergence is deep-leaf ONLY — the reference render_exp derives `App idx (FieldProj (Atom v) deref)` where production writes `App idx (Atom v)` (View.view call arg on the &Vec param — per-arg spec-call coercions need the callee signature the fixed-vocabulary mirror does not carry). Same class and same fix as probe9 vec_read: endgame A7 (stage-B callee-signature vocabulary).' ;;
     *) printf '%s' '' ;;
   esac
 }

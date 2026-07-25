@@ -487,7 +487,10 @@ impl<'a> WpCtx<'a> {
     pub fn new(
         krate: &'a KrateX,
         check: &'a FuncCheckSst,
-        fn_attr_closer_is_default: bool,
+        // The COMBINED closer gate (attr + proof-block prefix), from
+        // `closer_is_default` — the single source shared with the cert
+        // serializer's wrap-mode mirror (endgame A2).
+        fn_closer_is_default: bool,
         // For callee-side `&mut` body verification (#94): set of
         // sanitized param-name strings for the fn's `&mut` params.
         // Each ens_exp is rewritten so `*old(x)` → `<x>_at_pre_tactus`
@@ -604,31 +607,6 @@ impl<'a> WpCtx<'a> {
                 ))
             }).collect::<Result<Vec<_>, String>>()?
         );
-        // The Return→Wp::Let route additionally requires NO user
-        // `proof { tac }` tactic prefix anywhere in the body: a
-        // prefix flows onto every theorem in its scope and is
-        // positional against the legacy goal shape (a user
-        // `cases k with …; split` script overshoots forked per-arm
-        // goals — `test_exec_match_enum_with_per_arm_proof`).
-        // Assert-by closers are fine: they close only their own
-        // theorem.
-        let mut has_proof_block_prefix = false;
-        let _ = vir::sst_visitor::stm_visitor_dfs::<(), _>(
-            &check.body,
-            &mut |stm: &vir::sst::Stm| {
-                if let vir::sst::StmX::AssertQuery {
-                    mode: vir::ast::AssertQueryMode::Tactus {
-                        kind: vir::ast::TactusKind::ProofBlock, ..
-                    },
-                    ..
-                } = &stm.x
-                {
-                    has_proof_block_prefix = true;
-                }
-                vir::visitor::VisitorControlFlow::Recurse
-            },
-        );
-        let fn_closer_is_default = fn_attr_closer_is_default && !has_proof_block_prefix;
         Ok(Self {
             fn_map,
             datatypes,
@@ -772,17 +750,21 @@ pub(crate) fn peel_value_position(e: &Exp) -> &Exp {
 /// pieces `branch_ctor_frames` needs (the variant ident to find the
 /// field list, the scrutinee's instantiated typ for generic field
 /// substitution).
-struct BranchIsVariant<'e> {
-    dt_path: &'e vir::ast::Path,
-    variant: &'e str,
-    scrut: crate::lean_name::LeanName,
-    scrut_typ: &'e Typ,
+/// pub(crate) since bootstrap-77: the serializer's IfCtor fork arm
+/// shares the DETECTOR (single-source, like `closer_is_default` /
+/// `collect_assert_by_vars_in`) while re-assembling the ctor frames
+/// itself — the bridge validates the assembled structure.
+pub(crate) struct BranchIsVariant<'e> {
+    pub(crate) dt_path: &'e vir::ast::Path,
+    pub(crate) variant: &'e str,
+    pub(crate) scrut: crate::lean_name::LeanName,
+    pub(crate) scrut_typ: &'e Typ,
     /// The peeled scrutinee expression itself — `branch_ctor_frames`
     /// LOWERS this through the walk's render ctx to build the
     /// equation's LHS (a `&T` scrutinee renders as `x.deref`; hand-
     /// building `Var(x)` would equate the Ref with the constructor).
-    inner: &'e Exp,
-    positive: bool,
+    pub(crate) inner: &'e Exp,
+    pub(crate) positive: bool,
 }
 
 fn branch_test_of(cond: &Exp, positive: bool) -> Option<crate::lean_ast::BranchTest> {
@@ -924,7 +906,7 @@ fn branch_ctor_frames(
     Some(frames)
 }
 
-fn branch_isvariant_of(cond: &Exp, positive: bool) -> Option<BranchIsVariant<'_>> {
+pub(crate) fn branch_isvariant_of(cond: &Exp, positive: bool) -> Option<BranchIsVariant<'_>> {
     // Fixpoint-peel every transparent wrapper the SST may interpose
     // (Loc, Box/Unbox, CoerceMode, Trigger, CustomErr spans) and fold
     // an explicit `Not` into the polarity — the lowered-match chain
@@ -1079,6 +1061,37 @@ pub struct ExecFnObligations {
     pub goal_shapes: Vec<Option<GoalShape>>,
 }
 
+/// The N1-hoist / leaf-normal closer gate — SINGLE SOURCE, shared by
+/// `WpCtx` (production's hoist/Return-route decisions) and the cert
+/// serializer's wrap-mode mirror (endgame A2). Default iff the fn has
+/// no fn-level `tactus_tactic` attr AND no user `proof { tac }` prefix
+/// anywhere in the body: a user closer/prefix is positional against
+/// the legacy goal-position wrap shape, so production NEVER hoists
+/// those fns' goals (`emit_leaf_theorem`'s `is_default` gate) and the
+/// Return keeps the legacy `Done(let ret := e; …)` leaf.
+pub(crate) fn closer_is_default(fn_sst: &FunctionSst, check: &FuncCheckSst) -> bool {
+    if fn_sst.x.attrs.tactus_tactic.is_some() {
+        return false;
+    }
+    let mut has_proof_block_prefix = false;
+    let _ = vir::sst_visitor::stm_visitor_dfs::<(), _>(
+        &check.body,
+        &mut |stm: &vir::sst::Stm| {
+            if let vir::sst::StmX::AssertQuery {
+                mode: vir::ast::AssertQueryMode::Tactus {
+                    kind: vir::ast::TactusKind::ProofBlock, ..
+                },
+                ..
+            } = &stm.x
+            {
+                has_proof_block_prefix = true;
+            }
+            vir::visitor::VisitorControlFlow::Recurse
+        },
+    );
+    !has_proof_block_prefix
+}
+
 pub fn exec_fn_theorems_to_ast<'a>(
     krate: &'a KrateX,
     fn_sst: &'a FunctionSst,
@@ -1231,7 +1244,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
     let ctx = WpCtx::new(
         krate,
         check,
-        fn_sst.x.attrs.tactus_tactic.is_none(),
+        closer_is_default(fn_sst, check),
         &mut_param_names,
         borrow_mut_links,
         caller_param_typs,
@@ -1744,7 +1757,7 @@ use crate::obligation_naming::{build_theorem_name, detect_assert_kind, format_ru
 /// an expression-level binder for a name removes its env entry inside
 /// that scope, so capture is respected. `SpanMark`s and all other
 /// structure are preserved verbatim.
-fn rename_frame_vars(
+pub(crate) fn rename_frame_vars(
     e: &LExpr,
     env: &HashMap<String, crate::lean_name::LeanName>,
 ) -> LExpr {
@@ -1816,7 +1829,7 @@ fn rename_frame_vars(
 /// hoist's bail check: a theorem-level binder may not refer to a
 /// goal-position residue let. No shadow tracking — a shadowed
 /// coincidence bails conservatively (the pre-partial-hoist behavior).
-fn lexpr_mentions_var(e: &LExpr, name: &str) -> bool {
+pub(crate) fn lexpr_mentions_var(e: &LExpr, name: &str) -> bool {
     match &e.node {
         crate::lean_ast::ExprNode::Var(n) => n.as_str() == name,
         _ => {
@@ -5047,6 +5060,11 @@ pub(crate) struct CertCallLeaves {
     pub precondition: Option<LExpr>,
     /// The call's dest binder name (`let <dest> := …`).
     pub dest_name: crate::lean_name::LeanName,
+    /// The dest local's declared typ (from the dest Exp — the same
+    /// source the caller's `type_map` reads). The serializer's N1-hoist
+    /// classification (bootstrap-74 slice 2) decides FLetH / FLetR /
+    /// FLet for the dest let from it.
+    pub dest_typ: vir::ast::Typ,
     /// The post-call frame ingredients, path-tagged. The serializer
     /// chooses the `FrameList` shape from the tag.
     pub post: CertCallPost,
@@ -5099,6 +5117,25 @@ pub(crate) fn cert_call_leaves<'a>(
     call_span: &Span,
     fn_map: &'a crate::expr_shared::RenderFnMap<'a>,
     caller_param_typs: &HashMap<VarIdent, Typ>,
+    // The serializer's mirror of the walk's `OblCtx.let_binder_typs`
+    // ledger (endgame A2): call args that are EARLIER call-dest locals
+    // render at their LEDGERED typ (trusted), exactly as production's
+    // walk-time `arg_rctx` does — without it, a `tmp__N : &T` dest
+    // re-wraps `Tactus.Ref.mk` at the next call's arg slot and the
+    // instantiated ensures leaf diverges (apply_hom class).
+    let_binder_typs: &im::HashMap<crate::lean_name::LeanName, (Typ, bool)>,
+    // Emitter-counter mirror (bootstrap-78 S1, card E5): production's
+    // per-fn `ObligationEmitter.counter` value at THIS call site,
+    // replayed by the serializer's walk. The shell emitter below starts
+    // here (not 0 — the old per-call zero matched production only for
+    // fns whose call was the first consumer; fill_zeros' `_tactus_mut_
+    // post_5`/`_ret_6` is the counter-example). On success the consumed
+    // ids advance it: build_call_substitutions' gensyms (one per &mut
+    // arg + fresh_ret always, sites ~4025/4034) + one for the
+    // precondition theorem production emits iff requires is non-empty
+    // (~3634 guard) — which this fn mirrors as a leaf WITHOUT emitting,
+    // so the id is added manually.
+    emit_counter: &mut u64,
 ) -> Result<CertCallLeaves, String> {
     // ── Phase A: restricted-subset resolution (mirrors resolve_callee's
     // Static arm; everything else is a sharp fail-loud tag). ──
@@ -5124,8 +5161,18 @@ pub(crate) fn cert_call_leaves<'a>(
     // the VIR level below (`ret_typ_subst`, mirroring production's
     // dest-let binder typ) so `type_bound_predicate`/`coerce_lexpr`
     // see the concrete typ, not a bare `TypParam`.
-    // No `&mut` params — the mut-arg existential / rebind / prophecy
-    // machinery is out of the restricted subset.
+    // Returned-`&mut` callees — the returned-mut-ref PROPHECY
+    // COMPOSITION machinery (`mint_return_prophecy` + `OblCtx::
+    // prophecies` reuse across later calls) is out of the restricted
+    // subset; sharper tag than the param class since it is the harder
+    // machinery (bootstrap-78 D3; zero corpus population — a &mut
+    // return necessarily borrows from a &mut param, so check FIRST).
+    if crate::expr_shared::is_mut_ref_typ(&callee.ret.x.typ, false) {
+        return Err("call-mut-ret".to_string());
+    }
+    // No `&mut` params — the mut-arg existential / rebind machinery
+    // is the bootstrap-78 S3 arm (Var targets); until it lands every
+    // mut-param callee tags out here.
     if callee.params.iter()
         .any(|p| crate::expr_shared::is_mut_ref_typ(&p.x.typ, p.x.is_mut))
     {
@@ -5151,15 +5198,21 @@ pub(crate) fn cert_call_leaves<'a>(
         .map_err(|reason| format!("leaf-render: {}", reason))?;
 
     // ── Phase C: substitution maps + render ctxs (reuse production). ──
-    // Shell obl/emitter: in the restricted subset (no let-binder ledger,
-    // no prophecies) neither affects the rendered leaf text — the ret-eq
-    // path substitutes `fresh_ret_name` OUT, and the emitter's id counter
-    // only names theorems (not leaves). Constructed here (in-module).
-    let obl = OblCtx::new(Tactic::Named("tactus_auto".to_string()));
+    // Shell obl/emitter: the emitter's id counter only names theorems
+    // (not leaves) and prophecies stay out of the restricted subset —
+    // but the LET-BINDER LEDGER is load-bearing (endgame A2): the
+    // serializer's mirror installs so arg renders see earlier call
+    // dests at their trusted ledgered typs, matching the walk.
+    let mut obl = OblCtx::new(Tactic::Named("tactus_auto".to_string()));
+    obl.let_binder_typs = let_binder_typs.clone();
     let mut emitter = ObligationEmitter {
         fn_name: String::new(),
         base_binders: Vec::new(),
-        counter: 0,
+        // Counter mirror (bootstrap-78 S1): start at the walk-order
+        // value, NOT 0 — `build_call_substitutions` mints this call's
+        // `_tactus_mut_post_<id>` / `_tactus_ret_<id>` gensyms from it
+        // and those names enter cert leaf texts.
+        counter: *emit_counter as usize,
         out: Vec::new(),
         goal_shapes: Vec::new(),
         tactic_prefix: Vec::new(),
@@ -5173,7 +5226,8 @@ pub(crate) fn cert_call_leaves<'a>(
         dt_inventory: Default::default(),
     };
     let arg_rctx = crate::expr_shared::RenderCtx::with_fn_map(fn_map)
-        .with_binder_typs(caller_param_typs);
+        .with_binder_typs(caller_param_typs)
+        .with_let_binder_typs(let_binder_typs);
     let subst = build_call_substitutions(
         callee, spec_callee, &typ_args[..], &validated_args, &[],
         caller_param_typs, &arg_rctx, &obl, &mut emitter,
@@ -5290,9 +5344,23 @@ pub(crate) fn cert_call_leaves<'a>(
         }
     };
 
+    // Counter mirror: report the ids production consumes at this call —
+    // the shell emitter's advance (gensyms minted in Phase C: one per
+    // &mut arg + fresh_ret) plus the precondition theorem's id
+    // (production's ~3634 guard: emitted iff requires non-empty, which
+    // is exactly `precondition.is_some()` — this fn mirrors the leaf
+    // without emitting, so the id is added here).
+    *emit_counter = emitter.counter as u64 + u64::from(precondition.is_some());
+
     Ok(CertCallLeaves {
         precondition,
         dest_name: crate::lean_name::LeanName::from_var_ident(dest_ident),
+        // The dest let's binder typ is the instantiated CALLEE ret typ
+        // (production's Phase-5 `ret_typ_subst`, sst_to_lean.rs:4306) —
+        // NOT the SST dest local's declared typ (Verus auto-derefs the
+        // call result into the local: `vec_index`'s Ref-typed return
+        // becomes an Int local while the binder stays `Tactus.Ref Int`).
+        dest_typ: ret_typ_subst,
         post,
     })
 }
@@ -5648,7 +5716,10 @@ fn build_borrow_mut_binders(check: &FuncCheckSst) -> Vec<LBinder> {
 /// applies to the body's WP. This keeps `Var(x)` in the rewritten req
 /// expression type-checking against inner T at the theorem-binder
 /// position (which is outside the OblCtx wrap).
-fn build_req_binders(
+// pub(crate): the cert serializer reuses this for its `FnCtxData.reqs`
+// leaf TEXTS (endgame A2 — leaf text is production-rendered by design,
+// DESIGN §2.5; the fn_map ctx's view-arg auto-ref coercion must match).
+pub(crate) fn build_req_binders(
     fn_sst: &FunctionSst,
     check: &FuncCheckSst,
     mut_param_names: &HashSet<String>,
@@ -6706,6 +6777,19 @@ fn collect_assert_by_vars<'a>(
     stm: &Stm,
     ctx: &WpCtx<'a>,
 ) -> Vec<(&'a VarIdent, &'a Typ)> {
+    collect_assert_by_vars_in(stm, &ctx.assert_by_var_typs)
+}
+
+// Split out (endgame A6-short) so the cert serializer can run the SAME
+// detection from its own `LocalDeclKind::AssertByVar` map — a DeadEnd
+// scope referencing skolems means production ∀-binds them in the goal
+// telescope, which stage A has no quantifier-binder arm for; the
+// serializer census-rejects loud (`assert-forall`) instead of emitting
+// a cert that cannot bridge.
+pub(crate) fn collect_assert_by_vars_in<'a>(
+    stm: &Stm,
+    assert_by_var_typs: &HashMap<&'a VarIdent, &'a Typ>,
+) -> Vec<(&'a VarIdent, &'a Typ)> {
     use vir::sst::ExpX as X;
     let mut used: std::collections::HashSet<VarIdent> = std::collections::HashSet::new();
     let _ = vir::sst_visitor::map_exps_in_stm_visitor(stm, &mut |e: &Exp| {
@@ -6720,7 +6804,7 @@ fn collect_assert_by_vars<'a>(
         });
         e.clone()
     });
-    let mut out: Vec<(&'a VarIdent, &'a Typ)> = ctx.assert_by_var_typs.iter()
+    let mut out: Vec<(&'a VarIdent, &'a Typ)> = assert_by_var_typs.iter()
         .filter(|(v, _)| used.contains(**v))
         .map(|(v, t)| (*v, *t))
         .collect();

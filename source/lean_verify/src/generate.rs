@@ -4776,14 +4776,25 @@ fn build_link_module(
             .map(|pr| {
                 let name = crate::lean_name::LeanName::from_var_ident(&pr.x.name)
                     .into_string();
-                let kind = if let Some(pred) = field_bound_pred(&pr.x.typ, &name) {
-                    crate::wf_synth::ParamKind::Bounded(pred)
-                } else {
-                    match field_dt(&pr.x.typ) {
-                        Some((d, false)) if scalar_carrying.contains(&d) => {
-                            crate::wf_synth::ParamKind::Dt(d)
+                // Dt-classification takes PRECEDENCE for datatype-typed
+                // params (bootstrap-77): a scalar field in a struct makes
+                // `type_bound_predicate` fire on the WHOLE struct
+                // (FnCtxData.closer_default did exactly this), but the wf
+                // hypothesis subsumes the projected bound — it is a
+                // conjunct of the wf pred — and the synthesizer needs the
+                // Dt proof to project field wf (`hwf_c.1` etc.). A
+                // Bounded-classified struct param starved seed_frame_wf
+                // ("no wf source for `c.typ_params`").
+                let kind = match field_dt(&pr.x.typ) {
+                    Some((d, false)) if scalar_carrying.contains(&d) => {
+                        crate::wf_synth::ParamKind::Dt(d)
+                    }
+                    _ => {
+                        if let Some(pred) = field_bound_pred(&pr.x.typ, &name) {
+                            crate::wf_synth::ParamKind::Bounded(pred)
+                        } else {
+                            crate::wf_synth::ParamKind::Other
                         }
-                        _ => crate::wf_synth::ParamKind::Other,
                     }
                 };
                 (name, kind)
@@ -5292,9 +5303,32 @@ fn write_spine_sidecar(
                                     j.push_str(",\"p\":\"height\""),
                                 Some(HypProvenance::Requires { index }) =>
                                     j.push_str(&format!(",\"p\":\"requires\",\"i\":{}", index)),
-                                Some(HypProvenance::HoistEq { binder }) =>
+                                Some(HypProvenance::HoistEq { binder }) => {
                                     j.push_str(&format!(
-                                        ",\"p\":\"hoist\",\"binder\":\"{}\"", esc(binder.as_str()))),
+                                        ",\"p\":\"hoist\",\"binder\":\"{}\"", esc(binder.as_str())));
+                                    // Structured equation RHS (self-review
+                                    // 2026-07-24, finding 2): the composer
+                                    // needs `v` to replay `let binder := v;`
+                                    // — emit it from the STRUCTURED LExpr
+                                    // here (the writer holds the eq tree),
+                                    // never re-parsed from the pp'd `ty`
+                                    // text. A non-eq / mismatched-lhs shape
+                                    // omits the field and the parser keeps
+                                    // the fn pending (loud).
+                                    if let crate::lean_ast::ExprNode::BinOp {
+                                        op: crate::lean_ast::BinOp::Eq, lhs, rhs,
+                                    } = &b.ty.node
+                                    {
+                                        if matches!(&lhs.node,
+                                            crate::lean_ast::ExprNode::Var(n)
+                                                if n.as_str() == binder.as_str())
+                                        {
+                                            j.push_str(&format!(
+                                                ",\"v\":\"{}\"",
+                                                esc(&crate::lean_pp::pp_expr(rhs))));
+                                        }
+                                    }
+                                }
                                 Some(HypProvenance::CtorEq { scrutinee, variant, .. }) =>
                                     j.push_str(&format!(
                                         ",\"p\":\"ctor\",\"scrut\":\"{}\",\"variant\":\"{}\"",

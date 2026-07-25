@@ -94,3 +94,16 @@ where a broader bug-finding payoff (more real-corpus certs) will come from.
     # regen the cert (cold, cert on, targeted; ~80s) — see run.sh header
     LEAN=<lean-v4.25.0> bash probe-w0/probe11_w3_tgt/run.sh   # bridges on-disk certs
     LEAN_PATH=tactus-core/out/lib:<prelude> lean probe-w0/probe11_w3_tgt/Pinpoint.lean
+
+## Update 2026-07-24 (endgame A2, bootstrap-75): 3/3 CLOSE
+
+apply_hom_gen + apply_hom_inv reclassified honest-fail → **CLOSE** (the
+runner's LAX-REGRESS tripwire fired on the stale classification — the
+discipline works). Root cause was the CLOSER GATE, not arg-temp LetRaw:
+production never hoists user-`tactus_tactic` fns; the serializer now
+mirrors the shared `closer_is_default` gate (wrap-mode plain lets),
+renders ctx reqs via production's `build_req_binders`, and threads its
+let-binder ledger into `cert_call_leaves`. Current table: 3 CLOSE
+(clone, apply_hom_gen, apply_hom_inv) + 2 documented assert-forall
+honest-fails (endgame A6). ALL CLASSIFIED ✓. Full writeup:
+`board/bootstrap-75-a2-user-closer-wrap-mode.md`.
