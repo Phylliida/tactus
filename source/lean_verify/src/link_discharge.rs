@@ -84,7 +84,7 @@ pub fn parse_sidecar(txt: &str) -> Option<FnSidecar> {
                 for n in arr {
                     let k = n.get("k").and_then(|k| k.as_str()).unwrap_or("");
                     // An "all" entry CARRYING premise provenance is an
-                    // absorbed leading hyp (`_h_ctx_N` binder) — same
+                    // absorbed leading hyp (`_h_hoist_N` binder) — same
                     // application position as the corresponding imp, so
                     // parse it as the premise node directly.
                     let k = if k == "all" && n.get("p").is_some() { "imp" } else { k };

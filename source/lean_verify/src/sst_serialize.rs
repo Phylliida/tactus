@@ -141,13 +141,15 @@
 //!   RE-DERIVED via `sst_to_lean::collect_modifications(body)` filtered
 //!   by `local_typs` (= production's `WpCtx.type_map`), exactly as
 //!   `build_wp_loop` does. Emits: the modified-local `∀`-binders +
-//!   parallel `_h_ctx_N` type-bound hyps, the standard invariants as
-//!   `(_h_ctx_N, ANNOTATED obligation leaf)`, the ANNOTATED cond /
-//!   ¬cond hyps (shared `_h_ctx_N` name), and the single-level decrease
+//!   parallel `_h_hoist_N` type-bound hyps, the standard invariants as
+//!   `(_h_hoist_N, ANNOTATED obligation leaf)`, the ANNOTATED cond /
+//!   ¬cond hyps (shared `_h_hoist_N` name), and the single-level decrease
 //!   snapshot (`_tactus_d_old_<id>_0`) + its annotated
-//!   `0 ≤ D ∧ D < d_old` obligation. `_h_ctx_N` names mirror
-//!   `OblCtx::split_leading_binders`' counter byte-for-byte so the
-//!   binder-name ids unify with the goal side.
+//!   `0 ≤ D ∧ D < d_old` obligation. `_h_hoist_N` names replay
+//!   `hoist_all`'s walk counter (and, S3-pre, the per-goal counter of
+//!   `OblCtx::split_leading_binders` — the extracted prefix contains no
+//!   lets, so positions coincide with walk ordinals) so the binder-name
+//!   ids unify with the goal side.
 //! * `StmX::Call` (bootstrap-02b — THE one non-transcription trusted
 //!   step). The callee's `requires`/`ensures` are VIR-AST clauses that
 //!   must be INSTANTIATED at THIS call's actual args before they can be
@@ -3608,7 +3610,8 @@ impl<'a> Serializer<'a> {
         crate::sst_to_lean::collect_modifications(body, &mut locally_declared, &mut mod_names);
 
         // Hyp names are `_h_hoist_i` ordinals continuing the walk counter
-        // (bootstrap-74 slice 2; `_h_ctx_N` is gone from goal shapes):
+        // (bootstrap-74 slice 2; S3-pre retired `_h_ctx_N` entirely —
+        // `split_leading_binders` now replays the same scheme):
         // mod-var bounds first, then invariants, then the cond — the
         // maintain and use telescopes share them (sum_to evidence:
         // `_h_hoist_1..7` in both).

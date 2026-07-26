@@ -2239,6 +2239,33 @@ pub open spec fn close_e_wrap(f: FrameList, ob: RawExp) -> GoalData
     }
 }
 
+// S3-pre leading sub-mode: production's `split_leading_binders` extracts
+// the leading Binder/Hyp PREFIX of every wrap-mode goal to theorem-level
+// binders — a pure prefix latch that stops at the first let-class frame
+// (base binders always precede the frames, so there is no seed/body
+// boundary to distinguish). Leading FBind/FHyp render as NAMED All
+// binders (the FBind-encoding; the FHyp's hn field carries the
+// serializer-interned `_h_hoist_k` name, which coincides with
+// production's per-goal 1-based counter because the extracted prefix
+// contains no lets); the first let-class frame latches ONE-WAY to the
+// plain wrap rendering (`close_e_wrap` — hyps back to anonymous Imp).
+// FUserCloser is transparent (a serializer sentinel, not a frame
+// production's splitter sees).
+#[verifier::structural_decreases]
+pub open spec fn close_e_wrap_lead(f: FrameList, ob: RawExp) -> GoalData
+    decreases f
+{
+    match f {
+        FrameList::FNil => GoalData::LeafE(render_exp(ob)),
+        FrameList::FBind(id, typ, t) => GoalData::All(id, typ, Box::new(close_e_wrap_lead(*t, ob))),
+        FrameList::FHyp(hn, h, _p, t) => GoalData::All(hn, h, Box::new(close_e_wrap_lead(*t, ob))),
+        FrameList::FLet(id, v, t) => GoalData::Let(id, v, Box::new(close_e_wrap(*t, ob))),
+        FrameList::FLetH(id, _ty, v, _en, _ep, t) => GoalData::Let(id, v, Box::new(close_e_wrap(*t, ob))),
+        FrameList::FLetR(id, v, t) => GoalData::Let(id, v, Box::new(close_e_wrap(*t, ob))),
+        FrameList::FUserCloser(t) => close_e_wrap_lead(*t, ob),
+    }
+}
+
 // Hoist-mode rendering (production's hoist_all), TWO-PHASE exactly as
 // production builds it: phase 1 (`close_e_tel`) folds every non-residue
 // frame into the theorem-level binder telescope — hyps NAMED
@@ -2290,7 +2317,7 @@ pub open spec fn close_e_hoist(f: FrameList, ob: RawExp) -> GoalData {
 // unchanged). Mode is decided ONCE over the whole frame list, exactly
 // as production inspects all frames before hoisting (§hoist_all).
 pub open spec fn close_e(f: FrameList, ob: RawExp) -> GoalData {
-    if gate_wrap(f) == 1 { close_e_wrap(f, ob) } else { close_e_hoist(f, ob) }
+    if gate_wrap(f) == 1 { close_e_wrap_lead(f, ob) } else { close_e_hoist(f, ob) }
 }
 
 // W6d.1b: the bare-atom obligation. An obligation leaf that carries no deep
@@ -3414,7 +3441,10 @@ proof fn ref_wp_if_fallthrough_divergence()
                         Box::new(StmData::Skip))),
                     Box::new(StmData::Assert(atom_ob(40), 0, 39, 0)))),
             GoalList::Cons(
-                Box::new(GoalData::Imp(34, Box::new(GoalData::Imp(36,
+                // S3-pre prefix latch: the two leading hyps (ambient 34,
+                // annotated cond 36) extract to NAMED binders in this
+                // wrap goal (the RetLet is the first let-class frame).
+                Box::new(GoalData::All(0, 34, Box::new(GoalData::All(0, 36,
                     Box::new(GoalData::Let(8, 9, Box::new(GoalData::LeafE(ExprData::Atom(7))))))))),
                 Box::new(GoalList::Cons(
                     Box::new(GoalData::All(0, 34, Box::new(GoalData::All(0, 37,
@@ -3494,7 +3524,8 @@ by { decide }
 // * RET-EQ (#128): `double_exec` ensures `r == 2*x`, so production drops the
 //   `∀ a`: `post = FHyp(E_bound=9) FLet(a=8, 2*x=10)`. The continuation is
 //   `100 → (0≤2x∧2x<2^64) → let a := 2x; Q` — no quantifier. (Post-N1
-//   the plain FLet gates this goal to WRAP mode, so its Imps survive;
+//   the plain FLet gates this goal to WRAP mode; S3-pre extracts the
+//   leading hyps to NAMED binders up to the FLet latch;
 //   the let-free req goal and ∀-path goal HOIST — All-rendered.)
 // * ∀-PATH: a callee whose ensures is NOT a ret-eq (e.g. `r > x`) quantifies
 //   the result: `post = FBind(a=8, u64=1) FHyp(ret_bound=9) FHyp(ens=13)`.
@@ -3520,7 +3551,9 @@ proof fn ref_wp_call_pass_through()
             GoalList::Cons(
                 Box::new(GoalData::All(0, 100, Box::new(GoalData::LeafE(ExprData::Atom(7))))),
                 Box::new(GoalList::Cons(
-                    Box::new(GoalData::Imp(100, Box::new(GoalData::Imp(9,
+                    // S3-pre prefix latch: the ambient hyp + E_bound hyp
+                    // lead this wrap goal (FLet(a) is the latch) — NAMED.
+                    Box::new(GoalData::All(0, 100, Box::new(GoalData::All(0, 9,
                         Box::new(GoalData::Let(8, 10, Box::new(GoalData::LeafE(ExprData::Atom(11))))))))),
                     Box::new(GoalList::Nil)))),
         ) == 1,
@@ -3559,7 +3592,10 @@ proof fn ref_wp_call_pass_through()
             GoalList::Cons(
                 Box::new(GoalData::All(0, 100, Box::new(GoalData::LeafE(ExprData::Atom(7))))),
                 Box::new(GoalList::Cons(
-                    Box::new(GoalData::Imp(100, Box::new(GoalData::Imp(9,
+                    // Same S3-pre shape as the positive pin — the ONLY
+                    // difference is the let value (10 → 99), so the kill
+                    // stays non-vacuous.
+                    Box::new(GoalData::All(0, 100, Box::new(GoalData::All(0, 9,
                         Box::new(GoalData::Let(8, 99, Box::new(GoalData::LeafE(ExprData::Atom(11))))))))),
                     Box::new(GoalList::Nil)))),
         ) == 0
@@ -3775,6 +3811,30 @@ pub open spec fn close_sem_e_wrap(hp: HpOracle, he: HeOracle, lv: LvOracle, f: F
     }
 }
 
+// S3-pre leading sub-mode semantics, moving in step with
+// `close_e_wrap_lead`: leading FHyps take the tel-style ABSTRACT-BINDER
+// reading (`∀ n, … upd(st, hn, n)` — `holds` reads All as value
+// quantification, so the implication reading would break the weave; the
+// adequacy layer recovers the dependent-product meaning exactly as it
+// already does for hoist-mode named hyps). The first let-class frame
+// latches one-way to the plain wrap walk.
+#[verifier::structural_decreases]
+pub open spec fn close_sem_e_wrap_lead(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, o: RawExp) -> bool
+    decreases f
+{
+    match f {
+        FrameList::FNil => he(render_exp(o), st),
+        FrameList::FBind(x, _ty, t) =>
+            forall|n: int| #[trigger] close_sem_e_wrap_lead(hp, he, lv, *t, upd(st, x, n), o),
+        FrameList::FHyp(hn, _h, _p, t) =>
+            forall|n: int| #[trigger] close_sem_e_wrap_lead(hp, he, lv, *t, upd(st, hn, n), o),
+        FrameList::FLet(x, v, t) => close_sem_e_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), o),
+        FrameList::FLetH(x, _ty, v, _en, _ep, t) => close_sem_e_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), o),
+        FrameList::FLetR(x, v, t) => close_sem_e_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), o),
+        FrameList::FUserCloser(t) => close_sem_e_wrap_lead(hp, he, lv, *t, st, o),
+    }
+}
+
 // Hoist-mode semantics — TWO-PHASE, paralleling close_e_tel /
 // residue_fold_e arm-for-arm so holds(close_e_hoist …) ==
 // close_sem_e_hoist … is a mechanical induction: the telescope phase
@@ -3836,7 +3896,7 @@ pub open spec fn close_sem_e_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle, f: 
 }
 
 pub open spec fn close_sem_e(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, o: RawExp) -> bool {
-    if gate_wrap(f) == 1 { close_sem_e_wrap(hp, he, lv, f, st, o) } else { close_sem_e_hoist(hp, he, lv, f, st, o) }
+    if gate_wrap(f) == 1 { close_sem_e_wrap_lead(hp, he, lv, f, st, o) } else { close_sem_e_hoist(hp, he, lv, f, st, o) }
 }
 
 /// Frame-telescope interpretation, continuation = "every obligation in
@@ -3855,6 +3915,25 @@ pub open spec fn close_sem_obligs_wrap(hp: HpOracle, he: HeOracle, lv: LvOracle,
         FrameList::FLetH(x, _ty, v, _en, _ep, t) => close_sem_obligs_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), l),
         FrameList::FLetR(x, v, t) => close_sem_obligs_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), l),
         FrameList::FUserCloser(t) => close_sem_obligs_wrap(hp, he, lv, *t, st, l),
+    }
+}
+
+// S3-pre leading sub-mode, `obligs_safe` continuation (same prefix
+// latch as `close_sem_e_wrap_lead`).
+#[verifier::structural_decreases]
+pub open spec fn close_sem_obligs_wrap_lead(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, l: RawExpList) -> bool
+    decreases f
+{
+    match f {
+        FrameList::FNil => obligs_safe(he, l, st),
+        FrameList::FBind(x, _ty, t) =>
+            forall|n: int| #[trigger] close_sem_obligs_wrap_lead(hp, he, lv, *t, upd(st, x, n), l),
+        FrameList::FHyp(hn, _h, _p, t) =>
+            forall|n: int| #[trigger] close_sem_obligs_wrap_lead(hp, he, lv, *t, upd(st, hn, n), l),
+        FrameList::FLet(x, v, t) => close_sem_obligs_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), l),
+        FrameList::FLetH(x, _ty, v, _en, _ep, t) => close_sem_obligs_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), l),
+        FrameList::FLetR(x, v, t) => close_sem_obligs_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), l),
+        FrameList::FUserCloser(t) => close_sem_obligs_wrap_lead(hp, he, lv, *t, st, l),
     }
 }
 
@@ -3899,7 +3978,7 @@ pub open spec fn close_sem_obligs_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle
 }
 
 pub open spec fn close_sem_obligs(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, l: RawExpList) -> bool {
-    if gate_wrap(f) == 1 { close_sem_obligs_wrap(hp, he, lv, f, st, l) } else { close_sem_obligs_hoist(hp, he, lv, f, st, l) }
+    if gate_wrap(f) == 1 { close_sem_obligs_wrap_lead(hp, he, lv, f, st, l) } else { close_sem_obligs_hoist(hp, he, lv, f, st, l) }
 }
 
 /// Operational safety — FRAME-CARRYING (the W5c lift, probe24): mirrors
@@ -4009,7 +4088,7 @@ pub proof fn u_cse_nil(hp: HpOracle, he: HeOracle, lv: LvOracle, o: RawExp)
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all [lib.close_sem_e])")]
 pub proof fn u_cse_wrap_mode(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp)
     ensures gate_wrap(f) == 1 ==> forall|st: St| #[trigger] close_sem_e(hp, he, lv, f, st, o)
-        == close_sem_e_wrap(hp, he, lv, f, st, o)
+        == close_sem_e_wrap_lead(hp, he, lv, f, st, o)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all [lib.close_sem_e])")]
 pub proof fn u_cse_hoist_mode(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp)
@@ -4052,6 +4131,44 @@ pub proof fn u_csew_letr(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, v: u6
 pub proof fn u_csew_ucl(hp: HpOracle, he: HeOracle, lv: LvOracle, t: Box<FrameList>, o: RawExp)
     ensures forall|st: St| #[trigger] close_sem_e_wrap(hp, he, lv, FrameList::FUserCloser(t), st, o)
         == close_sem_e_wrap(hp, he, lv, *t, st, o)
+{}
+
+// close_sem_e_wrap_lead one-step unfolds (S3-pre leading sub-mode; the
+// let-class arms are the one-way latch into the plain wrap walk).
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csewl_nil(hp: HpOracle, he: HeOracle, lv: LvOracle, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_wrap_lead(hp, he, lv, FrameList::FNil, st, o)
+        == he(render_exp(o), st)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csewl_bind(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u64, t: Box<FrameList>, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_wrap_lead(hp, he, lv, FrameList::FBind(x, ty, t), st, o)
+        == (forall|n: int| #[trigger] close_sem_e_wrap_lead(hp, he, lv, *t, upd(st, x, n), o))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csewl_hyp(hp: HpOracle, he: HeOracle, lv: LvOracle, n: u64, h: u64, p: u64, t: Box<FrameList>, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_wrap_lead(hp, he, lv, FrameList::FHyp(n, h, p, t), st, o)
+        == (forall|m: int| #[trigger] close_sem_e_wrap_lead(hp, he, lv, *t, upd(st, n, m), o))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csewl_let(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, v: u64, t: Box<FrameList>, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_wrap_lead(hp, he, lv, FrameList::FLet(x, v, t), st, o)
+        == close_sem_e_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), o)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csewl_leth(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u64, v: u64, en: u64, ep: u64, t: Box<FrameList>, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_wrap_lead(hp, he, lv, FrameList::FLetH(x, ty, v, en, ep, t), st, o)
+        == close_sem_e_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), o)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csewl_letr(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, v: u64, t: Box<FrameList>, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_wrap_lead(hp, he, lv, FrameList::FLetR(x, v, t), st, o)
+        == close_sem_e_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), o)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csewl_ucl(hp: HpOracle, he: HeOracle, lv: LvOracle, t: Box<FrameList>, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e_wrap_lead(hp, he, lv, FrameList::FUserCloser(t), st, o)
+        == close_sem_e_wrap_lead(hp, he, lv, *t, st, o)
 {}
 
 // close_sem_e_hoist = tel ∘ res (two-phase). One-step unfolds are
@@ -4142,7 +4259,7 @@ pub proof fn u_cso_nil(hp: HpOracle, he: HeOracle, lv: LvOracle, l: RawExpList)
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all [lib.close_sem_obligs])")]
 pub proof fn u_cso_wrap_mode(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, l: RawExpList)
     ensures gate_wrap(f) == 1 ==> forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, f, st, l)
-        == close_sem_obligs_wrap(hp, he, lv, f, st, l)
+        == close_sem_obligs_wrap_lead(hp, he, lv, f, st, l)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all [lib.close_sem_obligs])")]
 pub proof fn u_cso_hoist_mode(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, l: RawExpList)
@@ -4184,6 +4301,43 @@ pub proof fn u_csow_letr(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, v: u6
 pub proof fn u_csow_ucl(hp: HpOracle, he: HeOracle, lv: LvOracle, t: Box<FrameList>, l: RawExpList)
     ensures forall|st: St| #[trigger] close_sem_obligs_wrap(hp, he, lv, FrameList::FUserCloser(t), st, l)
         == close_sem_obligs_wrap(hp, he, lv, *t, st, l)
+{}
+
+// close_sem_obligs_wrap_lead one-step unfolds (S3-pre).
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csowl_nil(hp: HpOracle, he: HeOracle, lv: LvOracle, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_wrap_lead(hp, he, lv, FrameList::FNil, st, l)
+        == obligs_safe(he, l, st)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csowl_bind(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u64, t: Box<FrameList>, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_wrap_lead(hp, he, lv, FrameList::FBind(x, ty, t), st, l)
+        == (forall|n: int| #[trigger] close_sem_obligs_wrap_lead(hp, he, lv, *t, upd(st, x, n), l))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csowl_hyp(hp: HpOracle, he: HeOracle, lv: LvOracle, n: u64, h: u64, p: u64, t: Box<FrameList>, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_wrap_lead(hp, he, lv, FrameList::FHyp(n, h, p, t), st, l)
+        == (forall|m: int| #[trigger] close_sem_obligs_wrap_lead(hp, he, lv, *t, upd(st, n, m), l))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csowl_let(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, v: u64, t: Box<FrameList>, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_wrap_lead(hp, he, lv, FrameList::FLet(x, v, t), st, l)
+        == close_sem_obligs_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), l)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csowl_leth(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, ty: u64, v: u64, en: u64, ep: u64, t: Box<FrameList>, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_wrap_lead(hp, he, lv, FrameList::FLetH(x, ty, v, en, ep, t), st, l)
+        == close_sem_obligs_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), l)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csowl_letr(hp: HpOracle, he: HeOracle, lv: LvOracle, x: u64, v: u64, t: Box<FrameList>, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_wrap_lead(hp, he, lv, FrameList::FLetR(x, v, t), st, l)
+        == close_sem_obligs_wrap(hp, he, lv, *t, upd(st, x, lv(v, st)), l)
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_csowl_ucl(hp: HpOracle, he: HeOracle, lv: LvOracle, t: Box<FrameList>, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_wrap_lead(hp, he, lv, FrameList::FUserCloser(t), st, l)
+        == close_sem_obligs_wrap_lead(hp, he, lv, *t, st, l)
 {}
 
 // Hoist-mode obligs: the tel/res two-phase pins (mirror of the cse
@@ -4439,7 +4593,7 @@ pub proof fn u_gateu_ucl(t: Box<FrameList>)
 // precondition VCs the Link discharge spine cannot yet compose —
 // implication-form pins keep every caller straight-line.
 pub proof fn u_ce_wrap_mode(f: FrameList, ob: RawExp)
-    ensures gate_wrap(f) == 1 ==> close_e(f, ob) == close_e_wrap(f, ob)
+    ensures gate_wrap(f) == 1 ==> close_e(f, ob) == close_e_wrap_lead(f, ob)
 {}
 pub proof fn u_ce_hoist_mode(f: FrameList, ob: RawExp)
     ensures gate_wrap(f) != 1 ==> close_e(f, ob) == close_e_hoist(f, ob)
@@ -4466,6 +4620,29 @@ pub proof fn u_cew_letr(x: u64, v: u64, t: Box<FrameList>, ob: RawExp)
 {}
 pub proof fn u_cew_ucl(t: Box<FrameList>, ob: RawExp)
     ensures close_e_wrap(FrameList::FUserCloser(t), ob) == close_e_wrap(*t, ob)
+{}
+
+// close_e_wrap_lead one-step unfolds (S3-pre leading sub-mode).
+pub proof fn u_cewl_nil(ob: RawExp)
+    ensures close_e_wrap_lead(FrameList::FNil, ob) == GoalData::LeafE(render_exp(ob))
+{}
+pub proof fn u_cewl_bind(x: u64, ty: u64, t: Box<FrameList>, ob: RawExp)
+    ensures close_e_wrap_lead(FrameList::FBind(x, ty, t), ob) == GoalData::All(x, ty, Box::new(close_e_wrap_lead(*t, ob)))
+{}
+pub proof fn u_cewl_hyp(n: u64, h: u64, p: u64, t: Box<FrameList>, ob: RawExp)
+    ensures close_e_wrap_lead(FrameList::FHyp(n, h, p, t), ob) == GoalData::All(n, h, Box::new(close_e_wrap_lead(*t, ob)))
+{}
+pub proof fn u_cewl_let(x: u64, v: u64, t: Box<FrameList>, ob: RawExp)
+    ensures close_e_wrap_lead(FrameList::FLet(x, v, t), ob) == GoalData::Let(x, v, Box::new(close_e_wrap(*t, ob)))
+{}
+pub proof fn u_cewl_leth(x: u64, ty: u64, v: u64, en: u64, ep: u64, t: Box<FrameList>, ob: RawExp)
+    ensures close_e_wrap_lead(FrameList::FLetH(x, ty, v, en, ep, t), ob) == GoalData::Let(x, v, Box::new(close_e_wrap(*t, ob)))
+{}
+pub proof fn u_cewl_letr(x: u64, v: u64, t: Box<FrameList>, ob: RawExp)
+    ensures close_e_wrap_lead(FrameList::FLetR(x, v, t), ob) == GoalData::Let(x, v, Box::new(close_e_wrap(*t, ob)))
+{}
+pub proof fn u_cewl_ucl(t: Box<FrameList>, ob: RawExp)
+    ensures close_e_wrap_lead(FrameList::FUserCloser(t), ob) == close_e_wrap_lead(*t, ob)
 {}
 
 // close_e_hoist = close_e_tel ∘ residue_fold_e (two-phase, mirroring
@@ -4667,6 +4844,61 @@ pub proof fn holds_close_e_wrap(hp: HpOracle, he: HeOracle, lv: LvOracle, f: Fra
     }
 }
 
+// Leading sub-mode weave (S3-pre): the FHyp arm reads the named binder
+// on BOTH sides (`u_holds_all_binder` — All is value-quantification,
+// exactly the hoist-mode telescope treatment); the let-class arms hand
+// off to the PLAIN wrap weave at the latch point.
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
+#[verifier::structural_decreases]
+pub proof fn holds_close_e_wrap_lead(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp)
+    ensures forall|st: St|
+        #[trigger] holds(hp, he, lv, close_e_wrap_lead(f, o), st) == close_sem_e_wrap_lead(hp, he, lv, f, st, o)
+    decreases f
+{
+    match f {
+        FrameList::FNil => {
+            u_cewl_nil(o);
+            u_holds_leafe(hp, he, lv, render_exp(o));
+            u_csewl_nil(hp, he, lv, o);
+        }
+        FrameList::FBind(x, ty, t) => {
+            u_cewl_bind(x, ty, t, o);
+            u_holds_all_binder(hp, he, lv, x, ty, Box::new(close_e_wrap_lead(*t, o)));
+            u_csewl_bind(hp, he, lv, x, ty, t, o);
+            holds_close_e_wrap_lead(hp, he, lv, *t, o);         // IH (st-generic)
+        }
+        FrameList::FHyp(hn, h, p, t) => {
+            u_cewl_hyp(hn, h, p, t, o);
+            u_holds_all_binder(hp, he, lv, hn, h, Box::new(close_e_wrap_lead(*t, o)));
+            u_csewl_hyp(hp, he, lv, hn, h, p, t, o);
+            holds_close_e_wrap_lead(hp, he, lv, *t, o);         // IH (st-generic)
+        }
+        FrameList::FLet(x, v, t) => {
+            u_cewl_let(x, v, t, o);
+            u_holds_let(hp, he, lv, x, v, Box::new(close_e_wrap(*t, o)));
+            u_csewl_let(hp, he, lv, x, v, t, o);
+            holds_close_e_wrap(hp, he, lv, *t, o);              // latch → plain weave
+        }
+        FrameList::FLetH(x, ty, v, en, ep, t) => {
+            u_cewl_leth(x, ty, v, en, ep, t, o);
+            u_holds_let(hp, he, lv, x, v, Box::new(close_e_wrap(*t, o)));
+            u_csewl_leth(hp, he, lv, x, ty, v, en, ep, t, o);
+            holds_close_e_wrap(hp, he, lv, *t, o);              // latch → plain weave
+        }
+        FrameList::FLetR(x, v, t) => {
+            u_cewl_letr(x, v, t, o);
+            u_holds_let(hp, he, lv, x, v, Box::new(close_e_wrap(*t, o)));
+            u_csewl_letr(hp, he, lv, x, v, t, o);
+            holds_close_e_wrap(hp, he, lv, *t, o);              // latch → plain weave
+        }
+        FrameList::FUserCloser(t) => {
+            u_cewl_ucl(t, o);
+            u_csewl_ucl(hp, he, lv, t, o);
+            holds_close_e_wrap_lead(hp, he, lv, *t, o);         // IH (st-generic)
+        }
+    }
+}
+
 // Hoist-mode analog, TWO-PHASE (bootstrap-74 slice 2): close_e_hoist =
 // close_e_tel ∘ residue_fold_e, so the weave splits into a residue
 // lemma (the folded Lets read as state updates) and a telescope lemma
@@ -4809,7 +5041,7 @@ pub proof fn holds_close_e(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameLis
 {
     u_ce_wrap_mode(f, o);
     u_cse_wrap_mode(hp, he, lv, f, o);
-    holds_close_e_wrap(hp, he, lv, f, o);
+    holds_close_e_wrap_lead(hp, he, lv, f, o);
     u_ce_hoist_mode(f, o);
     u_cse_hoist_mode(hp, he, lv, f, o);
     holds_close_e_hoist(hp, he, lv, f, o);
@@ -4880,6 +5112,46 @@ pub proof fn cso_nil_true_wrap(hp: HpOracle, he: HeOracle, lv: LvOracle, f: Fram
         FrameList::FUserCloser(t) => {
             u_csow_ucl(hp, he, lv, t, RawExpList::Nil);
             cso_nil_true_wrap(hp, he, lv, *t);                  // IH (st-generic)
+        }
+    }
+}
+
+// Leading sub-mode triviality (S3-pre): let-class arms hand off to the
+// plain wrap lemma at the latch point.
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
+#[verifier::structural_decreases]
+pub proof fn cso_nil_true_wrap_lead(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList)
+    ensures forall|st: St| #[trigger] close_sem_obligs_wrap_lead(hp, he, lv, f, st, RawExpList::Nil) == true
+    decreases f
+{
+    match f {
+        FrameList::FNil => {
+            u_csowl_nil(hp, he, lv, RawExpList::Nil);
+            u_obligs_nil(he);
+        }
+        FrameList::FBind(x, ty, t) => {
+            u_csowl_bind(hp, he, lv, x, ty, t, RawExpList::Nil);
+            cso_nil_true_wrap_lead(hp, he, lv, *t);             // IH (st-generic)
+        }
+        FrameList::FHyp(hn, h, p, t) => {
+            u_csowl_hyp(hp, he, lv, hn, h, p, t, RawExpList::Nil);
+            cso_nil_true_wrap_lead(hp, he, lv, *t);             // IH (st-generic)
+        }
+        FrameList::FLet(x, v, t) => {
+            u_csowl_let(hp, he, lv, x, v, t, RawExpList::Nil);
+            cso_nil_true_wrap(hp, he, lv, *t);                  // latch → plain
+        }
+        FrameList::FLetH(x, ty, v, en, ep, t) => {
+            u_csowl_leth(hp, he, lv, x, ty, v, en, ep, t, RawExpList::Nil);
+            cso_nil_true_wrap(hp, he, lv, *t);                  // latch → plain
+        }
+        FrameList::FLetR(x, v, t) => {
+            u_csowl_letr(hp, he, lv, x, v, t, RawExpList::Nil);
+            cso_nil_true_wrap(hp, he, lv, *t);                  // latch → plain
+        }
+        FrameList::FUserCloser(t) => {
+            u_csowl_ucl(hp, he, lv, t, RawExpList::Nil);
+            cso_nil_true_wrap_lead(hp, he, lv, *t);             // IH (st-generic)
         }
     }
 }
@@ -4975,7 +5247,7 @@ pub proof fn cso_nil_true(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList
     ensures forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, f, st, RawExpList::Nil) == true
 {
     u_cso_wrap_mode(hp, he, lv, f, RawExpList::Nil);
-    cso_nil_true_wrap(hp, he, lv, f);
+    cso_nil_true_wrap_lead(hp, he, lv, f);
     u_cso_hoist_mode(hp, he, lv, f, RawExpList::Nil);
     cso_nil_true_hoist(hp, he, lv, f);
 }
@@ -5032,6 +5304,62 @@ pub proof fn cso_cons_split_wrap(hp: HpOracle, he: HeOracle, lv: LvOracle, f: Fr
             u_csew_ucl(hp, he, lv, tl, *h);
             u_csow_ucl(hp, he, lv, tl, *t);
             cso_cons_split_wrap(hp, he, lv, *tl, h, t);         // IH (st-generic)
+        }
+    }
+}
+
+// Leading sub-mode ∧-split (S3-pre): the FHyp arm distributes the ∧
+// through the abstract ∀-binder exactly as FBind does (forall_and);
+// let-class arms hand off to the plain wrap split at the latch point.
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc, forall_and]))")]
+#[verifier::structural_decreases]
+pub proof fn cso_cons_split_wrap_lead(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, h: Box<RawExp>, t: Box<RawExpList>)
+    ensures forall|st: St| #[trigger] close_sem_obligs_wrap_lead(hp, he, lv, f, st, RawExpList::Cons(h, t))
+        == (close_sem_e_wrap_lead(hp, he, lv, f, st, *h) && close_sem_obligs_wrap_lead(hp, he, lv, f, st, *t))
+    decreases f
+{
+    match f {
+        FrameList::FNil => {
+            u_csowl_nil(hp, he, lv, RawExpList::Cons(h, t));
+            u_obligs_cons(he, h, t);
+            u_csewl_nil(hp, he, lv, *h);
+            u_csowl_nil(hp, he, lv, *t);
+        }
+        FrameList::FBind(x, ty, tl) => {
+            u_csowl_bind(hp, he, lv, x, ty, tl, RawExpList::Cons(h, t));
+            u_csewl_bind(hp, he, lv, x, ty, tl, *h);
+            u_csowl_bind(hp, he, lv, x, ty, tl, *t);
+            cso_cons_split_wrap_lead(hp, he, lv, *tl, h, t);    // IH (st-generic)
+        }
+        FrameList::FHyp(hn, hh, p, tl) => {
+            u_csowl_hyp(hp, he, lv, hn, hh, p, tl, RawExpList::Cons(h, t));
+            u_csewl_hyp(hp, he, lv, hn, hh, p, tl, *h);
+            u_csowl_hyp(hp, he, lv, hn, hh, p, tl, *t);
+            cso_cons_split_wrap_lead(hp, he, lv, *tl, h, t);    // IH (st-generic)
+        }
+        FrameList::FLet(x, v, tl) => {
+            u_csowl_let(hp, he, lv, x, v, tl, RawExpList::Cons(h, t));
+            u_csewl_let(hp, he, lv, x, v, tl, *h);
+            u_csowl_let(hp, he, lv, x, v, tl, *t);
+            cso_cons_split_wrap(hp, he, lv, *tl, h, t);         // latch → plain
+        }
+        FrameList::FLetH(x, ty, v, en, ep, tl) => {
+            u_csowl_leth(hp, he, lv, x, ty, v, en, ep, tl, RawExpList::Cons(h, t));
+            u_csewl_leth(hp, he, lv, x, ty, v, en, ep, tl, *h);
+            u_csowl_leth(hp, he, lv, x, ty, v, en, ep, tl, *t);
+            cso_cons_split_wrap(hp, he, lv, *tl, h, t);         // latch → plain
+        }
+        FrameList::FLetR(x, v, tl) => {
+            u_csowl_letr(hp, he, lv, x, v, tl, RawExpList::Cons(h, t));
+            u_csewl_letr(hp, he, lv, x, v, tl, *h);
+            u_csowl_letr(hp, he, lv, x, v, tl, *t);
+            cso_cons_split_wrap(hp, he, lv, *tl, h, t);         // latch → plain
+        }
+        FrameList::FUserCloser(tl) => {
+            u_csowl_ucl(hp, he, lv, tl, RawExpList::Cons(h, t));
+            u_csewl_ucl(hp, he, lv, tl, *h);
+            u_csowl_ucl(hp, he, lv, tl, *t);
+            cso_cons_split_wrap_lead(hp, he, lv, *tl, h, t);    // IH (st-generic)
         }
     }
 }
@@ -5165,7 +5493,7 @@ pub proof fn cso_cons_split(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameLi
     u_cso_wrap_mode(hp, he, lv, f, RawExpList::Cons(h, t));
     u_cse_wrap_mode(hp, he, lv, f, *h);
     u_cso_wrap_mode(hp, he, lv, f, *t);
-    cso_cons_split_wrap(hp, he, lv, f, h, t);
+    cso_cons_split_wrap_lead(hp, he, lv, f, h, t);
     u_cso_hoist_mode(hp, he, lv, f, RawExpList::Cons(h, t));
     u_cse_hoist_mode(hp, he, lv, f, *h);
     u_cso_hoist_mode(hp, he, lv, f, *t);

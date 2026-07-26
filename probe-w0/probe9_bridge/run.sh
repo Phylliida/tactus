@@ -77,15 +77,18 @@ honest_fail_reason() {
     # class as vec_read, one more member). Expected to CLOSE when A7
     # lands.
     vec_push7) printf '%s' 'stage-B A7 class (bootstrap-78 S3, 2026-07-26): mut-call frame spine matches production exactly (All mut_post/All ret/Imp ens/Let rebind after the preamble lets — manually verified against the cert); the divergence is deep-leaf only: ensures leaves need the derived `Tactus.Ref.mk` wrap on View.view args (vec_read class). Closes with A7 stage-B callee-signature vocab.' ;;
-    # fill_zeros: TWO known classes — (1) the same A7 deep-leaf gap on
-    # its view()-bearing invariant/ensures leaves; (2) the wrap-goal
-    # LEADING-HYP extraction: production's split_leading_binders
-    # renames leading frame hyps to `_h_ctx_N` theorem binders in wrap
-    # goals (post-call maintain/assert goals) while close_e_wrap
-    # renders FHyp as anonymous Imp — the b77 "leading-hyp wrap
-    # divergence", now exercised (S3-pre brick: unify production
-    # naming to _h_hoist + teach close_e_wrap the leading latch).
-    fill_zeros) printf '%s' 'A7 stage-B deep-leaf class on view()-bearing invariant leaves + the leading-hyp wrap-extraction divergence (production _h_ctx_N named binders vs close_e_wrap anonymous Imp — b77 residue, now exercised; S3-pre brick). Frame assembly around the in-loop mut call (havoc incl. the SOUNDNESS-fixed mod set, mut_post_5/ret_6 counter byte-match) verified against the spine sidecar.' ;;
+    # fill_zeros: ONE remaining class — the A7 deep-leaf gap on its
+    # view()-bearing invariant/ensures leaves (vec_read/vec_push7
+    # class). The former second class — the b77 leading-hyp wrap
+    # divergence (production `_h_ctx_N` named binders vs close_e_wrap
+    # anonymous Imp) — was RESOLVED by S3-pre (2026-07-26): production
+    # split_leading_binders is a pure prefix latch naming `_h_hoist_k`
+    # (= the serializer's interned FHyp names, per-goal positions ==
+    # walk ordinals), and refWp's close_e_wrap_lead renders leading
+    # FHyps as named All up to the first let-class frame. Positive
+    # evidence: add_capped + proof_block_fn certs changed shape with
+    # S3-pre and still CLOSE.
+    fill_zeros) printf '%s' 'A7 stage-B deep-leaf class on view()-bearing invariant leaves (vec_read/vec_push7 class; the b77 leading-hyp wrap divergence was RESOLVED by S3-pre — _h_hoist prefix latch on both sides). Frame assembly around the in-loop mut call (havoc incl. the SOUNDNESS-fixed mod set, mut_post_5/ret_6 counter byte-match) verified against the spine sidecar. Closes with A7 stage-B callee-signature vocab.' ;;
     *)         printf '%s' '' ;;
   esac
 }

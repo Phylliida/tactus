@@ -327,7 +327,7 @@ pub enum GoalSpine {
     /// `∀ (x : T),` — a theorem-level binder or a walker `Binder`
     /// frame. The second field carries hypothesis provenance when this
     /// binder is an ABSORBED leading hyp (`split_leading_binders` names
-    /// leading `P →` frames as `(_h_ctx_N : P)` theorem binders —
+    /// leading `P →` frames as `(_h_hoist_N : P)` theorem binders —
     /// positionally identical, so the discharge generator treats a
     /// provenance-carrying All exactly like the corresponding Imp).
     All(Binder, Option<HypProvenance>),

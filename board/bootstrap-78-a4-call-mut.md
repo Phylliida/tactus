@@ -387,6 +387,53 @@ row in the gate report updates automatically (tags are data-driven).
        class, now with a leading sub-mode. Link discharge 172/0 must
        hold after.
      This + A7 closes fill_zeros; A7 alone closes vec_push7.
+
+     **S3-pre DONE 2026-07-26 (fresh session, as spec'd).** Both sides
+     landed in one arc:
+     - *Production* (`sst_to_lean.rs`): `split_leading_binders` is the
+       pure prefix latch — `saw_binder` init artifact removed (Hyps
+       extract from position 0), extracted hyps named `_h_hoist_{k}`
+       (1-based pre-increment). `_h_ctx` retired from the codebase
+       (remaining mentions were comments; no test pinned the string).
+     - *tactus-core*: `close_e_wrap_lead` / `close_sem_e_wrap_lead` /
+       `close_sem_obligs_wrap_lead` (leading FBind→All keeps run,
+       FHyp→named All with the abstract-binder reading, let-class
+       latches ONE-WAY into the plain `_wrap` twins, FUserCloser
+       transparent); all three dispatchers route wrap mode through
+       lead; 21 one-step unfolds + 3 mode pins; weave lemmas
+       `holds_close_e_wrap_lead` / `cso_nil_true_wrap_lead` /
+       `cso_cons_split_wrap_lead` with let-arm handoff to the plain
+       lemmas. wp_stm_sound needed ZERO arm changes (dispatcher-level
+       lemma statements unchanged — the b74 architecture paid off).
+     - *Serializer*: NO code change — per-goal extraction positions ==
+       walk ordinals held by construction (prefix has no lets).
+     - *Pin churn* (the only per-fn failures, both fixed): 
+       `ref_wp_if_fallthrough_divergence` + `ref_wp_call_pass_through`
+       expected anonymous `Imp` chains in wrap goals whose leading
+       hyps now extract (mutation-kill arm reshaped in lockstep so the
+       10→99 kill stays non-vacuous). GOTCHA repeat: editing pin
+       STATEMENTS needs a cold `rm -rf out` before the next gate run —
+       warm stmts oleans false-red the Link (P3 class).
+     - *Battery*: tactus-core gate **283/0 cold**, package gate 52
+       modules, **Link discharge 196/0** (auto-absorbed all new
+       lemmas); units 425+7/0 (golden byte-stable pre-re-vendor);
+       fixture certified 38/41, cert diffs = exactly the predicted
+       churn class (add_capped / fill_zeros / proof_block_fn — body-
+       first hyps in wrap goals become named binders; all error
+       subjects' emitted pkg modules byte-identical to pre-change =
+       reds pre-existing, incl. mul_bound's Mathlib-import stmt-olean
+       env red); **probe9 23/26 CLOSE — add_capped + proof_block_fn
+       close WITH their reshaped certs** (the positive evidence);
+       fill_zeros hfail narrowed to A7-only (run.sh reason updated);
+       probes 13 (15 kills) / 14 / 37 / 38 PASS; golden add_capped
+       re-vendored post-battery (golden test green on it). E2e suite:
+       829 passed / 2 failed = exactly the documented pre-existing
+       examples-binary pair (flat_combine + tutorial_fifo, b77
+       attribution) — no S3-pre fallout.
+     - *Name-id unification evidence*: add_capped's wrap goal now
+       reuses the SAME interned name-leaf ids (16/19) its hoist goals
+       already used for `_h_hoist_1/2` — production per-goal counter
+       and serializer walk ordinals coincide, as the spec argued.
 4. **S4 kills — DONE 2026-07-26 (`c8c703f`).** probe13 → 15 classes:
    five kills on call_inc (mut_post_binder_drop / mut_bound_hyp_drop /
    mut_ens_hyp_drop / mut_rebind_drop / mut_gensym_rename single-site
