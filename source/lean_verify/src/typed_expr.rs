@@ -65,6 +65,20 @@ use crate::lean_name::LeanName;
 pub struct TypedExpr {
     pub inner: Expr,
     pub typ: Typ,
+    /// Does `typ` come from a TRUSTED source — one that describes the
+    /// rendered Lean value definitionally (a binder's declared typ, a
+    /// render-time substitution bridged by construction, a declared
+    /// callee ret typ, a definitional coercion) — rather than from
+    /// the node's CLAIMED SST typ, which VIR's poly-boxing can shift
+    /// by a ref-decoration?
+    ///
+    /// Computed per-arm in `exp_to_typed` alongside the render — the
+    /// single source of truth (2026-07-26, decision #6-2; replaces
+    /// the separate `actual_is_trusted` walk that had to hand-mirror
+    /// `exp_to_typed`'s arm structure). Consumers: the Box/Unbox arm
+    /// (propagate the child's actual only when trusted) and the
+    /// walker's let-binder env (P2 trust bit).
+    pub trusted: bool,
 }
 
 impl TypedExpr {
@@ -73,18 +87,27 @@ impl TypedExpr {
     /// Wrap a raw [`Expr`] with a stated typ. Caller asserts that
     /// `inner`'s actual Lean-level type is `typ`. Use when adapting
     /// pre-rendered Expr values (e.g., from `vir_expr_to_ast`) into
-    /// the typed composition pipeline.
+    /// the typed composition pipeline. Untrusted by default — chain
+    /// [`with_trust`] where the typ source is definitional.
     pub fn from_untyped(inner: Expr, typ: Typ) -> Self {
-        Self { inner, typ }
+        Self { inner, typ, trusted: false }
     }
 
     /// Typed variable reference. `typ` is the binder's declared typ
     /// in the current scope (post-shadow if the binder was shadowed).
+    /// Untrusted by default — chain [`with_trust`].
     pub fn var(name: LeanName, typ: Typ) -> Self {
         Self {
             inner: Expr::var(name),
             typ,
+            trusted: false,
         }
+    }
+
+    /// Set the trust bit (builder-style). See the field doc.
+    pub fn with_trust(mut self, trusted: bool) -> Self {
+        self.trusted = trusted;
+        self
     }
 
     // ── Coercion / unwrapping ───────────────────────────────────────
@@ -109,6 +132,11 @@ impl TypedExpr {
         Self {
             inner: coerced,
             typ: target_typ.clone(),
+            // The coercion makes the value inhabit `target_typ`
+            // definitionally (deref/mk chains are type-directed) —
+            // the result's typ describes the rendered value by
+            // construction (the Clip arm relies on this).
+            trusted: true,
         }
     }
 
@@ -155,6 +183,8 @@ impl TypedExpr {
         Self {
             inner: Expr::field_proj(derefed, field_name),
             typ: field_typ,
+            // Caller-claimed projection typ — not definitional.
+            trusted: false,
         }
     }
 
@@ -182,6 +212,9 @@ impl TypedExpr {
         Self {
             inner: Expr::app(self.inner, coerced_args),
             typ: ret_typ,
+            // The declared ret typ describes the rendered application
+            // by construction (same rule as the plain-call arm).
+            trusted: true,
         }
     }
 }

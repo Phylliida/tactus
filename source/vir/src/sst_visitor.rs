@@ -975,7 +975,7 @@ where
     }
 }
 
-pub(crate) fn map_stm_visitor<F>(stm: &Stm, fs: &mut F) -> Result<Stm, VirErr>
+pub fn map_stm_visitor<F>(stm: &Stm, fs: &mut F) -> Result<Stm, VirErr>
 where
     F: FnMut(&Stm) -> Result<Stm, VirErr>,
 {

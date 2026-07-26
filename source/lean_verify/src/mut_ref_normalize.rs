@@ -82,14 +82,14 @@ pub(crate) fn rewrite_varat_for_mut_params(
                     inner,
                 ) => cursor = inner,
                 ExprX::Var(ident) | ExprX::VarLoc(ident) => {
-                    if mut_param_names.contains(&sanitize(&ident.0)) {
+                    if mut_param_names.contains(&mut_param_key(ident)) {
                         return Some(ident.clone());
                     }
                     return None;
                 }
                 ExprX::ReadPlace(place, _) => match &place.x {
                     vir::ast::PlaceX::Local(ident) => {
-                        if mut_param_names.contains(&sanitize(&ident.0)) {
+                        if mut_param_names.contains(&mut_param_key(ident)) {
                             return Some(ident.clone());
                         }
                         return None;
@@ -103,7 +103,7 @@ pub(crate) fn rewrite_varat_for_mut_params(
     map_expr_visitor(expr, &|e: &Expr| {
         // Legacy mode: `*old(x)` → `VarAt(x, Pre)` for &mut params.
         if let ExprX::VarAt(ident, VarAt::Pre) = &e.x {
-            let raw_name = sanitize(&ident.0);
+            let raw_name = mut_param_key(ident);
             if mut_param_names.contains(&raw_name) {
                 // Use `raw_name` (already sanitized) so the synthetic
                 // string matches what `subst`'s key — `varat_pre_name(
@@ -134,7 +134,7 @@ pub(crate) fn rewrite_varat_for_mut_params(
             match op {
                 vir::ast::UnaryOp::MutRefCurrent => {
                     if let Some(ident) = extract_mut_var(inner) {
-                        let raw_name = sanitize(&ident.0);
+                        let raw_name = mut_param_key(&ident);
                         let new_str: vir::ast::Ident =
                             Arc::new(varat_pre_name(&raw_name));
                         let new_ident = VarIdent(new_str, ident.1.clone());
@@ -178,7 +178,7 @@ pub(crate) fn rewrite_varat_for_mut_params(
 /// General over any callee with a `MutRef`-typed return; not specific to
 /// `vec_index_mut`. Matches the return by sanitized base name.
 pub(crate) fn rewrite_return_final_ref(expr: &Expr, ret_name: &VarIdent, final_var: &VarIdent) -> Expr {
-    let ret_san = sanitize(&ret_name.0);
+    let ret_san = mut_param_key(ret_name);
     // Peel transparent wrappers + ReadPlace to the inner ident; true iff
     // it names the return. Mirrors `extract_mut_var`'s peel set.
     fn inner_names(e: &Expr, ret_san: &str) -> bool {
@@ -195,10 +195,10 @@ pub(crate) fn rewrite_return_final_ref(expr: &Expr, ret_name: &VarIdent, final_v
                     inner,
                 ) => cursor = inner,
                 ExprX::Var(id) | ExprX::VarLoc(id) | ExprX::VarAt(id, _) => {
-                    return sanitize(&id.0) == ret_san;
+                    return mut_param_key(id) == ret_san;
                 }
                 ExprX::ReadPlace(place, _) => match &place.x {
-                    vir::ast::PlaceX::Local(id) => return sanitize(&id.0) == ret_san,
+                    vir::ast::PlaceX::Local(id) => return mut_param_key(id) == ret_san,
                     _ => return false,
                 },
                 _ => return false,
@@ -324,7 +324,7 @@ fn peel_to_var(e: &Exp) -> Option<(&VarIdent, InnerKind)> {
 /// the OblCtx Let-frame construction so divergence is a compile
 /// error rather than a runtime mismatch.
 fn mk_pre_state_var(span: &vir::messages::Span, typ: &Typ, id: &VarIdent) -> Exp {
-    let raw_name = sanitize(&id.0);
+    let raw_name = mut_param_key(id);
     let new_str: vir::ast::Ident = Arc::new(varat_pre_name(&raw_name));
     // Reuse the original disambiguator. The `<x>_at_pre_tactus`
     // suffix contains no special chars, so `LeanName::from_var_ident`
@@ -392,7 +392,7 @@ fn unwrap_one_mut_ref_op(
         _ => return e.clone(),
     };
     let Some((id, kind)) = peel_to_var(inner) else { return e.clone() };
-    if !mut_param_names.contains(&sanitize(&id.0)) {
+    if !mut_param_names.contains(&mut_param_key(id)) {
         return e.clone();
     }
     let new_x = if is_future_or_final {
@@ -447,7 +447,7 @@ fn rename_varat_pre_in_exp(
     }
     vir::sst_visitor::map_exp_visitor(exp, &mut |e: &Exp| {
         let ExpX::VarAt(id, vir::ast::VarAt::Pre) = &e.x else { return e.clone() };
-        if !mut_param_names.contains(&sanitize(&id.0)) {
+        if !mut_param_names.contains(&mut_param_key(id)) {
             return e.clone();
         }
         match phase {
@@ -549,6 +549,34 @@ pub(crate) fn rewrite_mut_ref_in_stm(
 /// (test_exec_call_two_mut_args_new_mut_ref pinned the collision).
 pub(crate) fn borrow_mut_key(ident: &VarIdent) -> String {
     crate::lean_name::LeanName::from_var_ident(ident).as_str().to_string()
+}
+
+/// Key for MUT-PARAM membership tests (`mut_param_names` /
+/// `mut_ref_locals`): the sanitized BASE name — deliberately
+/// disambiguator-INSENSITIVE, in contrast to [`borrow_mut_key`].
+///
+/// Why base-name: params are unique by base name within a signature,
+/// and the body's SSA versions of a param (`x@1`, `x@2` after
+/// reassignment through `*x = …`) must all match the param's entry —
+/// a full-VarIdent key would silently stop the mut-ref rewrites on
+/// any reassigned param. Why `borrow_mut_key` differs: BorrowMut
+/// temps SHARE the base name (`tmp%`), so there the disambiguator is
+/// load-bearing (test_exec_call_two_mut_args_new_mut_ref pinned the
+/// collision).
+///
+/// Capture boundary (why the collapse is safe): the rewrites keyed by
+/// this only fire on `MutRefCurrent`/`MutRefFuture`/`MutRefFinal`-
+/// wrapped and `VarAt(_, Pre)` references, which Verus produces only
+/// for genuine mut-ref params — a user local merely SHADOWING a
+/// param's name never appears under those ops. Revisit if reborrow
+/// support (`let e = &mut …`) ever lands; today that shape is
+/// rejected upstream (adversarial_probe_double_bump_named pins it).
+///
+/// Single source of truth for the key derivation — raw
+/// `sanitize(&ident.0)` at membership sites is the drift-prone form
+/// this replaces (2026-07-26, decision #5).
+pub(crate) fn mut_param_key(ident: &VarIdent) -> String {
+    sanitize(&ident.0)
 }
 
 /// Walk the SST body collecting `Assign(user_local, Var(borrow_mut_local))`

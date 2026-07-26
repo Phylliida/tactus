@@ -291,7 +291,7 @@ fn apply_hoist_substs(e: &Expr, hyps: &[ShapeHyp]) -> Expr {
     apply_let_substs(e, &substs)
 }
 
-fn subst_var(e: &Expr, name: &str, val: &Expr) -> Expr {
+pub(crate) fn subst_var(e: &Expr, name: &str, val: &Expr) -> Expr {
     match &e.node {
         ExprNode::SpanMark { inner, .. } => subst_var(inner, name, val),
         ExprNode::Var(n) if n.as_str() == name => val.clone(),
@@ -492,43 +492,39 @@ pub fn author_v1(
 /// (later binders reference earlier ones), so the fixpoint exists;
 /// the iteration cap is a belt-and-suspenders bound.
 fn apply_let_substs(e: &Expr, substs: &[(String, Expr)]) -> Expr {
-    // SELF-referential equations (`x := …x…` — shadow rebinds, mut
-    // post-state chains) violate the acyclic-hoist-graph premise
-    // above: every fixpoint round multiplies the binder's
-    // occurrences, so the 16 rounds turn k self-occurrences into
-    // ~k^16 nodes — observed as a multi-GB memory runaway on
-    // `test_exec_call_mut_arg_whole_tuple_field` (2026-07-25 audit).
-    // A self-referential subst can never help the textual compare
-    // converge; drop it from the list.
-    let substs: Vec<&(String, Expr)> = substs
-        .iter()
-        .filter(|(name, val)| !expr_mentions_var(val, name))
-        .collect();
+    // `substs` is in BINDING order, outermost binder first: the
+    // goal-spine walk pushes binders top-down, and `author_form_c`
+    // concatenates theorem-level hoist equations (outermost) before
+    // goal-position lets. Values reference only EARLIER-bound names
+    // (the let/hoist graph is acyclic in the binding direction), so a
+    // SINGLE pass substituting INNERMOST-FIRST — reverse order — is
+    // complete: substituting an inner binder can only introduce
+    // earlier-bound names, which later steps expand, and nothing can
+    // reintroduce an already-processed name. No fixpoint, no
+    // iteration cap, no growth guard — divergence is impossible by
+    // construction. (Replaces 5fb9624's 16-round textual fixpoint,
+    // whose k^16 occurrence blowup on self-referential entries was
+    // the 2026-07-25 81GB runaway.)
+    //
+    // SELF-referential entries (`x := …x…`) are name-shadowing: the
+    // `x` inside the value denotes an OUTER binder that string-keyed
+    // substitution cannot distinguish from the entry's own binder.
+    // Expanding would capture; skip the entry — both compared sides
+    // skip identically, so the form-C textual compare stays
+    // consistent and merely declines if the unexpanded name differs.
     let mut out = e.clone();
-    let mut prev_pp = crate::lean_pp::pp_expr(&out);
-    for _ in 0..16 {
-        let next = substs
-            .iter()
-            .fold(out.clone(), |cur, (name, val)| subst_var(&cur, name, val));
-        let next_pp = crate::lean_pp::pp_expr(&next);
-        let converged = next_pp == prev_pp;
-        // Belt for MUTUAL cycles (`a := …b…; b := …a…`): divergence
-        // shows up as unbounded text growth. Past any plausible goal
-        // size, stop substituting — form C then honestly declines on
-        // the textual mismatch instead of allocating gigabytes.
-        let diverging = next_pp.len() > 1_000_000;
-        out = next;
-        prev_pp = next_pp;
-        if converged || diverging {
-            break;
+    for (name, val) in substs.iter().rev() {
+        if expr_mentions_var(val, name) {
+            continue;
         }
+        out = subst_var(&out, name, val);
     }
     crate::lean_ast::strip_transparent(&out)
 }
 
 /// Does `e` mention `Var(name)` anywhere? Used to detect
 /// self-referential hoist equations in `apply_let_substs`.
-fn expr_mentions_var(e: &Expr, name: &str) -> bool {
+pub(crate) fn expr_mentions_var(e: &Expr, name: &str) -> bool {
     if matches!(&e.node, ExprNode::Var(n) if n.as_str() == name) {
         return true;
     }
@@ -570,10 +566,13 @@ fn author_form_c(
             crate::sst_to_lean::debug_obligation_name()
         );
     }
-    // Normalization substs: the goal's own lets (wrap path) PLUS the
-    // N1 hoist-equations (hoisted path — the tmp binders are binder
-    // equations there, applied by the script's SubstHoists move).
-    let mut substs: Vec<(String, Expr)> = let_substs.to_vec();
+    // Normalization substs: the N1 hoist-equations (hoisted path —
+    // the tmp binders are binder equations there, applied by the
+    // script's SubstHoists move) THEN the goal's own lets (wrap
+    // path). Order is BINDING order — hoist binders are theorem-level
+    // (outermost), goal lets are inside the goal (innermost) — which
+    // `apply_let_substs`'s single reverse pass relies on.
+    let mut substs: Vec<(String, Expr)> = Vec::new();
     let mut hoist_names: Vec<String> = Vec::new();
     for h in hyps {
         if let HypProvenance::HoistEq { binder } = &h.prov {
@@ -585,6 +584,7 @@ fn author_form_c(
             }
         }
     }
+    substs.extend(let_substs.iter().cloned());
     // Candidates: (name, normalized proposition pp). Antecedent hyps
     // first (the freshest facts — the user's own calls), then shape
     // hyps. Normalization = the substs the script applies at proof
