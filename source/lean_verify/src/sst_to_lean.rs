@@ -7729,6 +7729,32 @@ fn lex_decrease_obligation(levels: &[DecreaseLevel<'_>]) -> LExpr {
 /// `out`. Nested loops inherit the current `locally_declared` set, so
 /// a variable `x` declared in an outer loop body and modified by an
 /// inner loop still counts as modified by the outer.
+/// Root var of a `Loc`-wrapped L-value argument (the legacy-mode `&mut`
+/// call-arg shape): peel transparent wrappers, the `Loc`, then any
+/// `Field` steps down to the base `Var`/`VarLoc`. `None` for value
+/// (non-`Loc`) args — a bare `Var` at a call is a READ, not a write
+/// (new-mut-ref BorrowMut args are bare `Var`s; their user-local write
+/// is the linkage `Assign` the Assign arm already collects). Shape
+/// mirror of `extract_mut_target`'s Loc path, context-free (no
+/// BorrowMut redirection — the mod-set consumer only needs the root).
+fn loc_root_var<'a>(e: &'a Exp) -> Option<&'a VarIdent> {
+    let e = peel_transparent(e);
+    let inner = match &e.x {
+        ExpX::Loc(inner) => inner,
+        _ => return None,
+    };
+    let mut cursor: &'a Exp = peel_transparent(inner);
+    loop {
+        match &cursor.x {
+            ExpX::Var(ident) | ExpX::VarLoc(ident) => return Some(ident),
+            ExpX::UnaryOpr(UnaryOpr::Field(_), base_exp) => {
+                cursor = peel_transparent(base_exp);
+            }
+            _ => return None,
+        }
+    }
+}
+
 pub(crate) fn collect_modifications<'a>(
     stm: &'a Stm,
     locally_declared: &mut HashSet<&'a VarIdent>,
@@ -7747,6 +7773,39 @@ pub(crate) fn collect_modifications<'a>(
                     locally_declared.insert(ident);
                 } else if !locally_declared.contains(&ident) && !out.contains(&ident) {
                     out.push(ident);
+                }
+            }
+        }
+        // A call writes through (a) its dest (`x = f(…)` is a
+        // `StmX::Call`, NOT an `Assign` — same init/local rules as the
+        // Assign arm) and (b) every legacy-mode `&mut` argument, which
+        // arrives as a `Loc`-wrapped L-value (`Loc(VarLoc(v))`, possibly
+        // through Field steps — root var is written). Both were MISSING
+        // (soundness, 2026-07-26): a loop body mutating an outer var
+        // only through a call left it out of the havoc set, so the
+        // maintain/exit telescopes pinned the pre-loop value —
+        // `bad_fill`/`bad_dest` (test_loop_call_mod_set_soundness)
+        // verified FALSE postconditions. New-mut-ref-mode callers need
+        // no arm here: their body carries the forward-forward linkage
+        // `Assign(user_local, Var(borrow_mut_local))`, which the Assign
+        // arm already collects.
+        StmX::Call { args, dest, .. } => {
+            for a in args.iter() {
+                if let Some(root) = loc_root_var(a) {
+                    if !locally_declared.contains(&root) && !out.contains(&root) {
+                        out.push(root);
+                    }
+                }
+            }
+            if let Some(Dest { dest, is_init }) = dest {
+                let ident = extract_simple_var_ident(dest)
+                    .or_else(|| decompose_assign_lvalue(dest).map(|(root, _)| root));
+                if let Some(ident) = ident {
+                    if *is_init {
+                        locally_declared.insert(ident);
+                    } else if !locally_declared.contains(&ident) && !out.contains(&ident) {
+                        out.push(ident);
+                    }
                 }
             }
         }

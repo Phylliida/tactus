@@ -8584,6 +8584,82 @@ test_verify_one_file_with_options! {
     } => Ok(())
 }
 
+// SOUNDNESS PIN (2026-07-26, bootstrap-78 S3 opener): the loop havoc
+// set must include vars a body statement writes THROUGH A CALL — (a)
+// the call's dest (`x = double(x)` is a `StmX::Call`, not an `Assign`)
+// and (b) legacy-mode `&mut` args (`Loc`-wrapped L-values, e.g. every
+// vstd `assume_specification` mut fn like `Vec::push`). Before the
+// `collect_modifications` Call arm, both left the target out of the
+// mod set, the maintain/exit telescopes pinned the PRE-LOOP value
+// (`let x := 1` surviving under the ∀-telescope), and this FALSE
+// ensures verified: hyps pin x = 1 pre-loop, so exit-side `r == 1`
+// closed while the real result is 2^n. Never Ok.
+test_verify_one_file! {
+    #[test] test_loop_call_dest_not_havocked_unsound verus_code! {
+        #[verifier::tactus_auto]
+        fn double(x: u64) -> (r: u64)
+            requires x < 1000,
+            ensures r == 2 * x,
+        {
+            2 * x
+        }
+
+        #[verifier::tactus_auto]
+        fn probe(n: usize) -> (r: u64)
+            requires n < 5,
+            ensures r == 1,  // FALSE for n >= 1 — the loop doubles r
+        {
+            let mut x: u64 = 1;
+            let mut i: usize = 0;
+            while i < n
+                invariant i <= n, x >= 1, x < 100,
+                decreases n - i,
+            {
+                x = double(x);
+                i = i + 1;
+            }
+            x
+        }
+    } => Err(err) => {
+        let s = format!("{:?}", err);
+        assert!(s.contains("tactus_auto failed") || s.contains("postcondition")
+                || s.contains("invariant"),
+            "false ensures must NOT verify (loop call-dest havoc); got: {}", s);
+    }
+}
+
+// Positive twin: same call-dest-in-loop shape with the TRUE ensures +
+// an inductive invariant (`x == i + 1` exactly tracks the increment)
+// verifies under the corrected havoc.
+test_verify_one_file! {
+    #[test] test_loop_call_dest_havocked_verifies verus_code! {
+        #[verifier::tactus_auto]
+        fn bump(x: u64) -> (r: u64)
+            requires x < 1000,
+            ensures r == x + 1,
+        {
+            x + 1
+        }
+
+        #[verifier::tactus_auto]
+        fn probe(n: u64) -> (r: u64)
+            requires n < 5,
+            ensures r == n + 1,
+        {
+            let mut x: u64 = 1;
+            let mut i: u64 = 0;
+            while i < n
+                invariant i <= n, x == i + 1,
+                decreases n - i,
+            {
+                x = bump(x);
+                i = i + 1;
+            }
+            x
+        }
+    } => Ok(())
+}
+
 // AUDIT FIX PIN (2026-07-25): a `&u8` param carries its refinement
 // bound on the Lean side. `type_bound_predicate` previously returned
 // `None` for decoration-wrapped typs (`Decorate(Ref, U(8))`), losing
