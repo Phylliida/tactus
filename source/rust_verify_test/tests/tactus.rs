@@ -8584,6 +8584,170 @@ test_verify_one_file_with_options! {
     } => Ok(())
 }
 
+// AUDIT SOUNDNESS PIN (2026-07-26, call_inlining/loop_normalize
+// review): a loop-body write through a CALL DEST was invisible to
+// `collect_modifications` (no `StmX::Call` arm) — `x = f()` with a
+// simple-var LHS lowers to `Call { dest: x, is_init: false }` with NO
+// separate Assign (ast_to_sst's `direct_assign`), so `x` never entered
+// the loop's havoc set and the post-loop continuation kept the
+// PRE-loop binding. Before the fix this false assert VERIFIED
+// (`x == 0` post-loop; reality `x == 7`). Never Ok.
+test_verify_one_file! {
+    #[test] audit_probe_loop_call_dest_havoc verus_code! {
+        fn seven() -> (r: u64)
+            ensures r == 7
+        {
+            7
+        }
+
+        #[verifier::tactus_auto]
+        fn probe() {
+            let mut x: u64 = 0;
+            let mut i: u64 = 0;
+            while i < 3
+                invariant i <= 3,
+                decreases 3 - i,
+            {
+                x = seven();
+                i = i + 1;
+            }
+            assert(x == 0); // FALSE — loop ran, x == 7
+        }
+    } => Err(err) => {
+        let s = format!("{:?}", err);
+        assert!(s.contains("tactus_auto failed") || s.contains("assert"),
+            "false post-loop assert must NOT verify (soundness); got: {}", s);
+    }
+}
+
+// Same pin in new-mut-ref mode — the call-dest gap was mode-independent.
+test_verify_one_file_with_options! {
+    #[test] audit_probe_loop_call_dest_havoc_nmr ["new-mut-ref"] => verus_code! {
+        fn seven() -> (r: u64)
+            ensures r == 7
+        {
+            7
+        }
+
+        #[verifier::tactus_auto]
+        fn probe() {
+            let mut x: u64 = 0;
+            let mut i: u64 = 0;
+            while i < 3
+                invariant i <= 3,
+                decreases 3 - i,
+            {
+                x = seven();
+                i = i + 1;
+            }
+            assert(x == 0); // FALSE — loop ran, x == 7
+        }
+    } => Err(err) => {
+        let s = format!("{:?}", err);
+        assert!(s.contains("tactus_auto failed") || s.contains("assert"),
+            "false post-loop assert must NOT verify (soundness); got: {}", s);
+    }
+}
+
+// AUDIT SOUNDNESS PIN (2026-07-26): legacy-mode `&mut`-arg mutation in
+// a loop BODY. The arg is a `Loc(...)`-shaped L-value in the
+// `StmX::Call` args (no linkage Assign in legacy mode, unlike
+// new-mut-ref), so `collect_modifications` missed the root local.
+// Before the fix this false assert VERIFIED. Never Ok. (The while-COND
+// twin is `audit_probe_while_cond_mutation_unsound`; the straight-line
+// twin `audit_probe_mut_arg_false_assert_fails` always failed
+// correctly — the gap was loop-havoc-specific.)
+test_verify_one_file! {
+    #[test] audit_probe_loop_mut_arg_havoc_legacy verus_code! {
+        fn set_seven(x: &mut u64)
+            ensures *x == 7
+        {
+            *x = 7;
+        }
+
+        #[verifier::tactus_auto]
+        fn probe() {
+            let mut x: u64 = 0;
+            let mut i: u64 = 0;
+            while i < 3
+                invariant i <= 3,
+                decreases 3 - i,
+            {
+                set_seven(&mut x);
+                i = i + 1;
+            }
+            assert(x == 0); // FALSE — loop ran, x == 7
+        }
+    } => Err(err) => {
+        let s = format!("{:?}", err);
+        assert!(s.contains("tactus_auto failed") || s.contains("assert"),
+            "false post-loop assert must NOT verify (soundness); got: {}", s);
+    }
+}
+
+// Positive twins of the two pins above: with a carrying invariant the
+// TRUE post-loop fact verifies (the fix havocs, the invariant
+// recovers), and an `is_init` call dest (`let y = seven()`) stays
+// iteration-local — no over-havoc.
+test_verify_one_file! {
+    #[test] test_exec_loop_call_mutations_verify verus_code! {
+        fn seven() -> (r: u64)
+            ensures r == 7
+        {
+            7
+        }
+
+        fn set_seven(x: &mut u64)
+            ensures *x == 7
+        {
+            *x = 7;
+        }
+
+        #[verifier::tactus_auto]
+        fn pos_call_dest() {
+            let mut x: u64 = 0;
+            let mut i: u64 = 0;
+            while i < 3
+                invariant i <= 3, i > 0 ==> x == 7,
+                decreases 3 - i,
+            {
+                x = seven();
+                i = i + 1;
+            }
+            assert(x == 7);
+        }
+
+        #[verifier::tactus_auto]
+        fn pos_mut_arg() {
+            let mut x: u64 = 0;
+            let mut i: u64 = 0;
+            while i < 3
+                invariant i <= 3, i > 0 ==> x == 7,
+                decreases 3 - i,
+            {
+                set_seven(&mut x);
+                i = i + 1;
+            }
+            assert(x == 7);
+        }
+
+        #[verifier::tactus_auto]
+        fn pos_init_dest_local() {
+            let z: u64 = 1;
+            let mut i: u64 = 0;
+            while i < 3
+                invariant i <= 3,
+                decreases 3 - i,
+            {
+                let y = seven();
+                assert(y == 7);
+                i = i + 1;
+            }
+            assert(z == 1);
+        }
+    } => Ok(())
+}
+
 // AUDIT FIX PIN (2026-07-25): a `&u8` param carries its refinement
 // bound on the Lean side. `type_bound_predicate` previously returned
 // `None` for decoration-wrapped typs (`Decorate(Ref, U(8))`), losing
