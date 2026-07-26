@@ -233,6 +233,29 @@ pub fn vec_push7(v: &mut Vec<u64>)
     v.push(7);
 }
 
+// F14b (bootstrap-78 S3): the minimal-mut pair. `inc` is a USER `&mut`
+// callee (new-mut-ref MutRef encoding — unlike the vstd legacy-`is_mut`
+// `Vec::push`), so `call_inc` exercises the caller-side BorrowMut
+// machinery; `u64` makes the mut-post existential carry a TYPE-BOUND
+// hyp and the rebind a wrapper COERCION (`.deref`) — the two channels
+// vec_push7's Vec subject leaves dormant (card §Open-items).
+pub fn inc(x: &mut u64)
+    requires *old(x) < 1000,
+    ensures *x == *old(x) + 1,
+{
+    *x = *x + 1;
+}
+
+pub fn call_inc(y: u64) -> (r: u64)
+    requires y < 500,
+    ensures r == y + 2,
+{
+    let mut z = y;
+    inc(&mut z);
+    inc(&mut z);
+    z
+}
+
 // F15: generic fn (type param; Nonempty-bracket plumbing on the spec side)
 pub fn id_generic<T>(t: T) -> (r: T)
     ensures r == t,

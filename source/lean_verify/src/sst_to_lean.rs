@@ -5064,16 +5064,49 @@ pub(crate) struct CertCallLeaves {
     /// (production `and_all`s the callee's requires into ONE leaf), or
     /// `None` when the callee has no `requires`.
     pub precondition: Option<LExpr>,
-    /// The call's dest binder name (`let <dest> := …`).
-    pub dest_name: crate::lean_name::LeanName,
-    /// The dest local's declared typ (from the dest Exp — the same
-    /// source the caller's `type_map` reads). The serializer's N1-hoist
-    /// classification (bootstrap-74 slice 2) decides FLetH / FLetR /
-    /// FLet for the dest let from it.
-    pub dest_typ: vir::ast::Typ,
+    /// The call's dest binder `(name, instantiated callee ret typ)` for
+    /// the `let <dest> := …` frame — `None` for a dest-less unit call
+    /// (only reachable with `&mut` args; plain unit calls tag out as
+    /// `call-unit-dest`). The typ is the same source the caller's
+    /// `type_map` reads; the serializer's N1-hoist classification
+    /// (bootstrap-74 slice 2) decides FLetH / FLetR / FLet from it.
+    pub dest: Option<(crate::lean_name::LeanName, vir::ast::Typ)>,
+    /// One entry per `&mut` arg (bootstrap-78 S3), walk order. The
+    /// serializer assembles Phase-1 `FBind(fresh, binder_typ)` +
+    /// optional `FHyp(bound)` frames BEFORE the ret frames, and the
+    /// Phase-4 plain `FLet(rebind_local, rebind_value)` rebinds AFTER
+    /// the ensures hyp (production's `push_mut_arg_binders` /
+    /// `push_mut_rebinds` phase order). Var targets only — Field
+    /// targets and returned-`&mut` callees tag out.
+    pub mut_args: Vec<CertMutArg>,
     /// The post-call frame ingredients, path-tagged. The serializer
     /// chooses the `FrameList` shape from the tag.
     pub post: CertCallPost,
+}
+
+/// One `&mut` argument's cert ingredients (bootstrap-78 S3): the
+/// production-rendered leaves of the Phase-1 existential binder + bound
+/// and the Phase-4 rebind. Mirrors `MutArgInfo` + the frame push sites,
+/// with every leaf rendered through the SAME production paths
+/// (`typ_to_expr`+typ_subst, `type_bound_predicate` over the
+/// `into_slot`-coerced inner view, coerced rebind value).
+pub(crate) struct CertMutArg {
+    /// The `_tactus_mut_post_<id>` existential (minted from the
+    /// mirrored walk counter inside `build_call_substitutions`).
+    pub fresh: crate::lean_name::LeanName,
+    /// Binder typ leaf — the callee's DECLARED param typ, typ-arg
+    /// substituted (wrapper typ for new-mut-ref params, bare for
+    /// legacy `is_mut`; numeric typs render `Int` either way).
+    pub binder_typ: LExpr,
+    /// `type_bound_predicate` over the inner-coerced view of `fresh`
+    /// (`None` for Vec/struct/generic inner typs).
+    pub bound: Option<LExpr>,
+    /// The caller local the call mutates (Phase-4 rebind target).
+    pub rebind_local: crate::lean_name::LeanName,
+    /// The rebind value — `fresh` coerced from the declared wrapper
+    /// typ to the inner typ (`.deref` when new-mut-ref; identity for
+    /// legacy/numeric).
+    pub rebind_value: LExpr,
 }
 
 /// Post-call frame ingredients, split by which `push_ret_frames` path
@@ -5130,6 +5163,11 @@ pub(crate) fn cert_call_leaves<'a>(
     // re-wraps `Tactus.Ref.mk` at the next call's arg slot and the
     // instantiated ensures leaf diverges (apply_hom class).
     let_binder_typs: &im::HashMap<crate::lean_name::LeanName, (Typ, bool)>,
+    // The caller's `&mut`-local name set (sanitize-keyed: mut-ref pars
+    // + BorrowMut decls), for `extract_mut_target`'s bare-Var arm —
+    // built by the serializer EXACTLY as production's `mut_param_names`
+    // (bootstrap-78 S3).
+    mut_ref_locals: &HashSet<String>,
     // Emitter-counter mirror (bootstrap-78 S1, card E5): production's
     // per-fn `ObligationEmitter.counter` value at THIS call site,
     // replayed by the serializer's walk. The shell emitter below starts
@@ -5176,20 +5214,6 @@ pub(crate) fn cert_call_leaves<'a>(
     if crate::expr_shared::is_mut_ref_typ(&callee.ret.x.typ, false) {
         return Err("call-mut-ret".to_string());
     }
-    // No `&mut` params — the mut-arg existential / rebind machinery
-    // is the bootstrap-78 S3 arm (Var targets); until it lands every
-    // mut-param callee tags out here.
-    if callee.params.iter()
-        .any(|p| crate::expr_shared::is_mut_ref_typ(&p.x.typ, p.x.is_mut))
-    {
-        return Err("call-mut".to_string());
-    }
-    // Unit-returning calls carry no dest; the restricted arm requires a
-    // dest (the FLet target). A synthetic-unit-binder shape is a future
-    // extension (card note).
-    let Some(dest_ident) = dest.and_then(|d| extract_simple_var_ident(&d.dest)) else {
-        return Err("call-unit-dest".to_string());
-    };
 
     // ── Phase B: drop-dummy + arg validation (mirrors build_wp_call). ──
     let args: &'a [Exp] =
@@ -5198,6 +5222,50 @@ pub(crate) fn cert_call_leaves<'a>(
         } else {
             &args[..]
         };
+
+    // `&mut` args (bootstrap-78 S3): resolve each mut param's arg to
+    // its L-value target through production's own extractor — at the
+    // serializer's RAW snapshot the corpus shapes are `Loc`-rooted
+    // (`Loc(VarLoc(v))`, call_inc/vec_push7/fill_zeros evidence), the
+    // same path the walk takes. `mut_ref_locals` (caller mut pars +
+    // BorrowMut decls, sanitize-keyed) serves the bare-Var arm for
+    // pass-along args (`fn wrap(x: &mut T) { inc(x) }`). BorrowMut
+    // linkage redirection is deliberately ABSENT (empty links map): a
+    // BorrowMut-lowered caller (`--new-mut-ref`-flag mode) fails loud
+    // earlier anyway — its body's raw `MutRefFuture` linkage Assigns
+    // reject at leaf render — so the map can never be consulted on a
+    // fn that reaches here. Field targets (struct-update rebind) are
+    // out of the stage-A subset: sharp tag, zero corpus population.
+    static EMPTY_LINKS: std::sync::OnceLock<HashMap<String, VarIdent>> =
+        std::sync::OnceLock::new();
+    let empty_links: &'static HashMap<String, VarIdent> =
+        EMPTY_LINKS.get_or_init(HashMap::new);
+    let mut_args_raw: Vec<(usize, MutTargetRaw<'a>)> =
+        build_call_mut_args(&callee.params, args, mut_ref_locals, empty_links)
+            // Tag split keeps pre-S3 census labels stable: only the
+            // mut-position extraction failure is the new sharp tag;
+            // `check_exp` / `contains_loc` failures on VALUE args keep
+            // the leaf-render label they'd have hit at Validated below.
+            .map_err(|e| if e.contains("&mut argument") {
+                "call-mut-arg-shape".to_string()
+            } else {
+                format!("leaf-render: {}", e)
+            })?;
+    if mut_args_raw.iter().any(|(_, t)| matches!(t, MutTargetRaw::Field { .. })) {
+        return Err("call-mut-field".to_string());
+    }
+
+    // Dest: a simple-Var dest local, or None for a dest-less unit call
+    // WITH `&mut` args (production still ∀-binds the unit ret gensym —
+    // vec_push7's `_tactus_ret_2 : Unit` evidence). A dest-less call
+    // without mut args stays out of the restricted arm (unchanged
+    // pre-S3 behavior); a synthetic-unit-binder shape for those is a
+    // future extension (card note).
+    let dest_ident: Option<&VarIdent> = dest.and_then(|d| extract_simple_var_ident(&d.dest));
+    if dest_ident.is_none() && mut_args_raw.is_empty() {
+        return Err("call-unit-dest".to_string());
+    }
+
     let validated_args: Vec<crate::to_lean_sst_expr::Validated<'a>> = args.iter()
         .map(crate::to_lean_sst_expr::Validated::check)
         .collect::<Result<Vec<_>, _>>()
@@ -5235,7 +5303,7 @@ pub(crate) fn cert_call_leaves<'a>(
         .with_binder_typs(caller_param_typs)
         .with_let_binder_typs(let_binder_typs);
     let subst = build_call_substitutions(
-        callee, spec_callee, &typ_args[..], &validated_args, &[],
+        callee, spec_callee, &typ_args[..], &validated_args, &mut_args_raw,
         caller_param_typs, &arg_rctx, &obl, &mut emitter,
     );
     let inlined = crate::call_inlining::collect_inlined_at_call(callee, spec_callee);
@@ -5289,6 +5357,13 @@ pub(crate) fn cert_call_leaves<'a>(
         ret_eq.as_ref().map(|q| (q.clause_idx, q.conjunct_idx)),
     );
 
+    // Dest-less calls (mut path only, guarded above): the ∀-path binds
+    // the unit ret gensym; a ret-eq hit with no dest has no subject in
+    // the corpus — sharp tag rather than an unvalidated arm.
+    if dest_ident.is_none() && ret_eq.is_some() {
+        return Err("call-nodest-ret-eq".to_string());
+    }
+
     let post = match ret_eq {
         Some(q) => {
             let e_raw = render_call_ensure_expr(q.rhs, &subst, None, callee, &render_ctx_ens);
@@ -5317,13 +5392,18 @@ pub(crate) fn cert_call_leaves<'a>(
         }
         None => {
             let ret_typ = substitute(&typ_to_expr(&ret_typ_subst), &subst.typ_subst);
-            let dest_lean = crate::lean_name::LeanName::from_var_ident(dest_ident);
+            let dest_lean = dest_ident.map(crate::lean_name::LeanName::from_var_ident);
             // Approach A: name the ∀-bound result with the dest's own name
             // (skip the alias FLet) unless the dest is free in the ensures.
-            let use_dest_name = substituted_ensures.as_ref()
-                .is_none_or(|ens| !crate::lean_ast::mentions_free_var(ens, dest_lean.as_str()));
+            // Dest-less (mut-path unit calls): always the gensym, never
+            // dest-named — production's `use_dest_name` is gated on
+            // `dest_lean.is_some_and(…)` (push_ret_frames ~4966).
+            let use_dest_name = dest_lean.as_ref().is_some_and(|d| {
+                substituted_ensures.as_ref()
+                    .is_none_or(|ens| !crate::lean_ast::mentions_free_var(ens, d.as_str()))
+            });
             let binder_name = if use_dest_name {
-                dest_lean.clone()
+                dest_lean.clone().expect("use_dest_name implies dest")
             } else {
                 subst.fresh_ret_name.clone()
             };
@@ -5350,6 +5430,35 @@ pub(crate) fn cert_call_leaves<'a>(
         }
     };
 
+    // `&mut`-arg ingredients (Phase 1 binder+bound, Phase 4 rebind) —
+    // every leaf via the SAME production helpers `push_mut_arg_binders`
+    // / `push_mut_rebinds` use: binder at the DECLARED param typ
+    // (typ-arg substituted), bound + rebind value through the
+    // `into_slot(inner)` wrapper coercion (identity for legacy/numeric,
+    // `.deref` for wrapper-typed existentials). Prophecy REUSE (Phase-1
+    // skip) is unreachable here: a registered prophecy requires an
+    // earlier `&mut`-returning call, which `call-mut-ret` rejects — so
+    // no fn with one ever reaches this arm.
+    let cert_mut_args: Vec<CertMutArg> = subst.mut_args.iter().map(|info| {
+        let typ = &callee.params[info.param_idx].x.typ;
+        let binder_typ = substitute(&typ_to_expr(typ), &subst.typ_subst);
+        let inner_typ = crate::to_lean_expr::strip_one_ref_decoration(typ);
+        let inner_form = crate::typed_expr::TypedExpr::var(
+            info.fresh.clone(), typ.clone(),
+        ).into_slot(&inner_typ);
+        let bound = crate::to_lean_sst_expr::type_bound_predicate(&inner_form, typ);
+        let rebind_value = crate::typed_expr::TypedExpr::var(
+            info.fresh.clone(), typ.clone(),
+        ).into_slot(&inner_typ);
+        CertMutArg {
+            fresh: info.fresh.clone(),
+            binder_typ,
+            bound,
+            rebind_local: crate::lean_name::LeanName::from_var_ident(info.rebind_local()),
+            rebind_value,
+        }
+    }).collect();
+
     // Counter mirror: report the ids production consumes at this call —
     // the shell emitter's advance (gensyms minted in Phase C: one per
     // &mut arg + fresh_ret) plus the precondition theorem's id
@@ -5360,13 +5469,15 @@ pub(crate) fn cert_call_leaves<'a>(
 
     Ok(CertCallLeaves {
         precondition,
-        dest_name: crate::lean_name::LeanName::from_var_ident(dest_ident),
         // The dest let's binder typ is the instantiated CALLEE ret typ
         // (production's Phase-5 `ret_typ_subst`, sst_to_lean.rs:4306) —
         // NOT the SST dest local's declared typ (Verus auto-derefs the
         // call result into the local: `vec_index`'s Ref-typed return
         // becomes an Int local while the binder stays `Tactus.Ref Int`).
-        dest_typ: ret_typ_subst,
+        dest: dest_ident.map(|d| {
+            (crate::lean_name::LeanName::from_var_ident(d), ret_typ_subst)
+        }),
+        mut_args: cert_mut_args,
         post,
     })
 }
