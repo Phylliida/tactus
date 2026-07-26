@@ -537,6 +537,12 @@ struct Serializer<'a> {
     /// (including the loop rows and wrap-mode walk-order timing) on
     /// EVERY emitted cert, not only on fns whose gensym names print.
     predicted_theorem_ids: Vec<u64>,
+    /// The caller's `&mut`-local names (sanitize-keyed mut-ref pars +
+    /// BorrowMut decls) — `cert_call_leaves`' mut-target extraction
+    /// consults it for bare-Var pass-along args (bootstrap-78 S3).
+    /// Built in `serialize()` exactly as production's
+    /// `mut_param_names` (exec_fn_theorems_to_ast).
+    mut_ref_locals: std::collections::HashSet<String>,
     /// Names of residue (Bool-typed) lets in scope on the current walk
     /// path — the poison-check domain (bootstrap-74 slice 2). A hyp prop
     /// or let-equation mentioning one of these forces whole-goal wrap
@@ -2925,6 +2931,7 @@ impl<'a> Serializer<'a> {
                     &self.fn_map,
                     &self.caller_param_typs,
                     &self.let_binder_typs,
+                    &self.mut_ref_locals,
                     // Counter mirror (bootstrap-78 S1): the shell emitter
                     // mints this call's gensyms from the WALK-ORDER
                     // counter, and the consumed ids (mut_posts + fresh_ret
@@ -3344,33 +3351,61 @@ impl<'a> Serializer<'a> {
             }
             None => raw_exp_list(&[]),
         };
+        // `&mut` rebind targets (bootstrap-78 S3): production's Phase-4
+        // pushes `CtxFrame::Let(local, …, None)` under the local's OWN
+        // name — never freshened (the typ-less let wrap-forces every
+        // goal containing it, and `rename_frame_vars` only runs inside
+        // `hoist_all`). A target under an ACTIVE shadow rename would
+        // need the rename applied on one side only — loud tag instead
+        // (zero corpus population; a subject would pin the choice).
+        for m in leaves.mut_args.iter() {
+            if self.rename_env.contains_key(m.rebind_local.as_str()) {
+                return Err("call-mut-renamed-local".to_string());
+            }
+        }
         // dest binder id = interned leaf id of the dest's rendered name
         // (same path as `binder_id`; production Phase-5 binds
         // `let <dest> := …`). Shadow mirror (Round D): a colliding dest
         // freshens, and the post-frame leaves render under the active
-        // renames.
-        let chosen = self.fresh_let_name(leaves.dest_name.as_str());
-        let dest_name = crate::lean_name::LeanName::synthetic(chosen);
-        let dest_id = self.text_leaf(dest_name.as_str());
-        let dest_typ = leaves.dest_typ.clone();
-        // Record the dest binder at its Lean-level typ (production's
-        // Phase-5 `with_let_binder(dest, ret_typ_subst, true)`, every
-        // path) so downstream Var reads coerce correctly (`.deref` on a
-        // Ref-typed call result).
-        self.let_binder_typs.insert(dest_name.clone(), (dest_typ.clone(), true));
+        // renames. `None` = dest-less unit call (mut path).
+        let dest_parts: Option<(u64, crate::lean_name::LeanName, vir::ast::Typ)> =
+            leaves.dest.as_ref().map(|(dname, dtyp)| {
+                let chosen = self.fresh_let_name(dname.as_str());
+                let dest_name = crate::lean_name::LeanName::synthetic(chosen);
+                let dest_id = self.text_leaf(dest_name.as_str());
+                // Record the dest binder at its Lean-level typ
+                // (production's Phase-5 `with_let_binder(dest,
+                // ret_typ_subst, true)`, every path) so downstream Var
+                // reads coerce correctly (`.deref` on a Ref-typed call
+                // result).
+                self.let_binder_typs.insert(dest_name.clone(), (dtyp.clone(), true));
+                (dest_id, dest_name, dtyp.clone())
+            });
+        // Hyp names in production PUSH order (bootstrap-74 slice 2):
+        // per-mut-arg type bounds (Phase 1) take ordinals BEFORE the
+        // ret-path hyps (Phases 2/3). Names never print in goals — every
+        // goal containing mut frames is wrap-mode (the plain rebind
+        // FLet) — but the ordinal stream must stay aligned for later
+        // hoist goals' recounts.
+        let mut_bound_names: Vec<Option<u64>> = leaves.mut_args.iter()
+            .map(|m| m.bound.as_ref().map(|_| self.next_hyp_name()))
+            .collect();
         let post = match leaves.post {
             CertCallPost::RetEq { e_bound, rest, dest_value } => {
                 // Frame (outer→inner): [FHyp(E_bound)] [FHyp(rest)]
-                // FLet/FLetH/FLetR(dest, E). Built innermost-out so
-                // E_bound ends up outermost — matching
+                // [FLet(rebind_i)…] FLet/FLetH/FLetR(dest, E). Built
+                // innermost-out so E_bound ends up outermost — matching
                 // `push_ret_frames`' push order (E_bound Hyp, then rest
-                // Hyp, then Phase-5 dest Let). Hyp names are assigned
-                // in PUSH order (bootstrap-74 slice 2): E_bound takes
-                // the earlier `_h_hoist_i`.
+                // Hyp, then Phase-4 rebinds, then Phase-5 dest Let).
+                // Hyp names are assigned in PUSH order (bootstrap-74
+                // slice 2): E_bound takes the earlier `_h_hoist_i`.
                 let eb_name = if e_bound.is_some() { Some(self.next_hyp_name()) } else { None };
                 let rest_name = if rest.is_some() { Some(self.next_hyp_name()) } else { None };
                 let fnil = format!("{}.FrameList.FNil", NS);
-                let mut post = self.dest_let_frame(dest_id, &dest_name, &dest_typ, &dest_value, fnil);
+                let (dest_id, dest_name, dest_typ) = dest_parts.as_ref()
+                    .expect("ret-eq path requires dest (call-nodest-ret-eq guard)");
+                let tail = self.dest_let_frame(*dest_id, dest_name, dest_typ, &dest_value, fnil);
+                let mut post = self.wrap_mut_rebinds(&leaves.mut_args, tail);
                 if let Some(rest) = rest {
                     let hp = self.hyp_poison(&rest);
                     if hp == 1 {
@@ -3398,20 +3433,24 @@ impl<'a> Serializer<'a> {
             CertCallPost::Forall { ret_typ, ret_bound, ens, binder_name, dest_value, use_dest_name } => {
                 // ∀-path (bootstrap-71; no callee `r == E` conjunct).
                 // Frame (outer→inner): FBind(binder, ret_typ)
-                // [FHyp(ret_bound)] [FHyp(ens)] [dest-let] — matching
-                // `push_ret_frames`' ∀-path push order (binder, bound
-                // Hyp, ens Hyp) + the Phase-5 alias let, which is
-                // SKIPPED when Approach A named the ∀-binder with the
-                // dest's own name (`use_dest_name` ⟺ binder == dest).
+                // [FHyp(ret_bound)] [FHyp(ens)] [FLet(rebind_i)…]
+                // [dest-let] — matching `push_ret_frames`' ∀-path push
+                // order (binder, bound Hyp, ens Hyp) + the Phase-4
+                // rebinds + the Phase-5 alias let, which is SKIPPED
+                // when Approach A named the ∀-binder with the dest's
+                // own name (`use_dest_name` ⟺ binder == dest) and
+                // ABSENT for dest-less unit calls (mut path).
                 // Hyp names in push order (ret_bound before ens).
                 let rb_name = if ret_bound.is_some() { Some(self.next_hyp_name()) } else { None };
                 let ens_name = if ens.is_some() { Some(self.next_hyp_name()) } else { None };
                 let fnil = format!("{}.FrameList.FNil", NS);
-                let mut post = if use_dest_name {
-                    fnil
-                } else {
-                    self.dest_let_frame(dest_id, &dest_name, &dest_typ, &dest_value, fnil)
+                let tail = match dest_parts.as_ref() {
+                    Some((dest_id, dest_name, dest_typ)) if !use_dest_name => {
+                        self.dest_let_frame(*dest_id, dest_name, dest_typ, &dest_value, fnil)
+                    }
+                    _ => fnil,
                 };
+                let mut post = self.wrap_mut_rebinds(&leaves.mut_args, tail);
                 if let Some(e) = ens {
                     let hp = self.hyp_poison(&e);
                     if hp == 1 {
@@ -3439,7 +3478,55 @@ impl<'a> Serializer<'a> {
                 format!("({}.FrameList.FBind {} {} {})", NS, bn, ty, box_(&post))
             }
         };
+        // Phase-1 mut frames OUTERMOST (production pushes them before
+        // the ret frames): per arg, `FBind(fresh, declared typ)` +
+        // optional `FHyp(bound)` — reverse iteration so the FIRST arg
+        // ends outermost.
+        let mut post = post;
+        for (m, bname) in leaves.mut_args.iter().zip(mut_bound_names.iter()).rev() {
+            if let Some(b) = &m.bound {
+                let hp = self.hyp_poison(b);
+                if hp == 1 {
+                    self.mark_poison_forced();
+                }
+                let bid = self.leaves.intern(pp_expr(b));
+                post = format!(
+                    "({}.FrameList.FHyp {} {} {} {})",
+                    NS, bname.expect("name minted iff bound"), bid, hp, box_(&post)
+                );
+            }
+            let fname = self.text_leaf(m.fresh.as_str());
+            let fty = self.leaves.intern(pp_expr(&m.binder_typ));
+            post = format!("({}.FrameList.FBind {} {} {})", NS, fname, fty, box_(&post));
+        }
+        // The plain rebind FLets wrap-force every downstream goal
+        // (production: `hoist_all` bails on the typ-less Phase-4 lets),
+        // so shadow-freshening is off from here — same off-switch as
+        // the mut-preamble/attr cases. Loop bodies restore the flag at
+        // body end (post-loop frames drop body frames).
+        if !leaves.mut_args.is_empty() {
+            self.mark_flet_forced();
+        }
         Ok(format!("({}.StmData.Call {} {})", NS, box_(&reqs), box_(&post)))
+    }
+
+    /// Phase-4 rebind frames (bootstrap-78 S3): one PLAIN `FLet(local,
+    /// coerced fresh)` per `&mut` arg, wrapped innermost-out around
+    /// `tail` in reverse arg order (first arg outermost) — production's
+    /// `push_mut_rebinds` push order, typ-less `CtxFrame::Let` ⇒ plain
+    /// FLet by construction (never FLetH/FLetR).
+    fn wrap_mut_rebinds(
+        &mut self,
+        mut_args: &[crate::sst_to_lean::CertMutArg],
+        tail: String,
+    ) -> String {
+        let mut post = tail;
+        for m in mut_args.iter().rev() {
+            let name = self.text_leaf(m.rebind_local.as_str());
+            let val = self.leaves.intern(pp_expr(&m.rebind_value));
+            post = format!("({}.FrameList.FLet {} {} {})", NS, name, val, box_(&post));
+        }
+        post
     }
 
     /// Serialize a `StmX::Loop` into the finding-3 `StmData.Loop` shape:
@@ -3605,8 +3692,15 @@ impl<'a> Serializer<'a> {
         // (fill_zeros: entry 2,3,4 precede the in-body call's 5,6).
         self.consume_theorem_ids(invs.len() as u64);
         let loop_counter_end = self.hyp_ordinal;
+        // Wrap-latch scope (bootstrap-78 S3): a plain FLet inside the
+        // body (a mut-call rebind) wrap-forces the BODY's downstream
+        // goals only — production's post-loop frames drop body frames,
+        // so post-loop goals hoist (and freshen) again (fill_zeros
+        // `v_hoist1` Ret evidence). Restore alongside `hyp_ordinal`.
+        let flet_forced_save = self.flet_forced;
         let body_term = self.stm(body)?;
         self.hyp_ordinal = loop_counter_end;
+        self.flet_forced = flet_forced_save;
         // Counter mirror: MAINTAIN theorems (one per inv) + the DECREASE
         // theorem, consumed after the body walk (fill_zeros: 8,9,10 then
         // 11). `decrease.len() == 1` is enforced above; nonstandard
@@ -4014,6 +4108,9 @@ fn serialize<'a>(
         }
         m
     };
+    // The same set feeds the Call arm's mut-target extraction
+    // (bootstrap-78 S3) — set BEFORE the body walk below.
+    s.mut_ref_locals = mut_param_names.clone();
     let mut req_entries: Vec<(u64, u64)> = Vec::new();
     for (i, b) in crate::sst_to_lean::build_req_binders(fn_sst, check, &mut_param_names, &s.fn_map)
         .iter()
@@ -4078,11 +4175,28 @@ fn serialize<'a>(
         s.bound_names.insert(format!("h_req{}", i));
     }
 
+    // Ensures leaves — from the ENSURES-PHASE mut-ref-rewritten exps
+    // (bootstrap-78 S3, the inc pinpoint): production's `WpCtx::new`
+    // canonicalizes every ens BEFORE rendering (`VarAt(x, Pre)` /
+    // `MutRefCurrent(x)` → `Var(<x>_at_pre_tactus)`, post-state forms →
+    // `Var(x)`), so its goal leaf reads `x = x_at_pre_tactus + 1` while
+    // the raw exp would render `x = x + 1` — the ref side must rewrite
+    // identically or the Ret obligation leaf diverges. Identity for fns
+    // without mut params/BorrowMut locals (`mut_param_names` empty ⇒
+    // no shapes match), so non-mut certs are byte-stable.
+    let ens_rewritten: Vec<Exp> = check.post_condition.ens_exps.iter()
+        .map(|e| crate::mut_ref_normalize::rewrite_mut_ref_in_exp(
+            e,
+            &mut_param_names,
+            crate::mut_ref_normalize::RewritePhase::Ensures,
+        ))
+        .collect();
+
     // Ensures leaves (bare) → `FnCtxData.enss`. refWp does NOT read this
     // slot (the `Return` goal uses the annotated obligations below); it is
     // kept for the fall-through documentation + O4 audit.
     let mut ens_leaves: Vec<u64> = Vec::new();
-    for e in check.post_condition.ens_exps.iter() {
+    for e in ens_rewritten.iter() {
         ens_leaves.push(s.exp_leaf(e)?);
     }
     // Annotated ensures obligation SLOTS → the `Return` goal
@@ -4097,7 +4211,7 @@ fn serialize<'a>(
     // exactly where the old `oblig_leaf` interned the span_mark'd leaf.
     let mut ens_oblig: Vec<String> = Vec::new();
     let mut ens_all_deep = true;
-    for e in check.post_condition.ens_exps.iter() {
+    for e in ens_rewritten.iter() {
         let (id, slot) = s.oblig_slot(e)?;
         // `oblig_slot` inserts `id` into `deep_ids` iff it emitted a deep
         // `RawExp.Span` (else an `atom_ob` fallback). The G4 Return-lift

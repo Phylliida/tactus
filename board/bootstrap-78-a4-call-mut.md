@@ -299,13 +299,80 @@ row in the gate report updates automatically (tags are data-driven).
    mut-param fixture fn still rejects on its CALL — `call-mut`); the
    preamble derivation gets its first live subject when S3's `fn
    inc(x: &mut u64)` lands with the call arm.
-3. **S3 call frame assembly** — D3 rest; vec_push7 + fill_zeros certs
-   elaborate + decide-close (extend probe9 subjects).
-4. **S4 kills** (D5) + tag retirement + battery.
+3. **S3 call frame assembly — DONE 2026-07-26.** Landed per D1/D3 with
+   at-impl corrections from live evidence:
+   * **SOUNDNESS FIX FIRST (own commit, `8896532`):** dumping the S3
+     shapes exposed that `collect_modifications` (Assign-only) missed
+     BOTH loop-body mut-call targets (legacy `Loc` args — every vstd
+     mut fn) and call DESTS (`x = f(x)` is a Call, not an Assign) —
+     the maintain/exit telescopes pinned the pre-loop value and FALSE
+     ensures verified (bad_fill `len==0` + bad_dest `r==1`, confirmed
+     live). Call arm + `loc_root_var` added to the SHARED fn, so the
+     serializer mirror moved in lockstep; 2 e2e pins; fill_zeros'
+     telescopes now havoc `v` (`all v` in the spine).
+   * Raw-snapshot ground truth (call_inc SST dump): mut args arrive
+     `Loc(VarLoc(v))` for BOTH legacy vstd callees and new-mode user
+     callees — NO BorrowMut machinery at this snapshot; a
+     BorrowMut-lowered caller fails loud at leaf render (raw
+     `MutRefFuture`), so no gate needed. `build_call_mut_args` reused
+     verbatim (empty links map, OnceLock).
+   * New-mode numeric frames render BARE (`∀ mut_post : Int`, bound on
+     bare fresh, bare rebind — call_inc theorem evidence); wrapper
+     coercions ride `into_slot` exactly as production.
+   * D2 amendment: NO rebind ledger re-entry — production's Phase 4
+     doesn't re-ledger either (the local's init-Assign entry persists);
+     the D3 bullet was a design guess corrected at impl.
+   * Serializer: `CertMutArg` ingredients (fresh/binder_typ/bound/
+     rebind) from `push_mut_arg_binders`/`push_mut_rebinds` mirrors;
+     `call_stm` assembles `FBind(fresh)[FHyp bound]…(ret frames)…
+     [FLet rebind]…[dest?]`; dest now `Option` (dest-less unit mut
+     calls; plain unit calls keep `call-unit-dest`); wrap-latch
+     `mark_flet_forced()` after mut rebinds, loop bodies save/restore
+     the latch (post-loop goals hoist again — `v_hoist1` evidence);
+     `call-mut-renamed-local` / `call-mut-field` /
+     `call-mut-arg-shape` / `call-nodest-ret-eq` loud tags.
+   * **Second serializer gap found by the inc pinpoint: the
+     ensures-phase mut-ref rewrite** — `WpCtx::new` canonicalizes ens
+     (`VarAt(x,Pre)` → `x_at_pre_tactus`) before rendering; the ref
+     side now rewrites identically before `exp_leaf`/`oblig_slot`
+     (identity for non-mut fns — golden byte-stable).
+   * **Results: certified 36/39 (call-mut tag RETIRED from fixture
+     census, 0 emit-counter-drift), probe9 ALL-CLASSIFIED — call_inc
+     (two sequential calls, `_1/_2`+`_4/_5` gensyms) and inc CLOSE;
+     fill_zeros' `_tactus_mut_post_5/_ret_6` byte-match the spine (S1
+     acceptance). vec_push7 + fill_zeros reclassified HONEST-FAIL:
+     frame spines match production node-for-node, the divergence is
+     deep-leaf only — `view (Tactus.Ref.mk v)` needs A7 stage-B
+     callee-signature vocab (vec_read's class, now 3 members);
+     fill_zeros additionally exercises the b77 leading-hyp wrap
+     divergence (production `split_leading_binders` renames leading
+     frame hyps `_h_ctx_N` in wrap goals vs `close_e_wrap`'s anonymous
+     Imp).** Battery: units 425+7/0, e2e 558/0, probes
+     9/11/13/14/20/37/38 green.
+   * **S3-pre brick spec'd (next): retire `_h_ctx` naming** — corpus
+     grep shows ZERO user references; rename production's extracted
+     wrap-leading hyps to the hoist scheme (`_h_hoist_k`, 1-based
+     per-goal — coincides with the serializer's global replay by the
+     prefix argument) and teach `close_e_wrap` the leading latch
+     (FBind→All keeps run alive; FHyp→All(hn) while leading, Imp
+     after; any let ends it; FUserCloser transparent; a pre-binder
+     Hyp ends it). Zero new vocabulary (the FHyp name slot serves);
+     link_discharge parses positionally (name-agnostic ✓). W5
+     close_sem lemmas need the latch threaded (b74 dual-mode class).
+     This + A7 closes fill_zeros; A7 alone closes vec_push7.
+4. **S4 kills** (D5, adapt subjects: call_inc is the closing cert —
+   rebind-drop / mut_post-binder-drop / ens-hyp-drop / single-site
+   counter rename against call_inc; vec_push7 kills fold into A7) +
+   battery.
 5. **S5 tgt copy_word** — scoped `--verify-module runtime
    --tactus-emit-cert` cert regen + close (probe38-style runner; NOT
    the full tgt gate — dropped per Danielle, and don't stack heavy
-   verus runs). `call-mut` tag → 0 on the tgt census.
+   verus runs). `call-mut` tag → 0 on the tgt census. NOTE: copy_word's
+   leaves are view()-bearing → expect A7-class honest-fail until A7;
+   the census-tag retirement still holds (cert EMITS).
+   ⚠ tgt loop fns with in-body mut calls / call dests will get NEW
+   goal shapes from the soundness fix (proper havoc) — some may need
+   real invariant repairs; that is the fix working, not a regression.
 
 ## Open items (resolve at impl, not design blockers)
 

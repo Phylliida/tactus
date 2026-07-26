@@ -66,6 +66,26 @@ honest_fail_reason() {
     # walk_let fork (N2 ctor frames on the positive branch, per-branch
     # RetLetH). If it reverts to failing, that is a fork-mirror
     # regression, not a reclassify.
+    # bootstrap-78 S3 (2026-07-26): the mut-call FRAME machinery is
+    # bridge-validated by call_inc + inc (both CLOSE: mut_post/ret
+    # binders, bound hyp, ens hyp, plain rebind FLets, fn-entry
+    # preamble, at_pre ensures rewrite). vec_push7's frame spine
+    # matches production node-for-node; the decide fails ONLY in the
+    # deep ensures leaves — `view (Tactus.Ref.mk v)`: production
+    # derives the Ref.mk wrap from the View::view arg slot, the
+    # fixed-vocabulary mirror cannot (same A7 stage-B callee-signature
+    # class as vec_read, one more member). Expected to CLOSE when A7
+    # lands.
+    vec_push7) printf '%s' 'stage-B A7 class (bootstrap-78 S3, 2026-07-26): mut-call frame spine matches production exactly (All mut_post/All ret/Imp ens/Let rebind after the preamble lets — manually verified against the cert); the divergence is deep-leaf only: ensures leaves need the derived `Tactus.Ref.mk` wrap on View.view args (vec_read class). Closes with A7 stage-B callee-signature vocab.' ;;
+    # fill_zeros: TWO known classes — (1) the same A7 deep-leaf gap on
+    # its view()-bearing invariant/ensures leaves; (2) the wrap-goal
+    # LEADING-HYP extraction: production's split_leading_binders
+    # renames leading frame hyps to `_h_ctx_N` theorem binders in wrap
+    # goals (post-call maintain/assert goals) while close_e_wrap
+    # renders FHyp as anonymous Imp — the b77 "leading-hyp wrap
+    # divergence", now exercised (S3-pre brick: unify production
+    # naming to _h_hoist + teach close_e_wrap the leading latch).
+    fill_zeros) printf '%s' 'A7 stage-B deep-leaf class on view()-bearing invariant leaves + the leading-hyp wrap-extraction divergence (production _h_ctx_N named binders vs close_e_wrap anonymous Imp — b77 residue, now exercised; S3-pre brick). Frame assembly around the in-loop mut call (havoc incl. the SOUNDNESS-fixed mod set, mut_post_5/ret_6 counter byte-match) verified against the spine sidecar.' ;;
     *)         printf '%s' '' ;;
   esac
 }
