@@ -7768,6 +7768,49 @@ pub(crate) fn collect_modifications<'a>(
             }
         }
         StmX::Loop { body, .. } => collect_modifications(body, locally_declared, out),
+        // AUDIT FIX (2026-07-26, call_inlining/loop_normalize review):
+        // calls modify state through two channels invisible to the
+        // Assign arm, and missing either meant the var kept its
+        // pre-loop binding in the post-loop continuation (a FALSE
+        // `assert(x == old_value)` verified):
+        //   1. `dest` — `x = f()` with a simple-var LHS lowers to
+        //      `Call { dest: Dest { dest: x, is_init: false } }` with
+        //      NO separate Assign (ast_to_sst's `direct_assign`).
+        //   2. Legacy-mode `&mut` args — `f(&mut x)` passes a
+        //      `Loc(...)`-shaped L-value whose root local the call
+        //      mutates. (New-mut-ref mode instead mutates the user
+        //      local via the BorrowMut linkage Assign, which the
+        //      Assign arm already tracks; its bare-`Var` BorrowMut
+        //      arg deliberately doesn't match the Loc gate here.)
+        // Unsupported mut-arg shapes can't slip past the root
+        // extraction: `build_call_mut_args` rejects them when the
+        // body is walked, failing the whole fn before any havoc
+        // set is consulted.
+        StmX::Call { dest, args, .. } => {
+            if let Some(Dest { dest, is_init }) = dest {
+                let ident = extract_simple_var_ident(dest)
+                    .or_else(|| decompose_assign_lvalue(dest).map(|(root, _)| root));
+                if let Some(ident) = ident {
+                    if *is_init {
+                        locally_declared.insert(ident);
+                    } else if !locally_declared.contains(&ident) && !out.contains(&ident) {
+                        out.push(ident);
+                    }
+                }
+            }
+            for arg in args.iter() {
+                let peeled = peel_transparent(arg);
+                if matches!(&peeled.x, ExpX::Loc(_)) {
+                    let root = extract_simple_var_ident(peeled)
+                        .or_else(|| decompose_assign_lvalue(peeled).map(|(root, _)| root));
+                    if let Some(root) = root {
+                        if !locally_declared.contains(&root) && !out.contains(&root) {
+                            out.push(root);
+                        }
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }
