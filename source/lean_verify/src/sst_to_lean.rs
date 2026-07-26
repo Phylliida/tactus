@@ -2261,30 +2261,33 @@ impl OblCtx {
     /// inaccessible `i✝` names that user tactics can't reference).
     /// See `BUG-loop-local-names-alpha-renamed.md`.
     ///
-    /// Only LEADING Binders are extracted — Hyp frames immediately
-    /// after the last extracted Binder also extract (they're the
-    /// bounds + invariants + cond that go with the modified-vars).
-    /// Stopping at the first Let preserves the source ordering of
-    /// `_tactus_d_old := D` lets and any other let-bound context.
-    /// Hyps get synthetic names so they're addressable.
+    /// PURE PREFIX LATCH (S3-pre): every leading Binder AND Hyp frame
+    /// extracts, stopping at the first Let-class frame — base binders
+    /// always precede the frames, so the old "Hyps only after a
+    /// Binder" gate (`saw_binder`) was an artifact that left body-first
+    /// hyps of param-carrying fns anonymous. Stopping at the first Let
+    /// preserves the source ordering of `_tactus_d_old := D` lets and
+    /// any other let-bound context. Extracted Hyps get `_h_hoist_{k}`
+    /// names (1-based pre-increment — `hoist_all`'s exact scheme, and
+    /// the cert serializer's global `hyp_ordinal` replay: the extracted
+    /// prefix contains no lets, so per-goal positions ARE the walk
+    /// ordinals 1..k) so they're addressable and bridge-comparable.
     fn split_leading_binders(&self) -> (Vec<(LBinder, Option<HypProvenance>)>, OblCtx) {
         let mut binders: Vec<(LBinder, Option<HypProvenance>)> = Vec::new();
         let mut remaining = self.clone();
         let mut hyp_counter: usize = 0;
-        let mut saw_binder = false;
         loop {
             match remaining.frames.front() {
                 Some(CtxFrame::Binder(b)) => {
                     binders.push((b.clone(), None));
                     remaining.frames.pop_front();
-                    saw_binder = true;
                 }
-                Some(CtxFrame::Hyp(p, prov)) if saw_binder => {
+                Some(CtxFrame::Hyp(p, prov)) => {
+                    hyp_counter += 1;
                     binders.push((
-                        LBinder::explicit(crate::lean_name::LeanName::synthetic(format!("_h_ctx_{}", hyp_counter)), p.clone()),
+                        LBinder::explicit(crate::lean_name::LeanName::synthetic(format!("_h_hoist_{}", hyp_counter)), p.clone()),
                         Some(prov.clone()),
                     ));
-                    hyp_counter += 1;
                     remaining.frames.pop_front();
                 }
                 _ => break,
@@ -3388,7 +3391,7 @@ fn walk_loop<'a>(
     );
     // Each invariant clause becomes its OWN hypothesis frame, NOT one
     // glued `∧` conjunction. `split_leading_binders` then names them
-    // `_h_ctx_N` individually, so a user tactic's `intros; nlinarith`
+    // `_h_hoist_N` individually, so a user tactic's `intros; nlinarith`
     // (and `linarith` / `assumption` / `exact`) sees each fact
     // directly. Those tactics do NOT decompose a conjunction
     // hypothesis, so gluing the clauses into one `(P1 ∧ P2 ∧ …)` frame

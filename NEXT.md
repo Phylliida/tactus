@@ -47,8 +47,15 @@ fill_zeros also exercises the b77 leading-hyp wrap divergence —
 S3-pre brick spec'd on the card (retire `_h_ctx` → `_h_hoist_k` +
 close_e_wrap leading latch, zero user references in corpus).
 Battery: units 425+7/0, e2e 558/0 (+2 soundness pins), probes
-9/11/13/14/20/37/38 green.** NEXT = S4 kills (subjects: call_inc)
-→ S3-pre (_h_ctx unification; + A7 closes fill_zeros) → S5 scoped
+9/11/13/14/20/37/38 green.** **S4 kills DONE 2026-07-26 (probe13 →
+15 classes). S3-pre DONE 2026-07-26 (full record on the b78 card):
+`_h_ctx` retired — production split_leading_binders = pure prefix
+latch naming `_h_hoist_k`, refWp close_e_wrap_lead/close_sem twins
+with one-way let-latch, serializer needed ZERO changes (per-goal
+positions == walk ordinals); gate 283/0 + discharge 196/0, probe9
+23/26 CLOSE (add_capped/proof_block_fn close with reshaped certs;
+fill_zeros hfail narrowed to A7-only), probes 13/14/37/38 green,
+golden re-vendored.** NEXT = S5 scoped
 tgt copy_word (⚠ tgt loop fns get NEW goal shapes from the
 soundness fix — invariant repairs possible and correct) → A7
 (stage-B callee-signature vocab — closes vec_read, vec_push7,
