@@ -33,13 +33,28 @@ slot 3 = deref VALUE leaf not inner-typ, at-impl D2 amendment; .mk
 arity 7; 17 vendored pins bumped + probe37 wf-projection +1 + golden
 re-vendored + probe20 de-staled). Battery: core gate 256/0 +
 discharge 172/0, emission 32/37 ctx-only diffs, probes
-9/11/13/14/20/37/38 + units all green. NEXT = S3 frame
-assembly + fixture closes + spine byte-match (incl. `fn inc(x: &mut
-u64)` minimal subject) → S4 kills → S5 scoped
-tgt copy_word) → A7 (stage-B callee-signature vocab — closes vec_read
-AND find_cancellation, derives poison + N2 detector reference-side) →
-B (b67 caching + b68 flip)**. D's in-model tripwire column landed
-with b77.
+9/11/13/14/20/37/38 + units all green. **S3 DONE 2026-07-26
+(`8896532`+`79ddaae`, card §3 has the full story): SOUNDNESS FIX
+first — collect_modifications missed loop-body call writes (mut-call
+targets AND call dests; false ensures verified, confirmed live,
+2 e2e pins) — then the mut-call frame arm: call_inc + inc
+BRIDGE-CLOSE, call-mut tag retired from the fixture census (36/39),
+fill_zeros `_5/_6` spine byte-match, ensures-phase mut-rewrite gap
+found+fixed via the inc pinpoint. vec_push7 + fill_zeros =
+documented A7-class honest-fails (frame spines match production
+node-for-node; deep-leaf `view (Tactus.Ref.mk v)` divergence);
+fill_zeros also exercises the b77 leading-hyp wrap divergence —
+S3-pre brick spec'd on the card (retire `_h_ctx` → `_h_hoist_k` +
+close_e_wrap leading latch, zero user references in corpus).
+Battery: units 425+7/0, e2e 558/0 (+2 soundness pins), probes
+9/11/13/14/20/37/38 green.** NEXT = S4 kills (subjects: call_inc)
+→ S3-pre (_h_ctx unification; + A7 closes fill_zeros) → S5 scoped
+tgt copy_word (⚠ tgt loop fns get NEW goal shapes from the
+soundness fix — invariant repairs possible and correct) → A7
+(stage-B callee-signature vocab — closes vec_read, vec_push7,
+fill_zeros AND find_cancellation, derives poison + N2 detector
+reference-side) → B (b67 caching + b68 flip)**. D's in-model
+tripwire column landed with b77.
 
 **The ordered map of everything remaining is now
 `DESIGN-bootstrap-endgame.md`** (milestones A–F + policy points P1–P4,
