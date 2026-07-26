@@ -105,34 +105,53 @@ pub(crate) fn sst_exp_to_typed(
 #[derive(Clone, Copy)]
 pub struct Validated<'a> {
     inner: &'a Exp,
+    /// The FN-LEVEL RenderCtx this witness was validated under —
+    /// fn_map + caller param typs, the pieces that exist at
+    /// `build_wp` time (walk-local enrichments — let-binder envs,
+    /// inv binder maps — are added per render site on top of this
+    /// base). Stored so (a) validation exercises the SAME routing
+    /// (trait-method dispatch via fn_map) the render will take, and
+    /// (b) `lower` renders under the base rather than an
+    /// unconditionally-empty ctx. See `check_in` for the residual
+    /// enrichment contract. (Decision #6-3 follow-up, 2026-07-26:
+    /// the fn-level base is as much ctx as can exist at check time —
+    /// carrying the per-obligation ctx would require merging the
+    /// build and walk phases.)
+    base_ctx: crate::expr_shared::RenderCtx<'a>,
 }
 
 impl<'a> Validated<'a> {
     /// Run validation by attempting `sst_exp_to_ast_checked`. Returns
     /// a witness on success, or the validation error on failure.
     ///
-    /// ## The ctx-free-Err contract
+    /// ## The enrichment contract (successor of ctx-free-Err)
     ///
-    /// Validation runs with an EMPTY [`RenderCtx`], but the eventual
-    /// [`lower_with_ctx`] renders with a per-obligation ctx that does
-    /// not even exist yet at check time (the walker builds it from
-    /// obligation-local state). The witness therefore only certifies
-    /// ctx-free renderability — soundness of the pair rests on the
-    /// contract that **a `RenderCtx` influences rendering CHOICES
-    /// (routing, typing, coercions), never Err-ness**. All ctx reads
-    /// (`fn_map` routing, `binder_typs` / `let_binder` / `lookup_subst`
-    /// lookups, `fn_ret_typ` / `fn_param_typs`) are `Option`-shaped
-    /// with a fallback rendering — none introduces an `Err` path.
-    /// When adding an arm or a ctx field, keep every `Err` condition
-    /// derivable from the `Exp` alone; a ctx-dependent `Err` would
-    /// make [`lower_with_ctx`]'s panic reachable. Pinned by
-    /// `validated_empty_check_lowers_with_rich_ctx`.
-    /// (Carrying the render ctx inside `Validated` — the cleaner
-    /// design — needs the per-obligation ctxs to exist at build_wp
-    /// time; see decision #6-3, 2026-07-26.)
+    /// Validation runs with the FN-LEVEL base ctx passed here —
+    /// including `fn_map`, so the routing-relevant decisions (trait
+    /// method → class dispatch vs plain call) are exercised exactly
+    /// as the render will take them. Render sites may ENRICH the base
+    /// (walk-local `let_binder_typs`, loop `binder_typs` overlays,
+    /// call-site substs) — the residual contract is only that
+    /// **enrichment fields never affect Err-ness**: they are
+    /// `Option`-shaped lookups feeding typ/coercion choices with a
+    /// fallback rendering, none introducing an `Err` path. When
+    /// adding a ctx field, keep it that way; `lower_with_ctx`
+    /// debug-asserts the enriched ctx shares the base's `fn_map` so a
+    /// witness can't be rendered under a DIFFERENT fn's routing.
+    /// Pinned by `validated_empty_check_lowers_with_rich_ctx`.
+    pub fn check_in(
+        e: &'a Exp,
+        base_ctx: crate::expr_shared::RenderCtx<'a>,
+    ) -> Result<Self, String> {
+        sst_exp_to_ast_checked_with_ctx(e, &base_ctx)?;
+        Ok(Validated { inner: e, base_ctx })
+    }
+
+    /// Ctx-less validation (empty base). For contexts genuinely
+    /// outside any fn render (tests, standalone shapes) — build_wp
+    /// sites should use [`check_in`] with `ctx.render_ctx()`.
     pub fn check(e: &'a Exp) -> Result<Self, String> {
-        sst_exp_to_ast_checked(e)?;
-        Ok(Validated { inner: e })
+        Self::check_in(e, crate::expr_shared::RenderCtx::empty())
     }
 
     /// The underlying `Exp` reference. Use sparingly — most consumers
@@ -149,11 +168,15 @@ impl<'a> Validated<'a> {
 /// sites (Validated is Copy, but `*v` is more noise than necessary
 /// when callers usually have a borrow already).
 ///
-/// Uses an empty [`RenderCtx`], so class-method-call rendering falls
-/// back to no-coerce. Use [`lower_with_ctx`] when a ctx is available
-/// to enable wrapper-arch coercion at trait dispatch sites.
+/// Renders under the witness's STORED base ctx (fn-level — the ctx
+/// it was validated with), so fn_map-aware routing applies wherever
+/// the witness came from a `check_in` site. Witnesses from the
+/// ctx-less `check` render with the empty ctx, as before. Use
+/// [`lower_with_ctx`] to render under a walk-local ENRICHMENT of the
+/// base.
 pub fn lower(v: &Validated<'_>) -> LExpr {
-    lower_with_ctx(v, &crate::expr_shared::RenderCtx::empty())
+    let base = v.base_ctx;
+    lower_with_ctx(v, &base)
 }
 
 /// Variant of [`lower`] that takes a [`RenderCtx`] for typing info
@@ -161,12 +184,27 @@ pub fn lower(v: &Validated<'_>) -> LExpr {
 /// coercion). Use at codegen entry points where the fn_map is
 /// available.
 pub fn lower_with_ctx(v: &Validated<'_>, ctx: &crate::expr_shared::RenderCtx) -> LExpr {
+    // A witness must not be rendered under a DIFFERENT fn's routing:
+    // when the stored base carries a fn_map, the render ctx must be
+    // an enrichment sharing that exact map. (Empty-base witnesses —
+    // the ctx-less `check` — accept any render ctx, matching the
+    // pre-#6-3 behavior.)
+    debug_assert!(
+        match (v.base_ctx.fn_map, ctx.fn_map) {
+            (Some(base), Some(render)) => std::ptr::eq(base, render),
+            (Some(_), None) => false,
+            (None, _) => true,
+        },
+        "Validated rendered under a ctx that does not extend its base \
+         (different or missing fn_map) — pass an enrichment of the \
+         check_in ctx",
+    );
     sst_exp_to_ast_checked_with_ctx(v.inner, ctx).unwrap_or_else(|reason| panic!(
-        // Reachable only via a violation of the ctx-free-Err contract
-        // (see `Validated::check`): validation passed with the empty
-        // ctx, so a failure here means some arm's Err condition
-        // became ctx-DEPENDENT — fix the arm, not this panic.
-        "Validated::lower: ctx-free-Err contract violated — {}",
+        // Reachable only via a violation of the enrichment contract
+        // (see `Validated::check_in`): validation passed under the
+        // base ctx, so a failure here means an enrichment field
+        // affected Err-ness — fix the arm, not this panic.
+        "Validated::lower: enrichment contract violated — {}",
         reason
     ))
 }
