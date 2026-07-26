@@ -378,10 +378,13 @@ fn apply_let_substs_self_referential_no_blowup() {
 
 #[test]
 fn apply_let_substs_mutual_cycle_bounded() {
-    // MUTUAL cycle (`a := f b b; b := g a a`): not caught by the
-    // self-reference filter, but the growth guard stops the doubling
-    // once the pp text passes the divergence bound. Bounded output,
-    // prompt return — form C then declines on the textual mismatch.
+    // MUTUAL cycle (`a := f b b; b := g a a`) — ill-formed input (the
+    // binding-order premise excludes it), but it must stay BOUNDED.
+    // The single reverse pass substitutes each entry exactly once:
+    // `b` first (no-op here), then `a` — whose value's `b` stays
+    // unexpanded because `b` was already processed. Divergence is
+    // impossible by construction; form C simply declines on the
+    // textual mismatch.
     let out = apply_let_substs(
         &app("lib.h", vec![var("a")]),
         &[
@@ -390,5 +393,5 @@ fn apply_let_substs_mutual_cycle_bounded() {
         ],
     );
     let s = crate::lean_pp::pp_expr(&out);
-    assert!(s.len() <= 8_000_000, "growth guard must bound divergence: {}", s.len());
+    assert_eq!(s, "lib.h (lib.f b b)", "one expansion of `a`, `b` left unexpanded: {s}");
 }

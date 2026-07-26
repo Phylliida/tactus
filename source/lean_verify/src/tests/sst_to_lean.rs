@@ -2165,3 +2165,40 @@ fn render_ctx_with_pre_state_subst_falls_back_to_none() {
     assert!(swapped.lookup_subst_raw(&key).is_none(),
         "with_pre_state_subst with no pre-map should fall back to no substitution");
 }
+
+// ── Shape-recognizer pins (decision #3, 2026-07-26) ─────────────────
+//
+// Tactus recognizes Verus-synthetic constructs by SHAPE (no vir-side
+// tagging — Danielle wants the fork PR-able upstream, so vir stays
+// unmodified). Most recognizers are pinned indirectly by e2e symptom
+// tests (a drifted BorrowMut linkage shape fails the mut-arg tests
+// loudly). The AST-side resolution-assume filter is the exception:
+// drift there produces false-positive unproved-assumption WARNINGS,
+// which no e2e test observes — pin it directly.
+
+/// `is_synthetic_resolution_assume` recognizes exactly the shapes
+/// `resolution_inference::mk_assume` produces: `HasResolved(_)` bare
+/// or under an `Implies(IsVariant-chain, …)` conclusion — and nothing
+/// else. If Verus's encoding changes shape, this pin fails at unit
+/// speed instead of users seeing spurious assume-warnings.
+#[test]
+fn resolution_assume_recognizer_shapes() {
+    use vir::ast::{ExprX, UnaryOpr, VarIdentDisambiguate};
+    let t_bool: vir::ast::Typ = std::sync::Arc::new(vir::ast::TypX::Bool);
+    let mk = |x: ExprX| -> vir::ast::Expr {
+        vir::ast::SpannedTyped::new(&vir::messages::Span::dummy(), &t_bool, x)
+    };
+    let var = mk(ExprX::Var(vir::ast::VarIdent(
+        std::sync::Arc::new("x".to_string()),
+        VarIdentDisambiguate::AirLocal,
+    )));
+    let hr = mk(ExprX::UnaryOpr(UnaryOpr::HasResolved(t_bool.clone()), var.clone()));
+    assert!(is_synthetic_resolution_assume(&hr), "bare HasResolved");
+    let implied = mk(ExprX::Binary(vir::ast::BinaryOp::Implies, var.clone(), hr.clone()));
+    assert!(is_synthetic_resolution_assume(&implied), "Implies-wrapped HasResolved");
+    let nested = mk(ExprX::Binary(vir::ast::BinaryOp::Implies, var.clone(), implied.clone()));
+    assert!(is_synthetic_resolution_assume(&nested), "chained Implies");
+    assert!(!is_synthetic_resolution_assume(&var), "plain var is user-written");
+    let conj = mk(ExprX::Binary(vir::ast::BinaryOp::And, var.clone(), hr));
+    assert!(!is_synthetic_resolution_assume(&conj), "And-wrapped is NOT the synthetic shape");
+}

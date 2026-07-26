@@ -484,8 +484,51 @@ fn expr_to_node(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
         ),
         ExprX::Unary(UnaryOp::FloatToBits, inner) => expr_to_node(inner, ctx),
         ExprX::Unary(UnaryOp::IeeeFloat(_), inner) => expr_to_node(inner, ctx),
-        // Remaining unary ops: transparent annotations/markers/internal ops.
-        ExprX::Unary(_, inner) => expr_to_node(inner, ctx),
+        // ── Remaining UnaryOps, enumerated explicitly (2026-07-26):
+        // no catch-all — an upstream variant addition must be a
+        // compile error here, not a silent passthrough. (HasResolved
+        // rendered wrong through exactly such a catch-all, on two
+        // paths, fixed years apart: #122 and the 2026-07-25 audit.)
+        //
+        // Verification-metadata markers / hints: no Lean content, the
+        // inner value flows through. HeightTrigger appears only in
+        // trigger positions (Lean has no e-matching; triggers drop at
+        // emission). InferSpecForLoopIter wraps the exec expr it
+        // hints about.
+        ExprX::Unary(
+            UnaryOp::MustBeFinalized
+            | UnaryOp::MustBeElaborated
+            | UnaryOp::CastToInteger
+            | UnaryOp::HeightTrigger
+            | UnaryOp::InferSpecForLoopIter { .. },
+            inner,
+        ) => expr_to_node(inner, ctx),
+        // Mut-ref ops surviving `rewrite_varat_for_mut_params`: the
+        // rewrite maps recognized mut-param shapes to Var forms;
+        // leftovers pass through to the inner value. LOAD-BEARING for
+        // callee-spec inlining — see mut_ref_normalize's single-pass
+        // note and the audit_probe_mut_arg_false_assert_fails
+        // tripwire before changing this.
+        ExprX::Unary(
+            UnaryOp::MutRefCurrent | UnaryOp::MutRefFuture(_) | UnaryOp::MutRefFinal(_),
+            inner,
+        ) => expr_to_node(inner, ctx),
+        // NOT transparent — a length is not its collection, so the
+        // old catch-all passthrough was silently WRONG if ever
+        // reached. No support yet (vstd routes `.len()` through View
+        // spec fns; nothing demands these raw ops). Render an
+        // uninterpreted head: sound as an opaque symbol, loud at Lean
+        // elaboration (unknown identifier) the moment a proof needs
+        // its value — the #122 hasResolved pattern. Real support =
+        // define the prelude fn and rename.
+        ExprX::Unary(UnaryOp::StrLen, inner) => apply(
+            "Tactus.strslice_len_unsupported",
+            vec![expr_to_ast(inner, ctx)],
+        ),
+        ExprX::Unary(UnaryOp::Length(_), inner) => apply(
+            "Tactus.array_len_unsupported",
+            vec![expr_to_ast(inner, ctx)],
+        ),
 
         ExprX::Call(target, args, _) => {
             // Class-method calls (Dynamic / DynamicResolved) use Lean's
@@ -876,7 +919,16 @@ fn expr_to_node(expr: &Expr, ctx: &crate::expr_shared::RenderCtx) -> ExprNode {
             "Tactus.hasResolved",
             vec![expr_to_ast(inner, ctx)],
         ),
-        ExprX::UnaryOpr(_, inner) => expr_to_node(inner, ctx),
+        // ProofNote: diagnostic label, transparent.
+        ExprX::UnaryOpr(UnaryOpr::ProofNote(_), inner) => expr_to_node(inner, ctx),
+        // ToDyn: concrete→dyn coercion. Untested territory (zero dyn
+        // e2e coverage); passthrough preserved verbatim from the
+        // pre-exhaustive catch-all. Revisit when dyn support is
+        // designed — the rendered value's Lean typ is the concrete
+        // type while the claim is the opaque Dyn type. This match is
+        // now EXHAUSTIVE: an upstream UnaryOpr addition is a compile
+        // error here.
+        ExprX::UnaryOpr(UnaryOpr::ToDyn(_), inner) => expr_to_node(inner, ctx),
 
         ExprX::NullaryOpr(NullaryOpr::ConstGeneric(typ)) => {
             // const generic parameter used as a value — the VIR typ is the

@@ -1130,11 +1130,11 @@ pub fn exec_fn_theorems_to_ast<'a>(
     //   unary op" arm.
     let mut mut_param_names: HashSet<String> = fn_sst.x.pars.iter()
         .filter(|p| is_mut_ref_typ(&p.x.typ, p.x.is_mut))
-        .map(|p| sanitize(&p.x.name.0))
+        .map(|p| crate::mut_ref_normalize::mut_param_key(&p.x.name))
         .collect();
     for decl in check.local_decls.iter() {
         if matches!(decl.kind, LocalDeclKind::BorrowMut) {
-            mut_param_names.insert(sanitize(&decl.ident.0));
+            mut_param_names.insert(crate::mut_ref_normalize::mut_param_key(&decl.ident));
         }
     }
 
@@ -1148,7 +1148,13 @@ pub fn exec_fn_theorems_to_ast<'a>(
     // Body-phase only (assignments + reads); the ensures-phase form
     // (which also rewrites `MutRefCurrent` → pre-state) runs separately
     // inside `WpCtx::new`.
-    let rewritten_body: Stm = rewrite_mut_ref_in_stm(&check.body, &mut_param_names);
+    // Loop-cond normalization FIRST (decision #2): setup-carrying
+    // whiles become loop+break, so every subsequent pass — the
+    // mut-ref rewrite, the BorrowMut link collector, modification
+    // collection — sees the former cond statements as body
+    // statements. See `loop_normalize` for the soundness story.
+    let normalized_body: Stm = crate::loop_normalize::normalize_setup_loops(&check.body);
+    let rewritten_body: Stm = rewrite_mut_ref_in_stm(&normalized_body, &mut_param_names);
 
     // BorrowMut elimination: walk the body (post mut-ref rewrites)
     // collecting `Assign(user_local, Var(borrow_mut_local))` linkage
@@ -1551,7 +1557,7 @@ pub fn exec_fn_theorems_to_ast<'a>(
     for decl in check.local_decls.iter() {
         if matches!(decl.kind, LocalDeclKind::BorrowMut) {
             let lean_name = crate::lean_name::LeanName::from_var_ident(&decl.ident);
-            let raw_name = sanitize(&decl.ident.0);
+            let raw_name = crate::mut_ref_normalize::mut_param_key(&decl.ident);
             initial_obl_ctx = add_pre_capture(initial_obl_ctx, &raw_name, &lean_name);
             initial_obl_ctx = add_body_shadow(initial_obl_ctx, lean_name);
         }
@@ -3846,7 +3852,7 @@ fn add_param_subst_entries<'a>(
         // &mut param?" the same way, so a future Verus-side change
         // updates both sites at once.
         if is_mut_ref_typ(&p.x.typ, p.x.is_mut) {
-            mut_param_names.insert(sanitize(&p.x.name.0));
+            mut_param_names.insert(crate::mut_ref_normalize::mut_param_key(&p.x.name));
             // Requires can mention `*old(p)` (rare but legal); the
             // rewrite turns it into <p>_at_pre_tactus. Key it too.
             req_value_subst.insert(
@@ -5508,8 +5514,9 @@ fn walk_let<'a>(
                         let b_name = crate::lean_name::LeanName::from_var_ident(&b.name);
                         let b_typed = crate::to_lean_sst_expr::sst_exp_to_typed(&b.a, &rctx)
                             .expect("walk_let binder rhs: sub of validated Exp tree");
-                        let b_trusted =
-                            crate::to_lean_sst_expr::sst_actual_is_trusted(&b.a, &rctx);
+                        // Trust bit rides the typed render (#6-2) —
+                        // no second walk.
+                        let b_trusted = b_typed.trusted;
                         let b_value = b_typed.into_slot(&b.a.typ);
                         chain_obl = chain_obl
                             .with_frame(CtxFrame::Let(b_name.clone(), b_value, Some(b.a.typ.clone())))
@@ -5540,7 +5547,8 @@ fn walk_let<'a>(
     let rctx = ctx.render_ctx().with_let_binder_typs(&obl.let_binder_typs);
     let val_typed = crate::to_lean_sst_expr::sst_exp_to_typed(val, &rctx)
         .expect("walk_let val: validated upstream via Wp::Let.value");
-    let trusted = crate::to_lean_sst_expr::sst_actual_is_trusted(val, &rctx);
+    // Trust bit rides the typed render (#6-2) — no second walk.
+    let trusted = val_typed.trusted;
     let coerced = val_typed.into_slot(dest_typ);
     let new_obl = obl
         .with_frame(CtxFrame::Let(name.clone(), coerced, Some(dest_typ.clone())))
@@ -7226,7 +7234,7 @@ fn extract_mut_target<'a>(
     // existential, and the body's linkage Assign is dropped — see
     // `collect_borrow_mut_links` / `is_borrow_mut_linkage_assign`.
     if let ExpX::Var(ident) = &e.x {
-        let san_name = sanitize(&ident.0);
+        let san_name = crate::mut_ref_normalize::mut_param_key(ident);
         if mut_ref_locals.contains(&san_name) {
             // Linkage lookup uses `borrow_mut_key` (disambig-aware,
             // matches what `collect_borrow_mut_links` inserts) so
@@ -7360,78 +7368,6 @@ fn build_call_mut_args<'a>(
     Ok(mut_args)
 }
 
-/// Does this loop-cond setup Stm mutate a USER-visible local — one
-/// whose name survives outside the condition evaluation? Returns the
-/// first offending (sanitized) name for the error message, or `None`
-/// for the pure shapes #114 accepts.
-///
-/// Verus-synthetic temps (`%`-containing idents — `expr_to_stm_opt`'s
-/// tmp% family, call-result dests, short-circuit temps, BorrowMut
-/// locals) are the EXPECTED pure-cond setup shape. Anything beyond
-/// that mutates enclosing state once per cond evaluation — a shape
-/// the loop encoding does not model: the BorrowMut elimination
-/// pre-passes (`collect_borrow_mut_links`) and `collect_modifications`
-/// walk only the loop BODY, so a cond-mutated local keeps its
-/// pre-loop value in maintain/exit reasoning. The 2026-07-25 audit
-/// probe (`while set_zero(&mut y) {}` then `y == 5` post-loop)
-/// VERIFIED a false ensures through exactly this gap — reject loudly
-/// instead. Two mutation channels are gated:
-///
-/// * `Assign` whose dest is a user-named local — the new-mut-ref
-///   BorrowMut linkage (`Assign(y, Var(tmp%))`) and any direct
-///   block-cond assignment (`while { y = y - 1; y > 0 }`).
-/// * `Call` args carrying an lvalue (`Loc(...)` / `VarLoc`) rooted at
-///   a user-named local — legacy-mode `&mut y` args (belt for shapes
-///   the legacy path doesn't already reject).
-///
-/// Rust identifiers can't contain `%`, so a `%`-free ident is
-/// user-named by construction; misclassification can only
-/// over-reject (safe). User `let`s inside a block cond also land
-/// here — over-rejection with a workaround message, accepted.
-/// The workaround preserves semantics exactly: `loop { let c = <cond>;
-/// if !c { break; } <body> }` routes the mutation through the BODY
-/// machinery, which handles it (the tested `&mut`-call path).
-fn cond_setup_user_mutation(stm: &Stm) -> Option<String> {
-    fn is_user_ident(v: &VarIdent) -> bool {
-        !v.0.contains('%')
-    }
-    /// Does this arg Exp carry an lvalue rooted at a user local?
-    fn exp_has_user_lvalue(e: &Exp) -> Option<String> {
-        match &e.x {
-            ExpX::VarLoc(v) if is_user_ident(v) => {
-                Some(crate::to_lean_type::sanitize(&v.0))
-            }
-            ExpX::Loc(inner) => exp_has_user_lvalue(inner),
-            ExpX::Unary(_, inner) | ExpX::UnaryOpr(_, inner) => exp_has_user_lvalue(inner),
-            _ => None,
-        }
-    }
-    match &stm.x {
-        StmX::Assign { lhs: Dest { dest, is_init: _ }, rhs: _ } => {
-            extract_simple_var_ident(dest)
-                .filter(|v| is_user_ident(v))
-                .map(|v| crate::to_lean_type::sanitize(&v.0))
-        }
-        StmX::Call { args, .. } => args.iter().find_map(exp_has_user_lvalue),
-        StmX::Block(ss) => ss.iter().find_map(cond_setup_user_mutation),
-        StmX::If(_, t, e) => cond_setup_user_mutation(t)
-            .or_else(|| e.as_ref().and_then(|s| cond_setup_user_mutation(s))),
-        StmX::Loop { body, .. } => cond_setup_user_mutation(body),
-        StmX::DeadEnd(s) | StmX::OpenInvariant(s) => cond_setup_user_mutation(s),
-        StmX::AssertQuery { body, .. } => cond_setup_user_mutation(body),
-        StmX::ClosureInner { body, .. } => cond_setup_user_mutation(body),
-        StmX::Assert(..)
-        | StmX::AssertBitVector { .. }
-        | StmX::AssertCompute(..)
-        | StmX::Assume(_)
-        | StmX::Fuel(..)
-        | StmX::RevealString(_)
-        | StmX::Return { .. }
-        | StmX::BreakOrContinue { .. }
-        | StmX::Air(_) => None,
-    }
-}
-
 /// Validate and build a `Wp::Loop`. Takes the destructured `StmX::Loop`
 /// fields directly (#104) — the wrong-variant case is unrepresentable
 /// because the function never sees a `Stm`. The explicit field
@@ -7502,90 +7438,81 @@ fn build_wp_loop<'a>(
     // has function calls, short-circuit `&&`/`||`, or other shapes
     // that need temporaries. The setup runs at every iteration
     // boundary (Verus's encoding mirrors this: it runs cond_setup in
-    // both the loop-body and outer SMT queries). We mirror Verus by
-    // walking cond_setup as a wp prefix in BOTH the body's Wp (under
-    // an `assume cond_exp` hyp via `Wp::Assume`) and the post-loop
-    // `after` Wp (under an `assume ¬cond_exp` hyp via `Wp::Hyp`).
-    // When this transform fires, we set `cond_exp_opt = None` so
-    // walk_loop doesn't push the cond hyp again — it's already
-    // inside the body's wrapped Wp.
+    // both the loop-body and outer SMT queries). Post-normalization
+    // (decision #2, `loop_normalize`), the iteration-side setup run
+    // lives INSIDE the loop body (setup + `if !c { break; }` guard);
+    // only the EXIT-side run — `setup; assume ¬cond` prefixing the
+    // post-loop continuation — is applied here, sourced from
+    // `original_cond`.
     //
     // The negated cond goes through `Wp::Hyp` (already-rendered
     // LExpr) rather than synthesizing a fresh SST `Exp` for ¬cond.
     // A synthesized Exp would need an `'a` lifetime that we can't
     // produce inside this fn (the input SST is the `'a` source).
-    // Using `LExpr::not(lower(cond_validated))` keeps everything on
-    // the borrow side: cond_validated borrows cond_exp, the negation
-    // happens at LExpr level (owned), no Arc clones.
     //
-    // Returns `(cond_exp_opt, cond_setup_wrap)`:
-    //   * `cond_exp_opt: Option<Validated>` — what walk_loop pushes
-    //     as the loop's cond hyp. `None` when the wrapper handles
-    //     it (so walk_loop doesn't push twice).
-    //   * `cond_setup_wrap: Option<(&Stm, Validated, LExpr)>` —
-    //     `Some` triggers the post-build wrap below.
-    // For Tactus #127: when `cond` is None but `original_cond` is Some,
-    // Verus's break-lowering converted the while loop to a `loop { if
-    // !c { break; } body }` shape. For Tactus's WP encoding we can
+    // For Tactus #127: when `cond` is None but `original_cond` is Some
+    // with an EMPTY setup, the break-lowering (Verus's, or ours in
+    // `loop_normalize` — same shape) converted a simple while. We
     // recover the cond:Some path: walk_loop pushes `c` in maintain
     // (under which the body's inserted if-not-c-break then-branch is
     // contradictorily unreachable, so its obligation discharges
     // vacuously) and pushes `¬c` in use_obl (recovering the natural-
-    // exit fact). Matches Verus's isolation=false semantics for
-    // post-loop reasoning.
+    // exit fact).
     //
-    // Soundness gates (refuse recovery, fall through to cond:None
-    // encoding — user must encode post-loop facts via
-    // `allow_complex_invariants` + loop `ensures`):
-    //   * **single-break check**: if the user body has its own breaks
-    //     alongside the inserted one, push `¬c` post-loop would be
-    //     unsound (user breaks may fire while `c` is still true).
+    // Soundness gates on using `original_cond` for EITHER recovery
+    // (empty setup) or the exit-fact wrap (non-empty setup):
+    //   * **single-break check**: the ¬c exit fact is sound only when
+    //     cond-failure is the loop's sole exit. Our normalizer's
+    //     input loops are break-free (Verus's cond:Some invariant),
+    //     so their transformed bodies have exactly the one
+    //     synthesized break; user bodies with their own breaks fail
+    //     this count and get no exit facts.
     //   * **unlabeled loop**: labeled loops would need cross-label
     //     break counting, deferred.
-    //   * **empty cond_setup**: non-empty setup (cond with calls /
-    //     short-circuits) would need scoping work for the temp
-    //     bindings.
+    let single_natural_exit = label.is_none()
+        && count_breaks_targeting_this_loop(body, None) == 1;
     let original_cond_recoverable = match original_cond {
         Some((orig_setup, _)) if cond.is_none() => {
-            label.is_none()
+            single_natural_exit
                 && matches!(&orig_setup.x, StmX::Block(ss) if ss.is_empty())
-                && count_breaks_targeting_this_loop(body, None) == 1
         }
         _ => false,
     };
     let effective_cond: &'a Option<(Stm, Exp)> =
         if original_cond_recoverable { original_cond } else { cond };
 
-    let (cond_exp_opt, cond_setup_wrap): (
+    let (cond_exp_opt, exit_wrap): (
         Option<Validated<'a>>,
-        Option<(&'a Stm, Validated<'a>, LExpr)>,
+        Option<(&'a Stm, LExpr)>,
     ) = match effective_cond {
-        None => (None, None),
+        None => match original_cond {
+            // Setup-carrying while, normalized to break form (ours or
+            // Verus's conversion): iteration semantics live in the
+            // body; wrap the post-loop continuation with the
+            // exit-side `setup; ¬cond` run when sound (see gates).
+            Some((cond_setup, cond_exp)) if single_natural_exit => {
+                let cond_validated =
+                    crate::to_lean_sst_expr::Validated::check(cond_exp)?;
+                let neg_cond_lexpr = LExpr::not(lower_validated(&cond_validated));
+                (None, Some((cond_setup, neg_cond_lexpr)))
+            }
+            _ => (None, None),
+        },
         Some((cond_setup, cond_exp)) => {
             let cond_validated = crate::to_lean_sst_expr::Validated::check(cond_exp)?;
             if matches!(&cond_setup.x, StmX::Block(ss) if ss.is_empty()) {
                 // Empty setup — fast path; walk_loop pushes cond hyp.
                 (Some(cond_validated), None)
             } else {
-                // Soundness gate (2026-07-25 audit): a cond setup
-                // that mutates a user local is NOT modeled — see
-                // `cond_setup_user_mutation`'s doc for the probe that
-                // verified a false ensures through this gap.
-                if let Some(name) = cond_setup_user_mutation(cond_setup) {
-                    return Err(format!(
-                        "loop condition mutates `{}` (a `&mut {}` call or an \
-                         assignment inside the condition) — not supported: the \
-                         loop encoding would lose the mutation. Hoist the \
-                         condition into the body instead: `loop {{ let c = \
-                         <cond>; if !c {{ break; }} <body> }}`",
-                        name, name,
-                    ));
-                }
-                // Render ¬cond at LExpr level (no synthesised SST
-                // Exp needed). The wrapper below uses Wp::Assume for
-                // cond and Wp::Hyp for ¬cond around the body/after.
-                let neg_cond_lexpr = LExpr::not(lower_validated(&cond_validated));
-                (None, Some((cond_setup, cond_validated, neg_cond_lexpr)))
+                // `loop_normalize::normalize_setup_loops` converts
+                // every setup-carrying cond:Some loop before build_wp
+                // runs — reaching here means the pre-pass was skipped
+                // or a new path feeds build_wp unnormalized SST.
+                return Err(
+                    "internal: setup-carrying while loop reached build_wp_loop \
+                     un-normalized — normalize_setup_loops must run on the body \
+                     first (loop_normalize.rs)".to_string()
+                );
             }
         }
     };
@@ -7727,29 +7654,20 @@ fn build_wp_loop<'a>(
     let inner_stack = LoopStack::Cons(&inner_loop_ctx, outer_loop_stack);
     let body_wp = build_wp(body, Wp::Done(continue_leaf), ctx, &inner_stack)?;
 
-    // Apply the non-empty cond_setup transform if needed (#114).
-    // Wraps body_wp with `cond_setup; assume cond_exp; ...` and the
-    // post-loop `after` with `cond_setup; assume ¬cond_exp; ...`.
-    // Mirrors Verus's two-query encoding (sst_to_air.rs:2789-2797 +
-    // 2730-2737): cond_setup runs at every iteration boundary AND at
-    // loop exit. Setup obligations (e.g., precondition checks for
-    // calls inside the cond) emit twice — correct per Verus.
-    let (body_wp, after) = match cond_setup_wrap {
-        None => (body_wp, after),
-        Some((cond_setup, cond_validated, neg_cond_lexpr)) => {
-            // Body: assume cond_exp via Wp::Assume (cond_validated
-            // borrows the SST's cond_exp). After: assume ¬cond via
-            // Wp::Hyp (carries the pre-rendered LExpr, no
-            // synthesised SST Exp).
-            let body_with_assume = Wp::Assume(cond_validated, Box::new(body_wp));
-            let body_wp_full = build_wp(
-                cond_setup, body_with_assume, ctx, &inner_stack,
-            )?;
+    // Exit-side cond run (#114, narrowed by decision #2): wrap the
+    // post-loop `after` with `cond_setup; assume ¬cond_exp; ...`,
+    // mirroring the exit half of Verus's two-query encoding
+    // (sst_to_air.rs:2730-2737). The ITERATION-side run needs no wrap
+    // anymore — `loop_normalize` moved setup + the `if !c { break; }`
+    // guard into the loop body, so the body Wp built above already
+    // contains it (and every body walker saw it). Setup obligations
+    // (e.g., precondition checks for calls inside the cond) emit for
+    // both runs — correct per Verus.
+    let after = match exit_wrap {
+        None => after,
+        Some((cond_setup, neg_cond_lexpr)) => {
             let after_with_hyp = Wp::Hyp { hyp: neg_cond_lexpr, body: Box::new(after) };
-            let after_wp_full = build_wp(
-                cond_setup, after_with_hyp, ctx, outer_loop_stack,
-            )?;
-            (body_wp_full, after_wp_full)
+            build_wp(cond_setup, after_with_hyp, ctx, outer_loop_stack)?
         }
     };
 

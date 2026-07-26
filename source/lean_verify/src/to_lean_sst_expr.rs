@@ -72,11 +72,9 @@ pub(crate) fn sst_exp_to_typed(
     exp_to_typed(e, ctx)
 }
 
-/// Public face of [`actual_is_trusted`] for the WP walker (P2): will
-/// this expression's actual typ come from a D3-trusted source?
-pub(crate) fn sst_actual_is_trusted(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> bool {
-    actual_is_trusted(e, ctx)
-}
+// The former `sst_actual_is_trusted(e, ctx)` public wrapper is gone:
+// the walker reads `.trusted` off the `sst_exp_to_typed` result it
+// already holds (one walk, one source of truth).
 
 /// A reference to an SST expression that has been validated (via
 /// [`sst_exp_to_ast_checked`]) and is therefore safe to lower to
@@ -112,6 +110,26 @@ pub struct Validated<'a> {
 impl<'a> Validated<'a> {
     /// Run validation by attempting `sst_exp_to_ast_checked`. Returns
     /// a witness on success, or the validation error on failure.
+    ///
+    /// ## The ctx-free-Err contract
+    ///
+    /// Validation runs with an EMPTY [`RenderCtx`], but the eventual
+    /// [`lower_with_ctx`] renders with a per-obligation ctx that does
+    /// not even exist yet at check time (the walker builds it from
+    /// obligation-local state). The witness therefore only certifies
+    /// ctx-free renderability — soundness of the pair rests on the
+    /// contract that **a `RenderCtx` influences rendering CHOICES
+    /// (routing, typing, coercions), never Err-ness**. All ctx reads
+    /// (`fn_map` routing, `binder_typs` / `let_binder` / `lookup_subst`
+    /// lookups, `fn_ret_typ` / `fn_param_typs`) are `Option`-shaped
+    /// with a fallback rendering — none introduces an `Err` path.
+    /// When adding an arm or a ctx field, keep every `Err` condition
+    /// derivable from the `Exp` alone; a ctx-dependent `Err` would
+    /// make [`lower_with_ctx`]'s panic reachable. Pinned by
+    /// `validated_empty_check_lowers_with_rich_ctx`.
+    /// (Carrying the render ctx inside `Validated` — the cleaner
+    /// design — needs the per-obligation ctxs to exist at build_wp
+    /// time; see decision #6-3, 2026-07-26.)
     pub fn check(e: &'a Exp) -> Result<Self, String> {
         sst_exp_to_ast_checked(e)?;
         Ok(Validated { inner: e })
@@ -144,12 +162,11 @@ pub fn lower(v: &Validated<'_>) -> LExpr {
 /// available.
 pub fn lower_with_ctx(v: &Validated<'_>, ctx: &crate::expr_shared::RenderCtx) -> LExpr {
     sst_exp_to_ast_checked_with_ctx(v.inner, ctx).unwrap_or_else(|reason| panic!(
-        // Reachable only if `Validated::check` has a bug where it
-        // accepted an Exp that fails validation on the second pass.
-        // sst_exp_to_ast_checked is deterministic, so this is
-        // structurally unreachable — but keep the message useful for
-        // the impossible case.
-        "Validated::lower: invariant violated — {}",
+        // Reachable only via a violation of the ctx-free-Err contract
+        // (see `Validated::check`): validation passed with the empty
+        // ctx, so a failure here means some arm's Err condition
+        // became ctx-DEPENDENT — fix the arm, not this panic.
+        "Validated::lower: ctx-free-Err contract violated — {}",
         reason
     ))
 }
@@ -566,50 +583,12 @@ fn tuple_slot_typ(base_typ: &Typ, field_opr: &FieldOpr) -> Option<Typ> {
     args.get(idx).cloned()
 }
 
-/// Will `exp_to_typed(e)`'s actual typ come from a TRUSTED source —
-/// one that describes the rendered Lean value definitionally — rather
-/// than from the claimed-typ default? Trusted sources: a binder lookup
-/// (the Lean binder's declared type IS the value's type), a render-time
-/// substitution (bridged to claimed by construction), the tuple-slot
-/// rule (the projection's Lean type is the slot's type), and Clip (the
-/// arm coerces to its range definitionally). Claimed typs at arbitrary
-/// nodes are NOT trusted — VIR's poly-boxing lies at some Var uses
-/// (see the Box/Unbox arm of `exp_to_typed`). Mirrors `exp_to_typed`'s
-/// arm structure; keep the two in sync.
-fn actual_is_trusted(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> bool {
-    match &e.x {
-        ExpX::Var(v) | ExpX::VarLoc(v) | ExpX::VarAt(v, _) => {
-            let lean_name = crate::lean_name::LeanName::from_var_ident(v);
-            ctx.binder_typs.is_some_and(|b| b.contains_key(v))
-                // Let-bound locals carry their own per-entry trust bit
-                // (P2): trusted iff the RHS's actual typ was trusted
-                // when the walker recorded the binding.
-                || ctx.let_binder(&lean_name).is_some_and(|(_, trusted)| *trusted)
-                || ctx.lookup_subst(&lean_name, &e.typ).is_some()
-        }
-        // Plain/recursive spec-fn calls (B5a): the migrated Call path
-        // reports the declared-instantiated ret typ — ground truth by
-        // construction — so Box/Unbox must NOT reset it to a claim
-        // (poly wraps inlined receivers in Box/Unbox; without this,
-        // the reset silently undoes the Call migration in exactly the
-        // failing shapes). `plain_spec_call` is the same gate the
-        // render path uses; class-dispatch/internal calls fall out as
-        // None → untrusted (claim-typed), matching their render.
-        ExpX::Call(..) => plain_spec_call(e, ctx)
-            .is_some_and(|(fun, _)| ctx.fn_map.is_some_and(|m| m.contains_key(fun))),
-        ExpX::Unary(UnaryOp::CoerceMode { .. }, inner)
-        | ExpX::Unary(UnaryOp::Trigger(_), inner)
-        | ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner)
-        | ExpX::WithTriggers(_, inner)
-        | ExpX::Loc(inner) => actual_is_trusted(inner, ctx),
-        // Tuple projections report the slot typ (truthful); non-tuple
-        // Field actuals are the claimed typ (not trusted, but the
-        // reset is an identity there anyway).
-        ExpX::UnaryOpr(UnaryOpr::Field(fo), _) => matches!(fo.datatype, Dt::Tuple(_)),
-        ExpX::Unary(UnaryOp::Clip { .. }, _) => true,
-        _ => false,
-    }
-}
+// `actual_is_trusted` — the separate trust walk that hand-mirrored
+// `exp_to_typed`'s arm structure ("keep the two in sync") — was folded
+// INTO `exp_to_typed` as `TypedExpr::trusted`, computed per arm
+// alongside the render (2026-07-26, decision #6-2). Consumers read the
+// bit off the TypedExpr they already hold; the Box/Unbox arm reads the
+// child's bit directly instead of re-walking the subtree.
 
 /// Typed rendering spine (P1, DESIGN-typed-renderer.md). Returns the
 /// rendered expression TOGETHER with its actual Lean-level typ — which
@@ -733,11 +712,16 @@ pub(crate) fn exp_to_typed(
     // `plain_spec_call` is the shared gate with actual_is_trusted.
     if let Some((fun, typs)) = plain_spec_call(e, ctx) {
         b5_census(fun, typs, &e.typ, ctx);
-        let actual = ctx.fn_ret_typ(fun, typs).unwrap_or_else(|| e.typ.clone());
+        // Declared-instantiated ret typ = ground truth by construction
+        // → trusted; callee absent from fn_map → claim, untrusted.
+        let (actual, trusted) = match ctx.fn_ret_typ(fun, typs) {
+            Some(t) => (t, true),
+            None => (e.typ.clone(), false),
+        };
         return Ok(TypedExpr::from_untyped(
             LExpr::new(exp_to_node_checked(e, ctx)?),
             actual,
-        ));
+        ).with_trust(trusted));
     }
     Ok(match &e.x {
         ExpX::Var(ident) | ExpX::VarLoc(ident) | ExpX::VarAt(ident, _) => {
@@ -747,21 +731,29 @@ pub(crate) fn exp_to_typed(
             // actual == claimed by construction.
             let lean_name = crate::lean_name::LeanName::from_var_ident(ident);
             if let Some(bridged) = ctx.lookup_subst(&lean_name, &e.typ) {
-                return Ok(TypedExpr::from_untyped(bridged, e.typ.clone()));
+                // Bridged to the claimed typ by construction → trusted.
+                return Ok(TypedExpr::from_untyped(bridged, e.typ.clone()).with_trust(true));
             }
             // Plain var: the rendered Lean value is the binder itself,
             // so the actual typ is the binder's DECLARED typ (the SST
             // may wrap the read in transparent Unbox/CoerceMode that
             // shift the claimed typ; the render doesn't). Params come
-            // from `binder_typs`; let-bound locals from the walker's
-            // `let_binder_typs` env (P2).
-            let actual = ctx
-                .binder_typs
-                .and_then(|b| b.get(ident))
-                .cloned()
-                .or_else(|| ctx.let_binder(&lean_name).map(|(t, _)| t.clone()))
-                .unwrap_or_else(|| e.typ.clone());
-            TypedExpr::var(lean_name, actual)
+            // from `binder_typs` (declared = definitional → trusted);
+            // let-bound locals from the walker's `let_binder_typs` env
+            // (P2), carrying their own per-entry trust bit; the claim
+            // fallback is untrusted.
+            let (actual, trusted) = if let Some(t) =
+                ctx.binder_typs.and_then(|b| b.get(ident)).cloned()
+            {
+                (t, true)
+            } else if let Some((t, tr)) =
+                ctx.let_binder(&lean_name).map(|(t, tr)| (t.clone(), *tr))
+            {
+                (t, tr)
+            } else {
+                (e.typ.clone(), false)
+            };
+            TypedExpr::var(lean_name, actual).with_trust(trusted)
         }
         // Transparent wrappers that DON'T shift the typ (mode/trigger
         // markers): no Lean code — the value's actual typ flows
@@ -785,7 +777,8 @@ pub(crate) fn exp_to_typed(
         // lifts this.
         ExpX::UnaryOpr(UnaryOpr::Box(_) | UnaryOpr::Unbox(_), inner) => {
             let child = exp_to_typed(inner, ctx)?;
-            if actual_is_trusted(inner, ctx) {
+            // The child's own trust bit — no re-walk (#6-2).
+            if child.trusted {
                 child
             } else {
                 TypedExpr::from_untyped(child.into_untyped(), e.typ.clone())
@@ -808,11 +801,19 @@ pub(crate) fn exp_to_typed(
         ExpX::UnaryOpr(UnaryOpr::Field(field_opr), inner) => {
             let base = exp_to_typed(inner, ctx)?;
             let n = count_ref_decorations(base.typ());
-            let actual =
-                tuple_slot_typ(base.typ(), field_opr).unwrap_or_else(|| e.typ.clone());
+            // Tuple slot typ = truthful (the projection's Lean type IS
+            // the slot's) → trusted. Non-tuple / degenerate tuple
+            // shapes report the claim, untrusted. (The old mirror
+            // trusted every Dt::Tuple even when the slot lookup
+            // failed; slot.is_some() is the tighter, safe-direction
+            // condition — the degenerate case is unreachable from
+            // real tuples.)
+            let slot = tuple_slot_typ(base.typ(), field_opr);
+            let trusted = slot.is_some();
+            let actual = slot.unwrap_or_else(|| e.typ.clone());
             let projected =
                 field_proj_opr(apply_deref_chain(base.into_untyped(), n), field_opr);
-            TypedExpr::from_untyped(projected, actual)
+            TypedExpr::from_untyped(projected, actual).with_trust(trusted)
         }
         // `IsVariant` from match-desugared patterns. A tuple has
         // exactly one "variant" — its test is vacuously true (the
@@ -1085,10 +1086,15 @@ fn exp_to_node_checked(e: &Exp, ctx: &crate::expr_shared::RenderCtx) -> Result<E
                 vec![sst_exp_to_ast_checked_with_ctx(inner, ctx)?],
             ).node
         }
-        // Remaining UnaryOprs (CustomErr, ProofNote — diagnostic
-        // wrappers) are transparent. ToDyn also lands here today,
-        // matching the VIR-AST path's passthrough.
-        ExpX::UnaryOpr(_, inner) => exp_to_node_checked(inner, ctx)?,
+        // Diagnostic wrappers: transparent.
+        ExpX::UnaryOpr(UnaryOpr::CustomErr(_) | UnaryOpr::ProofNote(_), inner) => {
+            exp_to_node_checked(inner, ctx)?
+        }
+        // ToDyn: passthrough preserved verbatim (untested — see the
+        // to_lean_expr twin's note). This match is now EXHAUSTIVE:
+        // an upstream UnaryOpr addition is a compile error here, not
+        // a silent passthrough (decision #4, 2026-07-26).
+        ExpX::UnaryOpr(UnaryOpr::ToDyn(_), inner) => exp_to_node_checked(inner, ctx)?,
 
         ExpX::Binary(op, lhs, rhs) => {
             // HeightCompare: `is_smaller_than(lhs, rhs)` for decreases-
@@ -2055,5 +2061,51 @@ mod tests {
         assert_eq!(pp(IntegerTypeBoundKind::SignedMin, 1), "(-1)");
         assert_eq!(pp(IntegerTypeBoundKind::SignedMin, 8), "(-128)");
         assert_eq!(two_pow_str(128), "340282366920938463463374607431768211456");
+    }
+}
+
+#[cfg(test)]
+mod validated_ctx_tests {
+    //! Pin for the ctx-free-Err contract (decision #6-3, 2026-07-26):
+    //! `Validated::check` validates with the EMPTY RenderCtx while
+    //! `lower_with_ctx` renders with a rich per-obligation ctx built
+    //! later — sound only while ctx influences rendering choices,
+    //! never Err-ness. Exercise a ctx-SENSITIVE shape (a binder-typed
+    //! Var under Unbox, where the rich ctx changes the actual-typ
+    //! decision) through check(empty) → lower_with_ctx(rich).
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use vir::ast::{TypDecoration, VarIdentDisambiguate};
+
+    fn mk_exp(x: ExpX, typ: Typ) -> Exp {
+        Arc::new(vir::ast::SpannedTyped { span: vir::messages::Span::dummy(), typ, x })
+    }
+    fn tvar(name: &str) -> VarIdent {
+        VarIdent(Arc::new(name.to_string()), VarIdentDisambiguate::AirLocal)
+    }
+
+    #[test]
+    fn validated_empty_check_lowers_with_rich_ctx() {
+        let t_u8: Typ = Arc::new(TypX::Int(IntRange::U(8)));
+        let t_ref_u8: Typ = Arc::new(TypX::Decorate(TypDecoration::Ref, None, t_u8.clone()));
+        // `Unbox(Var p) : u8` where the binder map declares `p : &u8`
+        // — with the rich ctx the Var arm reports the binder typ
+        // (trusted) and the Unbox arm keeps it; with the empty ctx it
+        // resets to the claim. Both must RENDER (never Err/panic).
+        let v = mk_exp(ExpX::Var(tvar("p")), t_ref_u8.clone());
+        let e = mk_exp(
+            ExpX::UnaryOpr(UnaryOpr::Unbox(t_u8.clone()), v),
+            t_u8.clone(),
+        );
+        let validated = Validated::check(&e).expect("shape is renderable ctx-free");
+        // Empty ctx (the exact conditions check ran under).
+        let _ = lower(&validated);
+        // Rich ctx: binder map present — different routing/typing
+        // decisions, same Err-free guarantee.
+        let mut binders: HashMap<VarIdent, Typ> = HashMap::new();
+        binders.insert(tvar("p"), t_ref_u8);
+        let rich = crate::expr_shared::RenderCtx::empty().with_binder_typs(&binders);
+        let _ = lower_with_ctx(&validated, &rich); // must not panic
     }
 }

@@ -8513,16 +8513,16 @@ test_verify_one_file_with_options! {
     }
 }
 
-// AUDIT SOUNDNESS PIN (2026-07-25): before the
-// `cond_setup_user_mutation` gate, this VERIFIED its blatantly false
-// ensures — the cond call zeroes `y` on the way out of the loop, but
-// the BorrowMut pre-passes and `collect_modifications` walk only the
-// loop BODY, so post-loop reasoning kept `y` at its pre-loop value
-// (`r == 5` proved; reality `r == 0`). The gate now rejects
-// user-local mutation inside a loop condition with a hoist-into-body
-// workaround message. If loop-cond mutation support ever lands, this
-// test must flip to a genuine verification failure of the false
-// ensures — never Ok.
+// AUDIT SOUNDNESS PIN (2026-07-25, upgraded 2026-07-26): before the
+// fix, this VERIFIED its blatantly false ensures — the cond call
+// zeroes `y` on the way out of the loop, but the cond-slot setup Stm
+// was invisible to the BorrowMut pre-passes and
+// `collect_modifications` (body-only walkers), so post-loop reasoning
+// kept `y` at its pre-loop value (`r == 5` proved; reality `r == 0`).
+// `loop_normalize::normalize_setup_loops` now rewrites the loop to
+// break form (setup + guard INSIDE the body — every walker sees the
+// mutation), so the false ensures fails as a GENUINE verification
+// failure. Never Ok.
 test_verify_one_file_with_options! {
     #[test] audit_probe_while_cond_mutation_unsound ["new-mut-ref"] => verus_code! {
         #[verifier::deprecated_postcondition_mut_ref_style(true)]
@@ -8551,6 +8551,37 @@ test_verify_one_file_with_options! {
                 || s.contains("postcondition"),
             "false ensures must NOT verify (soundness); got: {}", s);
     }
+}
+
+// Positive twin of the soundness pin (decision #2, 2026-07-26): the
+// same mutating while-cond shape with the TRUE ensures verifies.
+// `loop_normalize` puts the cond call inside the body (so the
+// BorrowMut machinery rebinds `y` each iteration) and the exit-side
+// wrap gives `¬r` + the callee ensures post-loop: `r == (*x > 0)`
+// false and `y ≤ 255` ⇒ `y == 0`.
+test_verify_one_file_with_options! {
+    #[test] test_exec_while_cond_mut_call_verifies ["new-mut-ref"] => verus_code! {
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn halve(x: &mut u8) -> (r: bool)
+            ensures *x == *old(x) / 2, r == (*x > 0)
+        {
+            *x = *x / 2;
+            *x > 0
+        }
+
+        #[verifier::tactus_auto]
+        #[verifier::deprecated_postcondition_mut_ref_style(true)]
+        fn drain() -> (r: u8)
+            ensures r == 0
+        {
+            let mut y: u8 = 200;
+            while halve(&mut y)
+                decreases y
+            {
+            }
+            y
+        }
+    } => Ok(())
 }
 
 // AUDIT FIX PIN (2026-07-25): a `&u8` param carries its refinement
@@ -9120,15 +9151,13 @@ test_verify_one_file! {
     } => Ok(())
 }
 
-// #127 soundness gate (non-empty cond_setup, natural-exit needed):
-// pins that the non-empty-cond-setup gate prevents recovery. Like
-// the labeled-loop case, fn would verify under empty cond_setup
-// (see test_exec_loop_isolation_false_natural_exit); using a fn call
-// for cond produces non-empty setup, recovery falls through, and
-// post-loop `i == n` is unavailable.
-//
-// If the cond_setup gate is ever lifted (scoping work for temp
-// bindings implemented), this test flips Err → Ok.
+// #127 → decision #2 (2026-07-26): FLIPPED Err → Ok, exactly as the
+// original pin predicted ("if the cond_setup gate is ever lifted").
+// `loop_normalize::normalize_setup_loops` moves the call-cond setup
+// into the loop body (break form) and `build_wp_loop` wraps the
+// post-loop continuation with the exit-side `setup; ¬cond` run — so
+// `¬is_below(i, n)` plus the callee ensures `r == (i < n)` plus the
+// invariant `i <= n` gives the post-loop `i == n`.
 test_verify_one_file! {
     #[test] test_exec_loop_isolation_false_complex_cond_natural_exit_falls_through verus_code! {
         fn is_below(i: u8, n: u8) -> (r: bool)
@@ -9150,7 +9179,7 @@ test_verify_one_file! {
             }
             i
         }
-    } => Err(_)
+    } => Ok(())
 }
 
 // #127 probe: `continue` in the body doesn't count as a break.

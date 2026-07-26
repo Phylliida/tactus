@@ -91,39 +91,35 @@ impl<'a, 'e> Synth<'a, 'e> {
         self.env.iter().rev().find(|(n, _)| n == name).map(|(_, r)| r)
     }
 
-    /// pp with `Inline` let-names substituted by their (parenthesized)
-    /// values, transitively — used for `by_cases`/`if` condition text
-    /// and spec-fn value arguments, where let names from the def body
-    /// are not in scope in the lemma.
+    /// pp with `Inline` let-names substituted by their values,
+    /// transitively — used for `by_cases`/`if` condition text and
+    /// spec-fn value arguments, where let names from the def body are
+    /// not in scope in the lemma.
+    ///
+    /// Substitution happens at the AST level (`script::subst_var`),
+    /// in a SINGLE innermost-first pass: `env` is in binding order
+    /// (the Let walk pushes outer lets first), values reference only
+    /// EARLIER lets, so processing in reverse order is complete —
+    /// nothing can reintroduce a processed name. No fixpoint, no
+    /// iteration cap. Precedence-correct parenthesization comes from
+    /// the pp itself instead of blanket-wrapping every value.
+    ///
+    /// SELF-referential values (`let x := x.deref` shadows) are
+    /// skipped — the `x` inside denotes the OUTER binder, which
+    /// name-keyed substitution cannot distinguish; the unexpanded
+    /// name then fails Lean elaboration and is censused (the honest
+    /// failure mode this module promises, never a hang or capture).
     fn subst_pp(&self, e: &Expr) -> String {
-        let mut t = crate::lean_pp::pp_expr(e);
-        // Fixpoint: values may reference earlier lets. BOUNDED — a
-        // self-referential value (a shadowing `let x := x.deref` /
-        // `let x := x + 1`) reintroduces its own name on every round
-        // and the textual fixpoint never converges; without the cap
-        // this loop hangs with unbounded string growth. Each round
-        // substitutes every inline let once, so `env.len() + 1`
-        // rounds suffice for any non-shadowing chain (values only
-        // reference EARLIER lets). On cap-out we return the partial
-        // text: the leftover name is unbound in the lemma, Lean
-        // elaboration fails, and the driver censuses it — the honest
-        // failure mode this module promises (never a hang).
-        for _ in 0..=self.env.len() {
-            let mut changed = false;
-            for (n, r) in self.env.iter().rev() {
-                if let Res::Inline(v) = r {
-                    if crate::link_discharge::referenced(n, &t) {
-                        let vp = format!("({})", crate::lean_pp::pp_expr(v));
-                        t = crate::link_discharge::replace_word(&t, n, &vp);
-                        changed = true;
-                    }
+        let mut out = e.clone();
+        for (n, r) in self.env.iter().rev() {
+            if let Res::Inline(v) = r {
+                if crate::script::expr_mentions_var(v, n) {
+                    continue;
                 }
-            }
-            if !changed {
-                break;
+                out = crate::script::subst_var(&out, n, v);
             }
         }
-        t
+        crate::lean_pp::pp_expr(&out)
     }
 
     /// A proof of the BOUND conjunct for `e` — named hypotheses when
@@ -564,11 +560,12 @@ mod tests {
     }
 
     /// A shadowing inline value (`let x := x + 1`) reintroduces its
-    /// own name on every substitution round — the textual fixpoint
-    /// can never converge. Before the audit fix this looped forever
-    /// with unbounded string growth; now the bound caps it and the
-    /// partial text fails downstream at Lean elaboration (the
-    /// module's honest-failure contract: Err/census, never a hang).
+    /// own name — a shadowing value whose inner `x` denotes the OUTER
+    /// binder. Name-keyed substitution cannot distinguish the two, so
+    /// the entry is SKIPPED (expanding would capture; the original
+    /// textual fixpoint looped forever on this shape). The unexpanded
+    /// name fails Lean elaboration downstream and is censused — the
+    /// module's honest-failure contract: Err/census, never a hang.
     #[test]
     fn subst_pp_self_referential_shadow_terminates() {
         let dts = HashMap::new();
@@ -584,9 +581,10 @@ mod tests {
             fresh: 0,
             recursive: false,
         };
-        // Must return (bounded), not hang.
+        // Must return promptly (no fixpoint) with the shadowing
+        // entry skipped: `x` stays unexpanded.
         let out = s.subst_pp(&Expr::var_synthetic("x"));
-        assert!(out.contains('1'), "at least one substitution round ran: {}", out);
+        assert_eq!(out, "x", "self-referential entry is skipped, not expanded");
     }
 
     /// Well-behaved chains (values referencing EARLIER lets only)
