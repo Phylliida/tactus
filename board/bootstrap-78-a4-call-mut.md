@@ -387,10 +387,55 @@ row in the gate report updates automatically (tags are data-driven).
        class, now with a leading sub-mode. Link discharge 172/0 must
        hold after.
      This + A7 closes fill_zeros; A7 alone closes vec_push7.
-4. **S4 kills** (D5, adapt subjects: call_inc is the closing cert —
-   rebind-drop / mut_post-binder-drop / ens-hyp-drop / single-site
-   counter rename against call_inc; vec_push7 kills fold into A7) +
-   battery.
+4. **S4 kills — DONE 2026-07-26 (`c8c703f`).** probe13 → 15 classes:
+   five kills on call_inc (mut_post_binder_drop / mut_bound_hyp_drop /
+   mut_ens_hyp_drop / mut_rebind_drop / mut_gensym_rename single-site
+   counter divergence), shared `_drop_frame_node` splicer; all
+   baselines 1 + kills 0 first run. vec_push7 kills fold into A7.
+
+   **REVIEW ROUND (Danielle-prompted "what are you not confident
+   in?", 2026-07-26 — the S1-review tradition pays again):**
+   * **Two-mut-arg calls PINNED** (was: written but zero subjects):
+     fixture F14c `swap_incr(a: &mut u64, b: &mut u64)` +
+     `call_swap_incr` — both CLOSE (per-arg FBind+FHyp interleave in
+     param order, both rebinds after the ens, three gensyms in one
+     counter advance, cross-check 0 drift). certified 38/41.
+   * **Forced-state branch leak FOUND + GUARDED** (pre-S3 class,
+     widened by S3): a branch tripping a wrap-forcer (mut-call
+     rebind now; field-assign LetRaw since b74; poison) leaks
+     classification state across branch boundaries — the join
+     desugar serializes the shared continuation under THEN-state
+     (other path's copy wrong), and the frozen If arm restores
+     pre-If state while production's surviving fall-through path
+     carries the branch's frames. Both were undiagnosed-CLOSE-BROKE
+     risks; now sharp tags `branch-forced-state-join` /
+     `branch-forced-state-leak` (population 0; diverging branches
+     exempt at the frozen arm). LONG FIX (carded): serialize the
+     continuation PER-BRANCH at the join — each copy gets its own
+     state AND its own gensym ids (matching production's after-clone
+     double walk), which retires `call-in-branch-join` too;
+     byte-stable for state-identical copies since interning is
+     idempotent and restore_branch resets bound_names between
+     copies. Blocked-by nothing; fresh-slice-sized.
+   * **Known-unpinned residue (documented, tags cover):**
+     `call-mut-renamed-local` (rebind target under an active shadow
+     rename — fires honestly on e.g. a colliding re-assign before a
+     mut call in a join continuation); the broader MIXED-RENAME
+     class (serializer rename_env is walk-global while production
+     renames per-goal at hoist time — a colliding re-assign followed
+     by a wrap-forcer in the same fn renders later leaves renamed on
+     the cert side, source-named in production's wrap goals;
+     pre-existing, bridge-red-honest, no corpus population).
+   * **Mirrored-not-fixed production quirk:** Phase-1 bound predicate
+     runs on the UNSUBSTITUTED param typ — a generic `&mut T` callee
+     instantiated at u64 gets NO bound hyp on the existential
+     (sound, incomplete; both sides agree so the bridge closes).
+     Production improvement candidate, sequenced with A7.
+   * **Open question (pre-existing, unexamined):** production's
+     `push_mod_var_frames` drops prior HYP frames that MENTION a
+     modified var; refWp's havoc can't (leaves are opaque ids). The
+     soundness fix widens exposure (more mod vars). Honest-red
+     class; needs a census or a probe when a subject appears.
 5. **S5 tgt copy_word** — scoped `--verify-module runtime
    --tactus-emit-cert` cert regen + close (probe38-style runner; NOT
    the full tgt gate — dropped per Danielle, and don't stack heavy

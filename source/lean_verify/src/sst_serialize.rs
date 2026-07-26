@@ -2830,13 +2830,32 @@ impl<'a> Serializer<'a> {
                 let ncn = cn;
                 self.hyp_ordinal = save + 1;
                 let t = self.stm(then_stm)?;
+                let then_forced = (self.flet_forced, self.poison_forced);
                 self.restore_branch(bstate.clone());
                 self.hyp_ordinal = save + 1;
                 let e = match else_stm {
                     Some(s) => self.stm(s)?,
                     None => self.skip(),
                 };
-                self.restore_branch(bstate);
+                let else_forced = (self.flet_forced, self.poison_forced);
+                self.restore_branch(bstate.clone());
+                // Forced-state leak (bootstrap-78 review): a FALL-THROUGH
+                // branch that trips a wrap-forcer (mut-call rebind,
+                // field-assign LetRaw, poison) leaks its classification
+                // state into everything serialized AFTER this If (the
+                // outer block's continuation, the fn's Ret) — production
+                // renders the surviving path under that branch's frames
+                // while the serializer restored to pre-If state.
+                // Undiagnosed CLOSE-BROKE without the tag; population 0
+                // (diverging branches are exempt — nothing survives
+                // them). Sharp reject until a subject pins the modeling.
+                let base_forced = (bstate.2, bstate.3);
+                if (!stm_diverges(then_stm) && then_forced != base_forced)
+                    || (else_stm.as_ref().map_or(false, |s| !stm_diverges(s))
+                        && else_forced != base_forced)
+                {
+                    return Err("branch-forced-state-leak".to_string());
+                }
                 // After: the two-way join is the documented unmodeled
                 // case (counter restores to the pre-If value). The
                 // FALL-THROUGH case (`frame_after` forwards the ¬cond
@@ -3294,6 +3313,10 @@ impl<'a> Serializer<'a> {
                         (self.predicted_theorem_ids.len() - cont_preds_before) as u64;
                     let cont_ords = self.emit_ordinal - cont_ord_before;
                     let t = format!("({}.StmData.Seq {} {})", NS, box_(&then_body), box_(&rest));
+                    // Captured BEFORE the restore below wipes it — the
+                    // forced-state-leak guard reads both branches' end
+                    // states (bootstrap-78 review).
+                    let then_forced = (self.flet_forced, self.poison_forced);
                     self.restore_branch(bstate.clone());
                     self.hyp_ordinal = save + 1;
                     let else_body = match else_stm {
@@ -3307,6 +3330,21 @@ impl<'a> Serializer<'a> {
                     // (P2; corpus population 0).
                     if cont_ords != cont_thms {
                         return Err("call-in-branch-join".to_string());
+                    }
+                    // Forced-state leak (bootstrap-78 review): a branch
+                    // that trips a wrap-forcer (mut-call rebind, field-
+                    // assign LetRaw, poison) changes how the SHARED
+                    // continuation term's lets/hyps classify — the term
+                    // was serialized once under THEN-state, so the other
+                    // path's copy is wrong (production renders each path
+                    // under its own frames). Undiagnosed CLOSE-BROKE
+                    // without this tag; population 0 today. The long fix
+                    // is per-branch continuation serialization (which
+                    // would also retire call-in-branch-join) — card §3.
+                    if then_forced != (bstate.2, bstate.3)
+                        || (self.flet_forced, self.poison_forced) != (bstate.2, bstate.3)
+                    {
+                        return Err("branch-forced-state-join".to_string());
                     }
                     self.consume_theorem_ids(cont_thms);
                     let e = format!("({}.StmData.Seq {} {})", NS, box_(&else_body), box_(&rest));
