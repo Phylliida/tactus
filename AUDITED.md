@@ -90,10 +90,18 @@ via the same function so both lanes stay coherent. Pinned by
 - Ghost-mutation loop probe (`proof { g = 0; }` in a body) fails in the sound
   direction but with several in-body obligation errors that look like
   incompleteness noise — worth a look separately.
-- Bootstrap fixture: cert-bearing fns whose loops call functions now get
-  additional havoc binders in their serialized WP — re-run the bootstrap
-  probe battery before trusting old fixture certs (expected: honest
-  regeneration, no soundness issue).
+- ~~Bootstrap fixture cert re-validation~~ **DONE (2026-07-26, same day):**
+  fixture certs are BYTE-IDENTICAL pre/post fix (no certified fn has a
+  loop-with-call; call-mut fns are fail-loud excluded). Probe battery with the
+  fixed binary: probe9 all-as-classified (vec_read honest-fail = pre-existing
+  b74 gap), probe11 tgt differential gate 5/5 CLOSE (incl.
+  `apply_hom_symbol_exec`, regenerated cold with the fixed binary), probe13
+  mutation-kill 10/10, probe14 ✓, probe37 adequacy ✓, probe38 ✓. probe20
+  skipped (bootstrap-worktree-lane tooling; defs-layer, orthogonal to loop
+  havoc). Fixture verify stash-baseline delta: only `fill_zeros` (already
+  failing pre-fix) gains one error — its loop-maintain now carries the correct
+  `&mut`-push havoc telescope and the auto-closer (`apply Eq.symm`) can't
+  close the new honest shape. Closer-selection follow-up, no green regression.
 
 ## Open follow-ups from the 2026-07-25 arc (reported, not fixed)
 
