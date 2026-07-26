@@ -349,16 +349,43 @@ row in the gate report updates automatically (tags are data-driven).
      frame hyps `_h_ctx_N` in wrap goals vs `close_e_wrap`'s anonymous
      Imp).** Battery: units 425+7/0, e2e 558/0, probes
      9/11/13/14/20/37/38 green.
-   * **S3-pre brick spec'd (next): retire `_h_ctx` naming** — corpus
-     grep shows ZERO user references; rename production's extracted
-     wrap-leading hyps to the hoist scheme (`_h_hoist_k`, 1-based
-     per-goal — coincides with the serializer's global replay by the
-     prefix argument) and teach `close_e_wrap` the leading latch
-     (FBind→All keeps run alive; FHyp→All(hn) while leading, Imp
-     after; any let ends it; FUserCloser transparent; a pre-binder
-     Hyp ends it). Zero new vocabulary (the FHyp name slot serves);
-     link_discharge parses positionally (name-agnostic ✓). W5
-     close_sem lemmas need the latch threaded (b74 dual-mode class).
+   * **S3-pre brick spec'd (next, fresh-session-sized): retire
+     `_h_ctx` naming** — corpus grep shows ZERO user references;
+     link_discharge parses positionally (name-agnostic ✓). TWO design
+     refinements from the S4-session recon:
+     - **Production: init `saw_binder = true`** in
+       `split_leading_binders` (base binders ALWAYS precede the
+       frames, so requiring a frame-Binder first is an artifact) +
+       name extracted hyps `_h_hoist_{k}` (1-based pre-increment,
+       hoist_all's exact scheme). This makes the refWp rule a PURE
+       PREFIX LATCH over the frame list — no seed/body boundary
+       problem (the earlier sketch's fatal wrinkle: refWp can't
+       distinguish seed FBinds from body FBinds, and production's
+       saw_binder=false made body-first hyps anonymous while seed
+       binders would have satisfied a naive latch — add_capped +
+       apply_hom evidence). Consequence: body-first hyps in wrap
+       goals of PARAM-CARRYING fns become named theorem binders
+       (goal-shape churn, add_capped class); user tactics are safe —
+       those hyps were `_`-intro'd inaccessible before, they only
+       become nameable. Per-goal extraction numbering == the
+       serializer's global `hyp_ordinal` replay by the prefix
+       argument (extracted prefix contains no lets ⇒ no FLetH
+       interleave ⇒ ordinals 1..k; NL-scope resets + branch
+       save/restore already handled).
+     - **refWp/W5: `close_e_wrap` splits into leading + plain**
+       (leading: FBind→All keeps the run, FHyp→All(hn, h), any
+       let-class frame latches to plain — FHyp→Imp — one-way;
+       FUserCloser transparent). The SEMANTIC side must move in step:
+       `close_sem_e_wrap` (+ `close_sem_obligs_wrap`) give leading
+       FHyps the tel-style ABSTRACT-BINDER reading (`∀ n, …upd(st,
+       hn, n)` — hoist mode's existing treatment of named hyps, with
+       the adequacy layer recovering the dependent-product meaning;
+       `holds` reads All as value-quantification, so the implication
+       reading would break the weave). Churn: the one-step unfold
+       lemma family, `holds_close_e_wrap`, and every `wp_stm_sound`
+       arm that unfolds wrap semantics — b74 slice-1b dual-mode
+       class, now with a leading sub-mode. Link discharge 172/0 must
+       hold after.
      This + A7 closes fill_zeros; A7 alone closes vec_push7.
 4. **S4 kills** (D5, adapt subjects: call_inc is the closing cert —
    rebind-drop / mut_post-binder-drop / ens-hyp-drop / single-site
