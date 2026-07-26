@@ -603,7 +603,7 @@ impl<'a> WpCtx<'a> {
                     AssertKind::Obligation(ObligationKind::Postcondition),
                     // Lower with the RenderCtx so trait method calls
                     // in the ensures get correct receiver coercion.
-                    lower_validated_with_ctx(&Validated::check(&rewritten)?, &render_ctx),
+                    lower_validated_with_ctx(&Validated::check_in(&rewritten, render_ctx)?, &render_ctx),
                 ))
             }).collect::<Result<Vec<_>, String>>()?
         );
@@ -6427,7 +6427,7 @@ fn build_wp<'a>(
             if let Some(ident) = extract_simple_var_ident(dest) {
                 return Ok(Wp::Let(
                     crate::lean_name::LeanName::from_var_ident(ident),
-                    crate::to_lean_sst_expr::Validated::check(rhs)?,
+                    crate::to_lean_sst_expr::Validated::check_in(rhs, ctx.render_ctx())?,
                     dest.typ.clone(),
                     Box::new(after),
                 ));
@@ -6442,7 +6442,7 @@ fn build_wp<'a>(
             // an already-rendered LExpr, not an SST Exp.
             if let Some((root, field_oprs)) = decompose_assign_lvalue(dest) {
                 let rhs_lexpr = lower_validated_with_ctx(
-                    &crate::to_lean_sst_expr::Validated::check(rhs)?,
+                    &crate::to_lean_sst_expr::Validated::check_in(rhs, ctx.render_ctx())?,
                     &ctx.render_ctx(),
                 );
                 let update = build_nested_field_update(
@@ -6469,7 +6469,7 @@ fn build_wp<'a>(
             // drop the mode — `tactus_auto`'s `decide` rung is the
             // closest Lean analog (computes the value structurally).
             // Documented under DESIGN.md "Lossy accepted forms".
-            Ok(Wp::Assert(crate::to_lean_sst_expr::Validated::check(e)?, Box::new(after)))
+            Ok(Wp::Assert(crate::to_lean_sst_expr::Validated::check_in(e, ctx.render_ctx())?, Box::new(after)))
         }
         StmX::Assume(e) => {
             // Skip synthetic resolution-tracking assumes (#95). Verus's
@@ -6484,7 +6484,7 @@ fn build_wp<'a>(
             if is_synthetic_assume_to_drop(e) {
                 return Ok(after);
             }
-            Ok(Wp::Assume(crate::to_lean_sst_expr::Validated::check(e)?, Box::new(after)))
+            Ok(Wp::Assume(crate::to_lean_sst_expr::Validated::check_in(e, ctx.render_ctx())?, Box::new(after)))
         }
         // `return e` discards the textual continuation (`after`) and
         // terminates at the fn's ensures. Discard is type-level:
@@ -6513,7 +6513,7 @@ fn build_wp<'a>(
                 if let (Some(name), Some(ret_typ)) = (ctx.ret_name, ctx.ret_typ.as_ref()) {
                     return Ok(Wp::Let(
                         crate::lean_name::LeanName::synthetic(sanitize(name)),
-                        crate::to_lean_sst_expr::Validated::check(e)?,
+                        crate::to_lean_sst_expr::Validated::check_in(e, ctx.render_ctx())?,
                         ret_typ.clone(),
                         Box::new(Wp::Done(ctx.ensures_goal.clone())),
                     ));
@@ -6541,7 +6541,7 @@ fn build_wp<'a>(
             Ok(Wp::Done(ctx.ensures_goal.clone()))
         }
         StmX::If(cond, then_stm, else_stm) => {
-            let cond_v = crate::to_lean_sst_expr::Validated::check(cond)?;
+            let cond_v = crate::to_lean_sst_expr::Validated::check_in(cond, ctx.render_ctx())?;
             // Both branches share the same post-if continuation. Clone
             // `after` into each — this is where the pre-DSL code's
             // exponential-in-nested-ifs size comes from; see DESIGN.md
@@ -6904,7 +6904,7 @@ fn build_wp_assert_query<'a>(
             // `<tac>` raw). We encode that in `Wp::AssertByTactus`
             // by passing `Some(cond)` vs `None`.
             let cond_for_have = match kind {
-                TactusKind::AssertBy => Some(crate::to_lean_sst_expr::Validated::check(cond)?),
+                TactusKind::AssertBy => Some(crate::to_lean_sst_expr::Validated::check_in(cond, ctx.render_ctx())?),
                 TactusKind::ProofBlock => None,
             };
             Ok(Wp::AssertByTactus {
@@ -7019,7 +7019,7 @@ fn build_wp_call<'a>(
     // (including mutual recursion across an SCC). `build_wp` sees it
     // as a plain `Wp::Assert`; `sst_exp_to_ast_checked` handles the lowering.
     let validated_args: Vec<Validated<'a>> = args.iter()
-        .map(|a| Validated::check(a))
+        .map(|a| Validated::check_in(a, ctx.render_ctx()))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Wp::Call {
         callee,
@@ -7492,14 +7492,14 @@ fn build_wp_loop<'a>(
             // exit-side `setup; ¬cond` run when sound (see gates).
             Some((cond_setup, cond_exp)) if single_natural_exit => {
                 let cond_validated =
-                    crate::to_lean_sst_expr::Validated::check(cond_exp)?;
+                    crate::to_lean_sst_expr::Validated::check_in(cond_exp, ctx.render_ctx())?;
                 let neg_cond_lexpr = LExpr::not(lower_validated(&cond_validated));
                 (None, Some((cond_setup, neg_cond_lexpr)))
             }
             _ => (None, None),
         },
         Some((cond_setup, cond_exp)) => {
-            let cond_validated = crate::to_lean_sst_expr::Validated::check(cond_exp)?;
+            let cond_validated = crate::to_lean_sst_expr::Validated::check_in(cond_exp, ctx.render_ctx())?;
             if matches!(&cond_setup.x, StmX::Block(ss) if ss.is_empty()) {
                 // Empty setup — fast path; walk_loop pushes cond hyp.
                 (Some(cond_validated), None)
@@ -7538,7 +7538,7 @@ fn build_wp_loop<'a>(
     // so the split is trivial. For `cond: None` loops (the
     // break-lowered form), the flags can differ.
     let validated_invs: Vec<crate::to_lean_sst_expr::Validated<'a>> = invs.iter()
-        .map(|inv| crate::to_lean_sst_expr::Validated::check(&inv.inv))
+        .map(|inv| crate::to_lean_sst_expr::Validated::check_in(&inv.inv, ctx.render_ctx()))
         .collect::<Result<Vec<_>, _>>()?;
     let inv_kinds: Vec<LoopInvKind> = invs.iter()
         .map(LoopInvKind::from_loop_inv)
@@ -7550,7 +7550,7 @@ fn build_wp_loop<'a>(
             // across nested loops AND sibling lex tiers.
             let d_old_name = format!("_tactus_d_old_{}_{}", id, i);
             Ok(DecreaseLevel {
-                value: crate::to_lean_sst_expr::Validated::check(d)?,
+                value: crate::to_lean_sst_expr::Validated::check_in(d, ctx.render_ctx())?,
                 d_old_name,
             })
         })

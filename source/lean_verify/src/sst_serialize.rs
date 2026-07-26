@@ -72,12 +72,17 @@
 //! [`emit_cert`] is called at the inputs of
 //! `sst_to_lean::exec_fn_theorems_to_ast(krate, fn_sst, check,
 //! broadcast_lemmas)` — the single source of obligation shape both the
-//! island and package paths feed. The serializer transcribes the RAW
-//! `check.body: Stm`. The mut-ref rewrite and `WpCtx` construction happen
-//! *inside* `exec_fn_theorems_to_ast`, downstream of this snapshot, so
-//! they are deliberately not the serializer's input — refWp recomputes
-//! whatever the walker does from the literal, and the `decide` equality
-//! (W2) is what validates the recomputation.
+//! island and package paths feed. The serializer transcribes
+//! `check.body: Stm` after ONE shared pre-pass —
+//! `loop_normalize::normalize_setup_loops`, the same function
+//! production applies, identity unless a setup-carrying `while` is
+//! present — so refWp sees the single loop encoding production walks
+//! rather than having to model the normalization itself (2026-07-26).
+//! The mut-ref rewrite and `WpCtx` construction happen *inside*
+//! `exec_fn_theorems_to_ast`, downstream of this snapshot, so they are
+//! deliberately not the serializer's input — refWp recomputes whatever
+//! the walker does from the literal, and the `decide` equality (W2) is
+//! what validates the recomputation.
 //!
 //! # Faithfulness contract (anchor #2) — audit this list, not the code
 //!
@@ -119,7 +124,11 @@
 //! * `StmX::Return { ret_exp }` — the returned expression → the
 //!   `RetBind::RetLet` value leaf (`exp_leaf`), paired with `dest` above to
 //!   reproduce production's `let <ret> := <e>` frame binding.
-//! * `check.body` — the `Stm` tree → `StmData` (the stage-A subset:
+//! * `check.body` — the `Stm` tree, LOOP-NORMALIZED first
+//!   (`loop_normalize::normalize_setup_loops` — the same pre-pass
+//!   production applies before its walk; identity unless a
+//!   setup-carrying `while` is present, so this is byte-neutral on
+//!   bodies without one) → `StmData` (the stage-A subset:
 //!   Assert, Assume, Assign, DeadEnd, Return, If, Loop, Block→Seq/Skip).
 //!   `Assert` carries TWO leaves (finding-1): the ANNOTATED obligation
 //!   leaf (`oblig_leaf` — production's `span_mark` render, the goal) and
@@ -4141,8 +4150,20 @@ fn serialize<'a>(
         .as_ref()
         .and_then(|dest| s.local_typs.get(dest).cloned());
 
-    // Body.
-    let stm_term = s.stm(&check.body)?;
+    // Body — the LOOP-NORMALIZED tree, the same one production walks
+    // (decision #2 follow-up, 2026-07-26). `normalize_setup_loops` is
+    // the identity on every body without a setup-carrying `while`, so
+    // existing certs are byte-identical; setup-carrying whiles arrive
+    // here in Verus's own break form (cond:None + guard in body),
+    // which the Loop arm already models — instead of a cond:Some
+    // shape refWp would otherwise have to learn to normalize itself.
+    // TCB note: like leaf rendering and `cert_call_leaves`, the
+    // normalization joins the TRUSTED transcription surface — the
+    // structural decide-check validates the WP of the normalized
+    // program, taking the (pure, shared-code) pre-pass on faith. See
+    // the faithfulness contract above.
+    let normalized_body = crate::loop_normalize::normalize_setup_loops(&check.body);
+    let stm_term = s.stm(&normalized_body)?;
 
     // G4/W6e — seed `deep_ids` for the value-if-lift goal leaves. The Return
     // arm recomputed the branch-folded obligations on the REFERENCE side
