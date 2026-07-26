@@ -256,6 +256,29 @@ pub fn call_inc(y: u64) -> (r: u64)
     z
 }
 
+// F14c (bootstrap-78 review): TWO `&mut` args in one call — pins the
+// multi-arg frame interleave (per-arg FBind+FHyp pairs in param order,
+// both rebinds after the ens, two mut_post gensyms + fresh_ret in one
+// counter advance) that call_inc's single-arg shape leaves dormant.
+pub fn swap_incr(a: &mut u64, b: &mut u64)
+    requires *old(a) < 100, *old(b) < 100,
+    ensures *a == *old(b) + 1, *b == *old(a) + 1,
+{
+    let t = *a;
+    *a = *b + 1;
+    *b = t + 1;
+}
+
+pub fn call_swap_incr(x: u64) -> (r: u64)
+    requires x < 50,
+    ensures r == x + 2,
+{
+    let mut p = x;
+    let mut q = x + 1;
+    swap_incr(&mut p, &mut q);
+    p
+}
+
 // F15: generic fn (type param; Nonempty-bracket plumbing on the spec side)
 pub fn id_generic<T>(t: T) -> (r: T)
     ensures r == t,
