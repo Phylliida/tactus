@@ -285,6 +285,83 @@ def aqt_hyp_drop(sst):
     return sst[:s] + "0" + sst[e:]
 
 
+def _find_nth(s, key, n):
+    """Offset of the n-th (1-based) occurrence of `key`."""
+    i = -1
+    for _ in range(n):
+        i = s.find(key, i + 1)
+        assert i != -1, f"occurrence {n} of {key!r} not found"
+    return i
+
+
+def _drop_frame_node(sst, ctor, nscalars, occ):
+    """bootstrap-78 S4: drop the occ-th `(lib.FrameList.<ctor> s… (Box X))`
+    node from a Call-post FrameList, splicing its tail X in place — the
+    single-node structural drop the D5 kills specify. Bracket-aware via
+    take_sexpr (b77 splitter); FrameList ctors only occur inside
+    `StmData.Call` posts (loop binders are BinderList), so occurrence
+    indexing is unambiguous."""
+    key = f"(lib.FrameList.{ctor} "
+    j = _find_nth(sst, key, occ)
+    i = j + len(key)
+    for _ in range(nscalars):
+        sp = take_sexpr(sst, i)
+        assert sst[sp[0]:sp[1]].isdigit(), \
+            f"{ctor} scalar expected, got {sst[sp[0]:sp[1]]!r}"
+        i = sp[1]
+    box = take_sexpr(sst, i)  # (Tactus.Box.mk X)
+    assert sst[box[0]:box[0] + 15] == "(Tactus.Box.mk ", f"{ctor}: tail not boxed"
+    inner = take_sexpr(sst, box[0] + 14)
+    end = match_paren(sst, j)
+    assert end + 1 == box[1] + 1, f"{ctor}: trailing args after tail?"
+    return sst[:j] + sst[inner[0]:inner[1]] + sst[end + 1:]
+
+
+# ── bootstrap-78 S4: the mut-call frame kills (D5, subject call_inc —
+# the CLOSING mut cert; vec_push7/fill_zeros are A7-class honest-fails).
+# One kill per call_stm output channel. call_inc's first call's post is
+# `FBind mut_post_1 · FHyp bound · FBind ret_2 · FHyp ens · FLet rebind`,
+# so occurrence indexes are: FBind#1 = mut_post binder, FHyp#1 = bound,
+# FHyp#2 = ens, FLet#1 = rebind. All SST-side (the frames live in the
+# CERT's Call post — refWp's own input is perturbed).
+
+def mut_post_binder_drop(sst):
+    """Drop the Phase-1 `∀ mut_post` existential binder (FBind#1)."""
+    return _drop_frame_node(sst, "FBind", 2, 1)
+
+
+def mut_bound_hyp_drop(sst):
+    """Drop the mut-post type-bound hyp (FHyp#1 — the
+    `type_bound_predicate` mirror channel; u64 subject so it exists)."""
+    return _drop_frame_node(sst, "FHyp", 3, 1)
+
+
+def mut_ens_hyp_drop(sst):
+    """Drop the instantiated-ensures hyp (FHyp#2) — distinct from b70's
+    ∀-path frame kills (probe38): those covered a no-mut call's frames;
+    this pins the hyp inside a MUT post assembly."""
+    return _drop_frame_node(sst, "FHyp", 3, 2)
+
+
+def mut_rebind_drop(sst):
+    """Drop the Phase-4 rebind `FLet local := mut_post` (FLet#1) — the
+    stale-local channel (continuation would read the PRE-call value)."""
+    return _drop_frame_node(sst, "FLet", 2, 1)
+
+
+def mut_gensym_rename(sst):
+    """Single-site counter kill (D5): divert the mut_post BINDER's name
+    leaf to the 999999 sentinel while the rebind FLet's value slot keeps
+    the real id — models an emit-counter bug shifting a gensym name at
+    one consumption site (the two sites disagree exactly as a mis-count
+    makes serializer text diverge from production's goal names)."""
+    key = "(lib.FrameList.FBind "
+    j = _find_nth(sst, key, 1)
+    sp = take_sexpr(sst, j + len(key))
+    assert sst[sp[0]:sp[1]].isdigit() and sst[sp[0]:sp[1]] != "999999"
+    return sst[:sp[0]] + "999999" + sst[sp[1]:]
+
+
 # (fn, class, human description, mutation, which def the mutation edits, expect)
 #
 # expect="close": baseline bridges (=1) and the mutation kills (=0).
@@ -317,6 +394,13 @@ CLASSES = [
     ("head_exec",  "ifctor_neg_drop", "IfCtor: degenerate the else-branch neg hyp leaf (A5/N2 frame assembly)", ifctor_neg_drop, "sst", "close"),
     ("head_exec",  "ifctor_arm_swap", "IfCtor: swap thn/els arm bodies (A5 fork structure)",                   ifctor_arm_swap, "sst", "close"),
     ("assert_by_default", "aqt_hyp_drop", "AssertQueryTactus: drop the AssertFact bare-P hyp (A3)",            aqt_hyp_drop,    "sst", "close"),
+    # bootstrap-78 S4: the mut-call frame kills (D5) — one per call_stm
+    # output channel, on the CLOSING mut subject call_inc.
+    ("call_inc", "mut_post_binder_drop", "mut call: drop the ∀ mut_post existential binder (Phase 1)", mut_post_binder_drop, "sst", "close"),
+    ("call_inc", "mut_bound_hyp_drop",   "mut call: drop the mut-post type-bound hyp (Phase 1)",       mut_bound_hyp_drop,   "sst", "close"),
+    ("call_inc", "mut_ens_hyp_drop",     "mut call: drop the instantiated-ensures hyp (Phase 3)",      mut_ens_hyp_drop,     "sst", "close"),
+    ("call_inc", "mut_rebind_drop",      "mut call: drop the rebind FLet (Phase 4, stale-local)",      mut_rebind_drop,      "sst", "close"),
+    ("call_inc", "mut_gensym_rename",    "mut call: single-site gensym-name divergence (counter channel)", mut_gensym_rename, "sst", "close"),
 ]
 
 
