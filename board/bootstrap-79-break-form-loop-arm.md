@@ -192,12 +192,16 @@ break-form's exit-reclose set = the normalized body's
 body-walk emission, not a new obligation kind. That's why it sits in
 walk order right after the setup stms (ids 6-8, before the user-body
 asserts 13-15) and why it "needs no body walk / emits early" (E1).
-Exit-reclose ctx = havoc binders + inv hyps + setup frames + the
-If-guard ¬cond hyp, all HOISTED (telescope binders, hoist mode) — and
-NO d_old binder pair (goal 6 telescope confirmed d_old-free; "no
-decrease obligation on break", `:7690`; the closer script's d_old
-`subst` is just the first `first |` alternative of the generic family
-script and is not the closing branch).
+Exit-reclose ctx = havoc binders + inv hyps + **the d_old pair** +
+setup frames + the If-guard ¬cond hyp, all HOISTED (telescope binders,
+hoist mode). **CORRECTION (impl-time, F26 evidence): the exit-reclose
+telescope DOES carry the d_old binder pair** (between the inv hyps and
+the setup frames — walk_loop pushes the d_old let onto the whole
+body-walk ctx, and the break stm inherits it; count_to_len goal 3 AND
+copy_word goal 6 both show it — the step-0 grep missed the spill
+lines). "No decrease obligation on break" (`:7690`) is about the LEAF,
+not the ctx. The closer script's d_old `subst` is thus live, not
+vestigial.
 
 **Q2 — maintain inline wrap (goal 16), exact structure:**
 
@@ -229,6 +233,20 @@ let tmp__3 := j;                          -- setup stms inline, source order
 - The If's then-branch (break) contributes nothing to the maintain
   goal — it is a different path through the body walk; its obligations
   are the 6-8 set.
+- **AMENDMENT (impl-time, F26 evidence): the maintain goal's mode is
+  NOT inherently wrap.** The wrap rendering above is copy_word's — its
+  in-body mut-call rebind (plain FLet) wrap-forces the body's
+  downstream goals (b78 S3 wrap-latch). count_to_len's body has no
+  wrap-forcer, so its maintain goal renders HOISTED: the d_old pair,
+  the setup frames, the `¬(¬cond)` guard, and the body frames are all
+  telescope binders (goal 5: `… d_old pair, tmp__2, _h_tmp__2_hoist1,
+  _h_hoist_3, tmp__1, _h_tmp__1_hoist1, _h_hoist_4 (¬¬cond), …,
+  i_hoist1, _h_i_hoist1_hoist1`) and the leaf is the bare renamed
+  invariant. I.e. mode selection is the EXISTING b74 dual-mode
+  per-goal machinery — the break-form adds the setup+guard FRAMES to
+  the walk; hoist vs wrap falls out of the existing latch. Same for
+  the post-loop continuation: the exit prefix frames hoist by default
+  (postcondition 8 telescope).
 
 **Q3 — id 20 = the exit-side setup replay's `v.len()` call fresh_ret
 ordinal.** Production's exit_wrap (`:7780-7786`) runs a REAL

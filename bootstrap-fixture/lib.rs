@@ -419,4 +419,27 @@ pub fn proof_block_fn(x: u64) -> (r: u64)
     x + 1
 }
 
+// F26 (bootstrap-79): break-form loop — a call-in-cond while
+// (`i < v.len()`), which loop_normalize rewrites to
+// `loop { setup; if !exp { break; } body }`. The minimal subject for
+// the break-form Loop arm: pins the THREE invariant goal families
+// (entry / exit-reclose / maintain), the cond-setup call's DOUBLE
+// emit-ordinal consumption (body run id + exit replay id), the
+// `¬(¬cond)` maintain else-guard, and the hoisted setup+¬cond prefix
+// on the post-loop continuation. Body deliberately trivial (no mut
+// call) — copy_word is the composition subject.
+pub fn count_to_len(v: &Vec<u64>) -> (r: usize)
+    ensures r as nat == v@.len(),
+{
+    let mut i: usize = 0;
+    while i < v.len()
+        invariant
+            i <= v@.len(),
+        decreases v@.len() - i,
+    {
+        i = i + 1;
+    }
+    i
+}
+
 } // verus!
