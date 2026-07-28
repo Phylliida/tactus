@@ -1,0 +1,1 @@
+{"fn":"lib__u_wp_deadend","vcs":[{"name":"_tactus_postcondition_u_wp_deadend_at_lib_4915_13_1","leaf":"/- @rust:lib.rs:4915:13 -/ lib.wp_stm f (lib.StmData.DeadEnd b) = lib.wp_stm f b.deref","spine":[{"k":"all","name":"f","ty":"lib.FrameList"},{"k":"all","name":"b","ty":"Tactus.Box lib.StmData"}]}]}

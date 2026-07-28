@@ -1,0 +1,1 @@
+{"fn":"lib__u_ceh_unfold","vcs":[{"name":"_tactus_postcondition_u_ceh_unfold_at_lib_4835_13_1","leaf":"/- @rust:lib.rs:4835:13 -/ lib.close_e_hoist f ob = lib.close_e_tel f (lib.residue_fold_e f (lib.GoalData.LeafE (lib.render_exp ob)))","spine":[{"k":"all","name":"f","ty":"lib.FrameList"},{"k":"all","name":"ob","ty":"lib.RawExp"}]}]}
