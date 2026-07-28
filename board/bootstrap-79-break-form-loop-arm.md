@@ -1,7 +1,7 @@
 # bootstrap-79 — break-form loop arm (loop_normalize cert-lane debt)
 
-Status: **card — step-0 evidence frozen 2026-07-28, design DIRECTION
-frozen, full design freeze + implementation not started.**
+Status: **DESIGN FROZEN 2026-07-28 — all 5 open questions resolved
+(§ "Design freeze" below). Implementation not started.**
 Unblocks: b78 S5 (call-mut census retirement on tgt via
 `runtime.copy_word`) + `runtime.find_cancellation_exec` cert return
 (A7 tripwire set). Sequencing decided by Danielle 2026-07-28: **this
@@ -107,9 +107,10 @@ The cond-setup call consumes a fresh_ret id (5) between entry and
 exit-re-close — a new row for the serializer's emit-counter contract
 table (loop entry: +1 per cond-setup CALL). The exit-phase setup
 replay reuses the SAME temp names (tmp__2/tmp__3 in both maintain and
-exit goals) — no fresh ids there. Id 20 (between decrease 19 and
-postcondition 21) is unaccounted — identify at impl (likely the
-post-loop/return-path gensym).
+exit goals) — no fresh temp NAMES there (the call's emit ordinal IS
+consumed again — id 20, resolved in the design freeze below). Id 20
+(between decrease 19 and postcondition 21) = the exit-side setup
+replay's `v.len()` call ordinal — see design freeze Q3.
 
 ## Design direction (frozen)
 
@@ -159,6 +160,128 @@ gains the setup-frame rows either way.
 5. Whether the exit-phase setup frames derive from `original_cond`'s
    setup or the body copy — evidence says same names; confirm the
    serializer needs only one transcription.
+
+## Design freeze (2026-07-28 — all questions resolved)
+
+Sources: the two step-0 emitted files + production
+(`sst_to_lean.rs:7501-7798` `build_wp_loop`, `:7780-7786` exit_wrap)
++ the serializer Loop arm (`sst_serialize.rs:3600-3824`).
+
+**Q1 — classical population: NO exit-reclose family exists; the
+break-form's extra set is NEW emission.** In the current vocab,
+`inv_obligs` = the init/entry obligations (plain invariant texts) and
+`inv_obligs_exit` = the MAINTAIN re-close (renamed texts after the
+body walk, `i_hoist1 ≤ n`) — the field name is about the maintain
+side, not a loop-exit family. The exit-reclose goals are not a mode
+of either field: they come from a different production mechanism
+entirely (see Q4). Content note: the exit-reclose oblig texts are the
+invariant texts renamed at the POST-SETUP rename state — in copy_word
+the setup rebinds no mod var, so they are byte-equal to `inv_obligs`'
+plain texts (goal 6 leaf `j ≤ len (view v)` = entry goal 2 leaf). A
+setup that rebinds a mod var would rename them (like `inv_obligs_exit`
+but renamed by the setup walk only) — derivable reference-side from
+the setup slot; the fixture will pin the common case.
+
+**Q4 — classical loops never emit an exit re-close set.** Production
+mechanism (`build_wp_loop:7753-7769`): the body's `continue_leaf` =
+entry-invs ∧ decrease (the maintain family), the `break_leaf` =
+exit-invs. The break leaf is only reached by walking a `Break` stm —
+a classical empty-setup body has none, so the family never fires. The
+break-form's exit-reclose set = the normalized body's
+`If(¬exp, [break], _)` then-branch hitting the break leaf: an ORDINARY
+body-walk emission, not a new obligation kind. That's why it sits in
+walk order right after the setup stms (ids 6-8, before the user-body
+asserts 13-15) and why it "needs no body walk / emits early" (E1).
+Exit-reclose ctx = havoc binders + inv hyps + setup frames + the
+If-guard ¬cond hyp, all HOISTED (telescope binders, hoist mode) — and
+NO d_old binder pair (goal 6 telescope confirmed d_old-free; "no
+decrease obligation on break", `:7690`; the closer script's d_old
+`subst` is just the first `first |` alternative of the generic family
+script and is not the closing branch).
+
+**Q2 — maintain inline wrap (goal 16), exact structure:**
+
+```
+let _tactus_d_old_0_0 := D;              -- d_old FIRST (walk_loop pushes
+                                         -- it onto the maintain ctx before
+                                         -- the body walk)
+let tmp__3 := j;                          -- setup stms inline, source order
+<setup call bound> →                      -- bound hyp as IMP
+(let tmp__2 := spec_vec_len v;            -- setup call dest let
+  ¬(¬(tmp__3 < tmp__2)) →                 -- the If guard, ELSE path:
+                                         -- outer ¬ around the ¬cond text
+  (let tmp__4 := <vec_index fresh_ret>;   -- user-body WP inline
+   ∀ _tactus_mut_post_11, ∀ _tactus_ret_12, <push post> →
+   (let out := _tactus_mut_post_11;       -- mut rebind
+    <AQT asserts / bound imps> →
+    (let j := j + 1;
+      <invariant clause, body renames>))))
+```
+
+- d_old let placement: FIRST, before the setup lets.
+- cond imp position: after the setup frames, before the body WP; the
+  cond appears as `¬(¬exp)` — the normalized If's else-guard is the
+  outer negation of the (already negated) guard text, and the @rust
+  comment attaches to the inner `¬exp` (`runtime.rs:443:11`). The
+  mirror must reproduce the double negation, NOT the bare cond.
+- Body WP nests as lets + call-bound imps + mut-call ∀s + rebind lets,
+  ending at the invariant clause with body renames applied.
+- The If's then-branch (break) contributes nothing to the maintain
+  goal — it is a different path through the body walk; its obligations
+  are the 6-8 set.
+
+**Q3 — id 20 = the exit-side setup replay's `v.len()` call fresh_ret
+ordinal.** Production's exit_wrap (`:7780-7786`) runs a REAL
+`build_wp(cond_setup, Wp::Hyp(¬cond, after))` walk over
+`original_cond.0`, and a call consumes its +1 emit ordinal there even
+though the dest temp (`tmp__2`) is a named SST temp shared with the
+body run and no `_tactus_ret_20` gensym materializes. E4's "no fresh
+ids there" holds for temp NAMES, not the counter. New counter-contract
+row: **a cond-setup call consumes +1 TWICE — once in the body run
+(id 5), once in the exit replay (id 20).** (For completeness, id 1 =
+the pre-loop `Vec::new()` call's fresh_ret; ids 10/11/12 = the push
+call's requires-theorem/mut-post/ret ordinals.)
+
+**Q5 — ONE transcription, TWO derivations.** Production physically
+walks the setup twice: the iteration-side run is the normalized
+BODY's inline copy (`loop_normalize` moved setup + the If guard into
+the body, `:7554-7559`, `:7773-7779`), the exit-side run is
+`original_cond.0` via exit_wrap. The normalizer clones the same SST
+nodes, so VarIdents/spans/temp names coincide — hence the same
+`tmp__2`/`tmp__3` in maintain and exit goals. Serializer: transcribe
+`original_cond`'s setup ONCE into the Loop node's setup slot (D2);
+refWp derives BOTH renderings from that single transcription — the
+inline wrap (maintain, via the body walk) and the hoisted frames
+(exit-reclose ctx + the post-loop continuation prefix). The W2 bridge
+is exactly what validates that the two derivations byte-match
+production's two physical walks.
+
+### Design-freeze consequences for D1/D2
+
+- The exit-reclose family needs NO new oblig field on
+  `StmData::Loop`: it is the body walk's break leaf, content =
+  invariant texts at the post-setup rename state (byte-equal to
+  `inv_obligs` in the common no-rebind case). Vocab growth stays
+  exactly the D2 setup slot (transcribed setup as mirror stms, empty
+  for classical = byte-stability check).
+- refWp Loop arm derivations: (a) exit-reclose goals = hoisted setup
+  frames + `neg_cond_ann` + inv texts at post-setup rename state;
+  (b) maintain goals = existing telescope + inline setup wrap +
+  `¬(neg_cond_ann)` guard imp + body WP + `inv_obligs_exit`;
+  (c) post-loop continuation = hoisted setup frames + `neg_cond_ann`
+  hyp + `after` (postcondition 21 shows exactly this prefix, then the
+  return binder).
+- Emit-counter contract gains rows: cond-setup calls +1 twice (body
+  run + exit replay); exit-reclose +|invs| consumed in body-walk
+  order immediately after the setup stms (before user-body stms).
+  Classical rows unchanged.
+- The maintain guard is `¬(neg_cond_ann)` (double negation), and the
+  exit side uses `neg_cond_ann` — both derive from the ONE
+  `neg_cond_ann` slot the Loop node already carries. No new cond
+  slots.
+- D3 unchanged: W5 churn still unknown until impl; the exit-reclose
+  family is a new goal FAMILY but over existing frame vocabulary, so
+  dispatcher-level hope stands.
 
 ## Acceptance
 
