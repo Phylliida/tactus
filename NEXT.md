@@ -55,9 +55,16 @@ with one-way let-latch, serializer needed ZERO changes (per-goal
 positions == walk ordinals); gate 283/0 + discharge 196/0, probe9
 23/26 CLOSE (add_capped/proof_block_fn close with reshaped certs;
 fill_zeros hfail narrowed to A7-only), probes 13/14/37/38 green,
-golden re-vendored.** NEXT = S5 scoped
-tgt copy_word (⚠ tgt loop fns get NEW goal shapes from the
-soundness fix — invariant repairs possible and correct) → A7
+golden re-vendored.** **S5 RUN 2026-07-28 —
+BLOCKED (full record on the b78 card §5): the 4th-sync loop_normalize
+pre-pass rewrites call-in-cond whiles to break-form; copy_word AND
+find_cancellation_exec now census-reject `break-or-continue` before
+the Call arm (find_cancellation LOST its b77-era cert = tgt coverage
+regression the stale-on-disk certs had masked). probe11 regen: 9/9
+remaining certs CLOSE + new subject-population pin keeps the 2
+absences loud. NEXT = break-form loop arm (serializer Loop vocab +
+refWp mirror + W5 churn — gates S5's call-mut census retirement AND
+find_cancellation's return) → S5 proper → A7
 (stage-B callee-signature vocab — closes vec_read, vec_push7,
 fill_zeros AND find_cancellation, derives poison + N2 detector
 reference-side) → B (b67 caching + b68 flip)**. D's in-model

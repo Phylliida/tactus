@@ -493,6 +493,44 @@ row in the gate report updates automatically (tags are data-driven).
    goal shapes from the soundness fix (proper havoc) — some may need
    real invariant repairs; that is the fix working, not a regression.
 
+   **S5 RUN 2026-07-28 — BLOCKED by the 4th-sync loop_normalize
+   pre-pass; the call-mut census retirement is NOT confirmable on tgt
+   this slice.** Cold scoped regen (per-module emits for `runtime` +
+   `todd_coxeter_rt`, `--emit-lean --tactus-emit-cert`, no `-V cache`;
+   exit 0, 24v/0e runtime-side) found copy_word AND
+   find_cancellation_exec both census-rejecting **`break-or-continue`**
+   (population 2) BEFORE the Call arm runs: the 4th sync (`fb23b6a`)
+   brought main's loop_normalize pre-pass, which rewrites call-in-cond
+   whiles (`while j < v.len()`) into break-form
+   (`loop { setup; if !exp { break; } body }`), and the stage-A stm
+   walk rejects `StmX::BreakOrContinue` loud. Both fns have
+   `Vec::len()` in their loop conds. Consequences:
+   * **tgt coverage REGRESSION from the sync**: find_cancellation_exec
+     was certified (b77, A7-class honest-fail, goal count 21 =
+     production) and now emits NO cert. loop_normalize.rs's cert-lane
+     header ("they had no certs before") is true of main's corpus but
+     false of tgt — the stale-certs-on-disk probe11 battery masked it
+     (stale certs always bridge; only a fresh regen sees the reject).
+   * The `call-mut` arm never fires on tgt — the break-form reject
+     precedes it in the walk. S5's acceptance (tag → 0 via copy_word
+     emitting) is unreachable until the loop arm lands.
+   * The card's ⚠ above (new loop goal shapes from the soundness fix)
+     is MOOT this slice: the loop fns reject before goal emission.
+   * The remaining 9 certs regen + bridge ALL CLOSE (probe11 green):
+     the apply_hom pair survives the S3-pre wrap-mode churn with fresh
+     certs; the soundness fix changed no non-loop fn's goals;
+     todd_coxeter_rt ×4 unchanged (its loop conds are local-pure).
+   * probe11's runner gained a **subject-population pin** (loud on
+     vanished/returned certs; the 2 absences documented with their
+     census tags; find_cancellation_exec's A7 honest_fail_reason
+     retained dormant for its return).
+   **UNBLOCK = a break-form loop arm**: serializer Loop vocab for the
+   normalized shape + refWp mirror + W5 model churn (loop_normalize.rs's
+   cert-lane note already flags "must eventually be mirrored
+   refWp-side"). This gates BOTH S5 (call-mut census retirement on
+   tgt) AND find_cancellation_exec's return to the A7 tripwire set.
+   Sequencing vs A7 = Danielle's call.
+
 ## Open items (resolve at impl, not design blockers)
 
 - Phase-4 coercion exactness: whether the Vec-case rebind is bare
