@@ -282,13 +282,22 @@ production's two physical walks.
   `inv_obligs` in the common no-rebind case). Vocab growth stays
   exactly the D2 setup slot (transcribed setup as mirror stms, empty
   for classical = byte-stability check).
-- refWp Loop arm derivations: (a) exit-reclose goals = hoisted setup
-  frames + `neg_cond_ann` + inv texts at post-setup rename state;
+- refWp Loop arm derivations (AMENDED at impl — the three cond-flavored
+  hyp leaves are DISTINCT, production evidence on both subjects):
+  (a) exit-reclose goals = hoisted setup frames + the SPAN-MARK'D
+  `¬exp` hyp (`/- @rust:…-/ ¬(…)` — walk_if marks the synthesized
+  `¬exp`, comment OUTSIDE the negation) + inv texts at post-setup
+  rename state;
   (b) maintain goals = existing telescope + inline setup wrap +
-  `¬(neg_cond_ann)` guard imp + body WP + `inv_obligs_exit`;
-  (c) post-loop continuation = hoisted setup frames + `neg_cond_ann`
-  hyp + `after` (postcondition 21 shows exactly this prefix, then the
-  return binder).
+  the `¬(span_mark'd ¬exp)` else-guard + body WP + `inv_obligs_exit`;
+  (c) post-loop continuation = hoisted setup frames + the BARE `¬exp`
+  hyp (exit_wrap pushes `LExpr::not(cond)` UNMARKED,
+  `build_wp_loop:7610`) + `after`. Vocab: FIVE new slots (arity
+  16→21) — `setup`, `inv_obligs_break`, `neg_neg_cond_ann`,
+  `break_guard_ann`, `break_use_ann`; the classical `cond_ann` /
+  `neg_cond_ann` slots keep their classical constructions in both
+  forms (`neg_cond_ann` = 999999 in break-form; the three break-form
+  slots = 999999 in classical). Guard hyps all share `cond_name`.
 - Emit-counter contract gains rows: cond-setup calls +1 twice (body
   run + exit replay); exit-reclose +|invs| consumed in body-walk
   order immediately after the setup stms (before user-body stms).
@@ -316,3 +325,63 @@ production's two physical walks.
   user break/continue would still tag loud).
 - Churn: classical-loop certs byte-identical; W5 gate + Link discharge
   hold.
+
+## Implementation log (2026-07-28)
+
+**Fixture F26 landed (`count_to_len`)** — `while i < v.len()` over
+`&Vec<u64>`, body `i = i + 1`, one invariant. Verifies 35/0; production
+census confirms the design-freeze id map exactly: entry 1, setup call
+2, exit-reclose 3, body assert 4, maintain 5, decrease 6, exit replay
+call 7, postcondition 8. Its maintain goal renders HOISTED (no
+wrap-forcer in body) — the evidence that amended the freeze's
+"maintain = wrap-mode" reading (mode is the existing dual-mode latch).
+
+**tactus-core slice landed (commits b9bbaf8, 7a0eb45).** `StmData::Loop`
+16→21 fields; `loop_telescope_base` + `d_old_frame` helpers (classical
+`loop_maintain_frame`/`loop_use_frame` untouched, byte-identical);
+`is_skip(*setup)` branch split in `wp_stm` / `frame_after` /
+`exec_safe_f` (classical path verbatim); `wp_stm_sound` Loop arm
+handles both branches. **W5 churn (D3) = one new proof branch +
+restructure, dispatcher-level holds:** the goal-family semantics extend
+compositionally (`exec_safe_f`'s bf arm = the same close_sem groups at
+the same derived frames).
+
+**wp_stm_sound debugging saga (3 gate iterations):**
+- gate-2 (IHs inside the `if`): termination VCs whnf-explode — the
+  branch guard lands in the VC's path condition and
+  `cases s` + simp_all detonates on it. Pin also failed (simp won't
+  reduce `is_skip` on a closed `Skip` literal — no equation lemmas;
+  fixed with an explicit `assert(is_skip(StmData::Skip) == 1)`).
+- gate-3 (IHs hoisted outside the `if`): 3 of 4 termination VCs pass;
+  the 4th and the postcondition VC explode. Root cause found in the
+  generated `_tactus_termination_` theorems: sequential recursive calls
+  CHAIN each call's VC under every previous call's postcondition
+  (`… → (∀ ret, IH1-post → (let tmp22 … IH2-goal …))`), and past ~2
+  nested IH facts (each a `wp_stm`/`exec_safe_f` application over the
+  open frame fns) simp_all whnf-explodes.
+- gate-4: IHs paired into TWO `assert … by` blocks (the AGENTS.md
+  assert-by scoping idiom) — each inner VC sees only the previous
+  CONJUNCTION, capping the chain at ≤2.
+
+**Serializer slice landed (compiles; untested pending vargo build).**
+`loop_stm`: canonical break-form detection (cond None +
+original_cond Some + Block[setup, If(¬exp, break, None), user-body] +
+non-empty setup — Verus-lowered user while-with-breaks with EMPTY
+original setup stay rejected); ONE setup transcription from
+`original_cond`; exit-reclose obligs via the factored
+`renamed_inv_slots` (post-setup rename state); guard name minted AFTER
+the body-run setup walk (per-goal-path ordinal); post-loop restore
+point moved PRE-setup; exit replay re-walks the setup for counter
+effects only (rename/bound state restored; `replay_guard == cond_name`
+checked, drift rejects `loop-break-form-replay-drift`); three new leaf
+constructors (`marked_neg_cond_leaf`, `bare_neg_cond_leaf`,
+`neg_neg_oblig_leaf`); 21-arg node for classical too (Skip/Nil/
+999999 sentinels). Header contract rows updated (Loop bullet,
+emit-counter rows, BreakOrContinue exclusion).
+
+**Still open:** gate green, vargo rebuild + fixture re-emit
+(classical certs must be byte-identical modulo the arity bump;
+bridges must all hold), probe9 count_to_len CLOSE, probe13 kills on
+the five new channels (setup drop / break-oblig drop / guard-leaf
+degen / negneg degen / use-leaf degen), probe11 tgt regen (copy_word +
+find_cancellation_exec return), full battery.
