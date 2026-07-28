@@ -1,1 +1,0 @@
-{"fn":"lib__u_ce_wrap_mode","vcs":[{"name":"_tactus_postcondition_u_ce_wrap_mode_at_lib_4779_13_1","leaf":"/- @rust:lib.rs:4779:13 -/ lib.gate_wrap f = 1 → lib.close_e f ob = lib.close_e_wrap_lead f ob","spine":[{"k":"all","name":"f","ty":"lib.FrameList"},{"k":"all","name":"ob","ty":"lib.RawExp"}]}]}

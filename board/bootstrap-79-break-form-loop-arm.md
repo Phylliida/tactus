@@ -402,3 +402,26 @@ simp_all branch burns 123s (tips over 1.6M heartbeats in-gate) while
 `intros <;> cases s <;> omega` closes it in 1.9s (the height goal is
 pure once `cases s` exposes the ctor; VCs needing the simp reduction
 fail omega in ~2s and fall through to the pre-b79 branch).
+
+**Gate-6/7/8 (same day):** gate-6 GREEN (285/0, package gate 52) with
+6 Link-discharge pends — all traced to the b79 changes (part-lemma
+`requires` → assert VCs in recursive fn; the bites pin's is_skip
+assert → non-postcondition VC; 4 fns awaiting wp_stm_sound_closed).
+Gate-7 (implies-form part-lemmas + pin fix via `lib.is_skip` in the
+simp set) cleared the pends' causes but surfaced the part-lemmas'
+fatal flaw: the arm's postcondition VC states the goal on `s` while
+the part-lemma posts are over the match-pattern's let-bound field
+fvars — after `cases s` the forms don't unify under `assumption`
+(✝ vs ✝¹ fvars, hand-isolated), and no tactic variant closed it.
+Gate-8: part-lemmas DELETED, back to the gate-2 inline arm (IHs
+inside the branches — its postcondition VC was the one thing that
+always passed), keeping the proven tactic fixes: the omega-first
+ladder (guard-in-path is harmless to omega — the guard is just a nat
+atom; the chain VCs are pure height inequalities) + `lib.is_skip` in
+the bites pin's simp set (closed-ite reduction, 1.9s standalone).
+LESSON for the idioms file: in the Tactus backend, (a) assert-by
+drops lemma posts, (b) extracted part-lemmas with requires generate
+assert VCs the Link discharge pends on, (c) extracted part-lemmas
+with implies-posts don't unify across the match-arm projection
+boundary — prefer INLINE arms + tactic tuning, tuned on
+hand-isolated generated theorems, never blind.
