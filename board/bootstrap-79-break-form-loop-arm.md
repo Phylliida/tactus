@@ -385,3 +385,20 @@ bridges must all hold), probe9 count_to_len CLOSE, probe13 kills on
 the five new channels (setup drop / break-oblig drop / guard-leaf
 degen / negneg degen / use-leaf degen), probe11 tgt regen (copy_word +
 find_cancellation_exec return), full battery.
+
+**Gate-4/5 (same day):** `assert … by` pairing REVERTED — the Tactus
+backend DROPS lemma-call posts from assert-by blocks (the generated VC
+sees only `True →`; the closer had to re-prove the IH equalities from
+scratch — confirmed by hand-elaborating the generated theorem:
+`constructor <;> assumption` fails with no posts in ctx). This is the
+probe33-F1 class (proof-fn calls under `assert forall…by` dropped) one
+level down; the Z3-Verus "assert-by scoping" idiom does NOT carry over.
+Gate-5 structure instead: (a) the two branch bodies extracted into
+NON-cycle part-lemmas `wp_stm_sound_loop_classical` / `_bf` (IH facts
+as `requires`; the arm = 4 direct IH calls + the if + 2 lemma calls),
+(b) the `wp_stm_sound` closer ladder gains an omega-FIRST branch —
+hand-isolating the failing chain-3 termination VC showed the zetaDelta
+simp_all branch burns 123s (tips over 1.6M heartbeats in-gate) while
+`intros <;> cases s <;> omega` closes it in 1.9s (the height goal is
+pure once `cases s` exposes the ctor; VCs needing the simp reduction
+fail omega in ~2s and fall through to the pre-b79 branch).
