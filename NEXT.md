@@ -62,9 +62,12 @@ find_cancellation_exec now census-reject `break-or-continue` before
 the Call arm (find_cancellation LOST its b77-era cert = tgt coverage
 regression the stale-on-disk certs had masked). probe11 regen: 9/9
 remaining certs CLOSE + new subject-population pin keeps the 2
-absences loud. NEXT = break-form loop arm (serializer Loop vocab +
-refWp mirror + W5 churn — gates S5's call-mut census retirement AND
-find_cancellation's return) → S5 proper → A7
+absences loud. NEXT = break-form loop arm — card
+`board/bootstrap-79-break-form-loop-arm.md` (step-0 frozen: the
+break-form has THREE invariant phases vs classical TWO; exit side
+hoists setup+¬cond, maintain wraps inline; design = NO Break arm,
+mirror at original_cond level, Loop-node vocab growth; Danielle
+sequenced it before A7) → S5 proper → A7
 (stage-B callee-signature vocab — closes vec_read, vec_push7,
 fill_zeros AND find_cancellation, derives poison + N2 detector
 reference-side) → B (b67 caching + b68 flip)**. D's in-model

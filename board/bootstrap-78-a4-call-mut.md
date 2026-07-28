@@ -529,7 +529,10 @@ row in the gate report updates automatically (tags are data-driven).
    cert-lane note already flags "must eventually be mirrored
    refWp-side"). This gates BOTH S5 (call-mut census retirement on
    tgt) AND find_cancellation_exec's return to the A7 tripwire set.
-   Sequencing vs A7 = Danielle's call.
+   Danielle sequenced it BEFORE A7 (2026-07-28). Card:
+   `board/bootstrap-79-break-form-loop-arm.md` (step-0 evidence frozen;
+   design direction = NO Break arm — mirror at `original_cond` level,
+   vocab growth on the existing Loop node).
 
 ## Open items (resolve at impl, not design blockers)
 

@@ -24,7 +24,7 @@
 # (lost its b77-era cert) and copy_word (the b78-S5 call-mut subject) — both
 # census-reject `break-or-continue` since the 4th-sync loop_normalize pre-pass
 # rewrites their call-in-cond whiles to break-form. Unblock = the break-form
-# loop arm (board/bootstrap-78-a4-call-mut.md §5). Regen = the cold emit
+# loop arm (board/bootstrap-79-break-form-loop-arm.md). Regen = the cold emit
 # below, run TWICE (once per module: runtime, todd_coxeter_rt) into the same
 # OUT.
 #
