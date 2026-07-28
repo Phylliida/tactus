@@ -300,6 +300,28 @@ pub enum StmData {
     ///   leaf ids, distinct from the init obligations' plain-`i`
     ///   texts). Index-aligned with `inv_obligs`; closed ONLY at
     ///   maintain-reclose (init keeps `inv_obligs`).
+    /// * `inv_obligs_break` — the EXIT-RECLOSE obligations
+    ///   (bootstrap-79, break-form loops only): the invariant texts at
+    ///   the post-SETUP rename state, closed at the normalized body's
+    ///   `if ¬cond { break }` break leaf. Byte-equal to `inv_obligs`
+    ///   when the setup rebinds no mod var (the common case — cond
+    ///   setup assigns only compiler temps). `RawExpList::Nil` for
+    ///   classical empty-setup loops (no break leaf ever fires).
+    /// * `setup` — the transcribed cond-setup stms (bootstrap-79):
+    ///   `StmData::Skip` for a classical empty-setup while; otherwise
+    ///   the `original_cond` setup (ordinary Assign/Call content).
+    ///   refWp splices the setup's frames at the THREE positions
+    ///   production's two physical walks produce them (maintain/body
+    ///   walk under the maintain telescope; exit-reclose telescope;
+    ///   post-loop continuation prefix) — ONE transcription, TWO
+    ///   derivations, the `decide` bridge validates both against
+    ///   production's body copy and `original_cond` exit copy.
+    /// * `neg_neg_cond_ann` — the ANNOTATED `¬(¬cond)` leaf (the
+    ///   normalized If's ELSE-guard, maintain path; break-form only,
+    ///   999999 sentinel for classical). The exit-side guard reuses
+    ///   `neg_cond_ann`; both guard hyps share `cond_name` (the
+    ///   per-goal-path walk ordinals coincide — the d_old eq-hyp is
+    ///   name-based, not ordinal-consuming).
     /// * `binders` — the modified-local havoc set `(id, typ leaf)`.
     /// * `binder_bounds` — parallel `(NoBound | Bound(_h_hoist name, range
     ///   prop))` per modified local (production re-asserts each mod-var's
@@ -321,11 +343,13 @@ pub enum StmData {
         inv_hyps: Box<BinderList>,
         inv_obligs: Box<RawExpList>,
         inv_obligs_exit: Box<RawExpList>,
+        inv_obligs_break: Box<RawExpList>,
         binders: Box<BinderList>,
         binder_bounds: Box<ParamBoundList>,
         cond_name: u64,
         cond_ann: u64,
         neg_cond_ann: u64,
+        neg_neg_cond_ann: u64,
         cond_poison: u64,
         d_old_name: u64,
         d_old_ty: u64,
@@ -333,6 +357,7 @@ pub enum StmData {
         d_old_eq_name: u64,
         d_old_eq_prop: u64,
         decrease_oblig: RawExp,
+        setup: Box<StmData>,
         body: Box<StmData>,
     },
     /// StmX::AssertQuery (mode NonLinear) — an ISOLATED verification
@@ -848,14 +873,16 @@ pub open spec fn stm_size(s: StmData) -> nat
         // Mirrors the serializer token count: head + pos-binder Cons + bodies.
         StmData::IfCtor { pos_binders, eq_name: _, eq_prop: _, eq_poison: _, neg_name: _, neg_prop: _, neg_poison: _, thn, els } =>
             1 + binder_len(*pos_binders) + stm_size(*thn) + stm_size(*els),
-        StmData::Loop { inv_hyps, inv_obligs, inv_obligs_exit, binders, binder_bounds: _, cond_name: _, cond_ann: _, neg_cond_ann: _, cond_poison: _, d_old_name: _, d_old_ty: _, d_old_val: _, d_old_eq_name: _, d_old_eq_prop: _, decrease_oblig: _, body } =>
+        StmData::Loop { inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds: _, cond_name: _, cond_ann: _, neg_cond_ann: _, neg_neg_cond_ann: _, cond_poison: _, d_old_name: _, d_old_ty: _, d_old_val: _, d_old_eq_name: _, d_old_eq_prop: _, decrease_oblig: _, setup, body } =>
             // Mirrors the serializer's `stm_size_of` token count, which sums
             // stmt heads + LeafList/BinderList/RawExpList `Cons` — `inv_hyps`
-            // and `binders` are BinderLists (counted); `inv_obligs` and
-            // `inv_obligs_exit` are the parallel DEEP-obligation RawExpLists
-            // (counted, W6d.1b-iii); `binder_bounds` is a ParamBoundList
-            // (NOT counted, same as FnCtxData's); the scalar leaves add 0.
-            1 + binder_len(*inv_hyps) + raw_exp_list_len(*inv_obligs) + raw_exp_list_len(*inv_obligs_exit) + binder_len(*binders) + stm_size(*body),
+            // and `binders` are BinderLists (counted); `inv_obligs`,
+            // `inv_obligs_exit` and `inv_obligs_break` are the parallel
+            // DEEP-obligation RawExpLists (counted, W6d.1b-iii);
+            // `binder_bounds` is a ParamBoundList (NOT counted, same as
+            // FnCtxData's); the scalar leaves add 0; `setup` is an ordinary
+            // StmData (counted, bootstrap-79).
+            1 + binder_len(*inv_hyps) + raw_exp_list_len(*inv_obligs) + raw_exp_list_len(*inv_obligs_exit) + raw_exp_list_len(*inv_obligs_break) + binder_len(*binders) + stm_size(*setup) + stm_size(*body),
         StmData::Skip => 1,
         StmData::Seq(a, b) => 1 + stm_size(*a) + stm_size(*b),
     }
