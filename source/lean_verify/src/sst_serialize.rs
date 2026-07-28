@@ -150,6 +150,24 @@
 //!   `OblCtx::split_leading_binders` — the extracted prefix contains no
 //!   lets, so positions coincide with walk ordinals) so the binder-name
 //!   ids unify with the goal side.
+//!   bootstrap-79 (break-form): when the loop is `loop_normalize`'s
+//!   canonical `loop { setup; if !exp { break; } body }` (cond: None,
+//!   original_cond: Some((setup, exp)), non-empty setup, exactly the
+//!   synthesized guard break), the Loop node additionally carries the
+//!   transcribed setup (`setup` — ONE transcription from
+//!   `original_cond`; refWp derives the maintain-inline and
+//!   exit-hoisted renderings), the exit-reclose obligations
+//!   (`inv_obligs_break` — invariant texts at the post-setup rename
+//!   state), and the three cond-flavored guard leaves production's
+//!   three goal families actually carry (`break_guard_ann` = span_mark'd
+//!   `¬exp` for the exit-reclose telescope, `neg_neg_cond_ann` =
+//!   `¬(span_mark'd ¬exp)` for the maintain else-guard,
+//!   `break_use_ann` = BARE `¬exp` for the post-loop exit-fact hyp —
+//!   production's exit_wrap pushes `LExpr::not(cond)` unmarked). The
+//!   classical slots stay in their classical shapes (`neg_cond_ann` =
+//!   999999 for break-form; the three break-form slots = 999999 for
+//!   classical). Anything else with a `Break` keeps the loud
+//!   `break-or-continue` reject.
 //! * `StmX::Call` (bootstrap-02b — THE one non-transcription trusted
 //!   step). The callee's `requires`/`ensures` are VIR-AST clauses that
 //!   must be INSTANTIATED at THIS call's actual args before they can be
@@ -181,11 +199,20 @@
 //!   `_tactus_ensures_` theorem, S1b/mul_bound), loop entry invs
 //!   +|invs| before the body walk, loop maintain + decrease +|invs|+1
 //!   after, each Ret terminal +|obligation list|, each call
-//!   +muts+1(+1 iff requires), and the two-way-join desugar REPLAYS the
+//!   +muts+1(+1 iff requires), the two-way-join desugar REPLAYS the
 //!   reused continuation's theorem count after the else branch —
 //!   production clones `after` into both branch Wps and consumes twice
 //!   (S1b/count_down id 5, clamped_inc ids 4-5; a gensym-consuming
-//!   continuation rejects `call-in-branch-join`). This row is NOT a trusted
+//!   continuation rejects `call-in-branch-join`), and a break-form
+//!   loop's cond-setup walks TWICE (bootstrap-79): the body run (the
+//!   normalized body's inline copy) consumes its call ordinals between
+//!   the entry and exit-reclose theorems, the exit-reclose theorems
+//!   (+|invs|) land between the body-run setup and the user-body walk
+//!   (mirroring the break leaf's position in production's emission),
+//!   and the exit replay (production's `exit_wrap` re-running
+//!   `build_wp(cond_setup, …)` around the post-loop continuation)
+//!   consumes the setup's ordinals AGAIN after the decrease theorem
+//!   (count_to_len ids 2/7, copy_word ids 5/20). This row is NOT a trusted
 //!   predicate (unlike poison / the N2 peel): it is CHECKED twice — at
 //!   emission time, the replayed per-theorem id predictions are compared
 //!   element-wise against the ids production's goal names carry
@@ -214,7 +241,13 @@
 //!   and their isolated contexts (tags `assert-bitvector`/`assert-query`).
 //! * `StmX::OpenInvariant` / `ClosureInner` / `BreakOrContinue` —
 //!   concurrency, closures, loop control. `BreakOrContinue` therefore also
-//!   excludes `invariant_except_break` loops.
+//!   excludes `invariant_except_break` loops. The ONE Break the walk
+//!   accepts is `loop_normalize`'s synthesized guard break inside the
+//!   canonical break-form — and it is never walked: the Loop arm
+//!   pattern-matches the shape and mirrors at the `original_cond` level
+//!   (bootstrap-79). Verus-lowered user while-with-breaks (original_cond
+//!   with an EMPTY setup — production's `original_cond_recoverable`
+//!   path, vacuous break-leaf goals) stay rejected for now.
 //! * `check.unwind`, masks, recommends, fuel/reveal *state*,
 //!   `assert_id`/`base_error`, `mode`, trait dispatch/impl-subst — none
 //!   bear a stage-A obligation the mirror models. (`check.local_decls`
@@ -746,6 +779,97 @@ impl<'a> Serializer<'a> {
             inner,
         );
         Ok(self.leaves.intern(pp_expr(&LExpr::not(marked))))
+    }
+
+    /// Render `¬(¬<annotated e>)` as a leaf (bootstrap-79) — the
+    /// normalized If's ELSE-guard hypothesis on the maintain path.
+    /// `loop_normalize` synthesizes `if !exp { break; }`, so the else
+    /// branch's guard is the negation of the span_mark'd `¬exp` —
+    /// production's If walk pushes `LExpr::not(cond_marked)` where
+    /// `cond_marked` is exactly the marked `¬exp` `neg_oblig_leaf`
+    /// builds. Reconstructed via the identical `span_mark` → `not` →
+    /// `not` → `pp_expr` path (the @rust comment stays on the INNER
+    /// `¬exp`, matching the goal side's `¬(/- @rust:… -/ ¬(…))`).
+    fn neg_neg_oblig_leaf(&mut self, e: &Exp) -> Sr<u64> {
+        let inner_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(e, &self.render_ctx())
+            .map_err(|reason| format!("leaf-render: {}", reason))?;
+        let inner = self.apply_renames(&inner_raw);
+        let loc = crate::obligation_naming::format_rust_loc(&e.span);
+        let marked = LExpr::span_mark(
+            loc,
+            Some(e.span.clone()),
+            AssertKind::Obligation(ObligationKind::Plain),
+            inner,
+        );
+        Ok(self.leaves.intern(pp_expr(&LExpr::not(LExpr::not(marked)))))
+    }
+
+    /// Render `/- @rust:…-/ ¬<e>` — the span_mark'd NEGATION (bootstrap-79,
+    /// the exit-reclose telescope's If-then-guard hyp): production's
+    /// walk_if marks the synthesized `¬exp` itself, so the @rust comment
+    /// sits OUTSIDE the negation (unlike `neg_oblig_leaf`'s
+    /// `¬(/- …-/ …)`).
+    fn marked_neg_cond_leaf(&mut self, e: &Exp) -> Sr<u64> {
+        let inner_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(e, &self.render_ctx())
+            .map_err(|reason| format!("leaf-render: {}", reason))?;
+        let inner = self.apply_renames(&inner_raw);
+        let loc = crate::obligation_naming::format_rust_loc(&e.span);
+        let marked = LExpr::span_mark(
+            loc,
+            Some(e.span.clone()),
+            AssertKind::Obligation(ObligationKind::Plain),
+            LExpr::not(inner),
+        );
+        Ok(self.leaves.intern(pp_expr(&marked)))
+    }
+
+    /// Render BARE `¬<e>` (bootstrap-79, the post-loop continuation's
+    /// exit-fact hyp): production's `build_wp_loop` exit_wrap pushes
+    /// `LExpr::not(lower_validated(cond))` with NO span_mark.
+    fn bare_neg_cond_leaf(&mut self, e: &Exp) -> Sr<u64> {
+        let inner_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(e, &self.render_ctx())
+            .map_err(|reason| format!("leaf-render: {}", reason))?;
+        let inner = self.apply_renames(&inner_raw);
+        Ok(self.leaves.intern(pp_expr(&LExpr::not(inner))))
+    }
+
+    /// The invariant texts with the CURRENT shadow renames applied —
+    /// the re-close obligations at whatever walk point we're at
+    /// (bootstrap-79, factored out of `loop_stm`): post-SETUP for the
+    /// exit-reclose family (`inv_obligs_break`), post-BODY for the
+    /// maintain-reclose family (`inv_obligs_exit`). Slot discipline
+    /// (production's ob-drives, sum_to evidence): a renamed text whose
+    /// id is ALREADY deep (the renames were a no-op — same interned id
+    /// as the init's deep leaf) keeps the init's deep `RawExp.Span`
+    /// slot; a genuinely renamed text (a NEW id, not in `deep_ids`) is
+    /// the opaque `atom_ob` fallback — matching the production goal
+    /// side exactly.
+    fn renamed_inv_slots(&mut self, invs: &[LoopInv], init_slots: &[String]) -> Sr<Vec<String>> {
+        let mut slots: Vec<String> = Vec::new();
+        for (i, li) in invs.iter().enumerate() {
+            let inner = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(
+                &li.inv,
+                &self.render_ctx(),
+            )
+            .map_err(|reason| format!("leaf-render: {}", reason))?;
+            let renamed = self.apply_renames(&inner);
+            let loc = crate::obligation_naming::format_rust_loc(&li.inv.span);
+            let marked = LExpr::span_mark(
+                loc,
+                Some(li.inv.span.clone()),
+                AssertKind::Obligation(ObligationKind::Plain),
+                renamed,
+            );
+            let id = self.leaves.intern(pp_expr(&marked));
+            if self.deep_ids.contains(&id) {
+                // The renames were a no-op on this invariant: the init's
+                // deep slot (same id) is the correct re-close slot too.
+                slots.push(init_slots[i].clone());
+            } else {
+                slots.push(atom_ob_lit(id));
+            }
+        }
+        Ok(slots)
     }
 
     /// Render the single-level loop decrease obligation as an ANNOTATED
@@ -3593,6 +3717,30 @@ impl<'a> Serializer<'a> {
             (None, Some((_, c))) => c,
             (None, None) => return Err("loop-without-cond".to_string()),
         };
+        // bootstrap-79: the canonical break-form — `loop_normalize`'s
+        // output (cond: None, original_cond: Some((setup, exp)), body =
+        // Block[setup-copy, If(¬exp, break, None), user-body], setup
+        // non-empty). Mirror at the `original_cond` level (NO Break
+        // arm): transcribe the setup ONCE from `original_cond`, walk the
+        // USER body. Anything else with a Break keeps the loud
+        // `break-or-continue` tag (genuine user break/continue — no
+        // corpus population), including Verus-lowered user
+        // while-with-breaks (their original_cond has an EMPTY setup —
+        // production's `original_cond_recoverable` path renders vacuous
+        // break-leaf goals the mirror does not yet model).
+        let break_form: Option<(&Stm, &Stm)> = match (cond, original_cond, &body.x) {
+            (None, Some((o_setup, _)), StmX::Block(ss))
+                if ss.len() == 3
+                    && !matches!(&o_setup.x, StmX::Block(es) if es.is_empty())
+                    && matches!(&ss[1].x,
+                        StmX::If(guard_cond, then_stm, None)
+                            if matches!(&guard_cond.x, ExpX::Unary(UnaryOp::Not, _))
+                                && matches!(&then_stm.x, StmX::BreakOrContinue { label: None, is_break: true })) =>
+            {
+                Some((o_setup, &ss[2]))
+            }
+            _ => None,
+        };
         // Stage A: single-level `decreases` only. A multi-level lex
         // measure needs the full `lex_decrease_obligation` chain +
         // per-level d_old lets the flat mirror does not carry.
@@ -3672,24 +3820,6 @@ impl<'a> Serializer<'a> {
             inv_slots.push(slot);
         }
 
-        // The loop condition: one shared `_h_hoist_i` name for both the
-        // maintain hyp (`cond_ann`) and the use hyp (`neg_cond_ann`), the
-        // last hyp in the telescope (counter not consumed further); plus
-        // the cond's poison bit (a cond mentioning a residue let forces
-        // whole-goal wrap).
-        let cond_name = self.next_hyp_name();
-        let cond_ann = self.oblig_leaf(cond_exp)?;
-        let neg_cond_ann = self.neg_oblig_leaf(cond_exp)?;
-        let cond_inner_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(
-            cond_exp,
-            &self.render_ctx(),
-        )
-        .map_err(|reason| format!("leaf-render: {}", reason))?;
-        let cond_poison = self.hyp_poison(&self.apply_renames(&cond_inner_raw));
-        if cond_poison == 1 {
-            self.mark_poison_forced();
-        }
-
         // Decreases snapshot let — an FLetH binder pair (the
         // `_tactus_d_old_<id>_0 : T` binder + its equation
         // `_h__tactus_d_old_<id>_0_hoist1 : _tactus_d_old_<id>_0 = D`,
@@ -3732,14 +3862,75 @@ impl<'a> Serializer<'a> {
         // (one per inv) at the loop head, BEFORE walking the body
         // (fill_zeros: entry 2,3,4 precede the in-body call's 5,6).
         self.consume_theorem_ids(invs.len() as u64);
-        let loop_counter_end = self.hyp_ordinal;
         // Wrap-latch scope (bootstrap-78 S3): a plain FLet inside the
         // body (a mut-call rebind) wrap-forces the BODY's downstream
         // goals only — production's post-loop frames drop body frames,
         // so post-loop goals hoist (and freshen) again (fill_zeros
         // `v_hoist1` Ret evidence). Restore alongside `hyp_ordinal`.
         let flet_forced_save = self.flet_forced;
-        let body_term = self.stm(body)?;
+        // bootstrap-79 break-form: walk the setup ONCE from
+        // `original_cond` (the body-run side — consumes the setup's
+        // emit ordinals and hyp names, applies the setup's renames),
+        // derive the exit-reclose obligations at the post-setup rename
+        // state, and consume the exit-reclose theorems (production's
+        // break leaf emits between the setup run and the user-body
+        // walk: count_to_len ids 2 [call], 3 [exit-reclose]). The
+        // restore point for the post-loop path is PRE-setup (the exit
+        // replay re-walks the setup — its hyps renumber from there).
+        let (setup_term, inv_obligs_break, pre_setup_ordinal) = if let Some((o_setup, _)) = break_form {
+            let pre = self.hyp_ordinal;
+            let setup_term = self.stm(o_setup)?;
+            let break_slots = self.renamed_inv_slots(invs, &inv_slots)?;
+            self.consume_theorem_ids(invs.len() as u64);
+            (setup_term, raw_exp_list(&break_slots), pre)
+        } else {
+            (self.skip(), raw_exp_list(&[]), 0)
+        };
+        // The guard/cond leaves — shared position: post-setup for the
+        // break-form (the setup rebinds no mod var in the common case,
+        // so this coincides with the classical pre-body state), pre-body
+        // for classical. One shared `_h_hoist_i` name for every
+        // cond-flavored hyp (the maintain hyp `cond_ann` / use hyp
+        // `neg_cond_ann` for classical; the exit-reclose / maintain /
+        // post-loop guards for break-form — per-goal-path ordinals
+        // coincide since the d_old eq-hyp is name-based); plus the
+        // cond's poison bit (a cond mentioning a residue let forces
+        // whole-goal wrap).
+        let cond_name = self.next_hyp_name();
+        let cond_ann = self.oblig_leaf(cond_exp)?;
+        let (neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann) =
+            if break_form.is_some() {
+                (
+                    // The classical use-hyp shape `¬(/- …-/ cond)` does not
+                    // occur in break-form goals (the exit_wrap hyp is the
+                    // BARE `¬cond` — `break_use_ann`).
+                    999999,
+                    self.neg_neg_oblig_leaf(cond_exp)?,
+                    self.marked_neg_cond_leaf(cond_exp)?,
+                    self.bare_neg_cond_leaf(cond_exp)?,
+                )
+            } else {
+                (self.neg_oblig_leaf(cond_exp)?, 999999, 999999, 999999)
+            };
+        let cond_inner_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(
+            cond_exp,
+            &self.render_ctx(),
+        )
+        .map_err(|reason| format!("leaf-render: {}", reason))?;
+        let cond_poison = self.hyp_poison(&self.apply_renames(&cond_inner_raw));
+        if cond_poison == 1 {
+            self.mark_poison_forced();
+        }
+        // The restore point: classical = the telescope end (post-cond);
+        // break-form = PRE-setup (the exit replay re-walks the setup for
+        // the post-loop goals — its hyps renumber from there, e.g.
+        // count_to_len's postcondition `_h_hoist_3` bound hyp).
+        let loop_counter_end = if break_form.is_some() { pre_setup_ordinal } else { self.hyp_ordinal };
+        let walk_body: &Stm = match break_form {
+            Some((_, user_body)) => user_body,
+            None => body,
+        };
+        let body_term = self.stm(walk_body)?;
         self.hyp_ordinal = loop_counter_end;
         self.flet_forced = flet_forced_save;
         // Counter mirror: MAINTAIN theorems (one per inv) + the DECREASE
@@ -3758,38 +3949,8 @@ impl<'a> Serializer<'a> {
         // texts with the body's shadow renames applied
         // (`i_hoist1 ≤ n`, `Int.toNat acc_hoist1 = lib.tri (Int.toNat
         // i_hoist1)` — fresh leaf ids, distinct from the init
-        // obligations' plain texts). Slot discipline (production's
-        // ob-drives, sum_to evidence): a renamed text whose id is
-        // ALREADY deep (an invariant the renames leave untouched —
-        // `n ≤ 1000` reuses the init's deep leaf id) keeps the deep
-        // `RawExp.Span` slot; a genuinely renamed text (a NEW id, not
-        // in `deep_ids`) is the opaque `atom_ob` fallback — matching
-        // the production goal side exactly.
-        let mut exit_slots: Vec<String> = Vec::new();
-        for (i, li) in invs.iter().enumerate() {
-            let inner = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(
-                &li.inv,
-                &self.render_ctx(),
-            )
-            .map_err(|reason| format!("leaf-render: {}", reason))?;
-            let renamed = self.apply_renames(&inner);
-            let loc = crate::obligation_naming::format_rust_loc(&li.inv.span);
-            let marked = LExpr::span_mark(
-                loc,
-                Some(li.inv.span.clone()),
-                AssertKind::Obligation(ObligationKind::Plain),
-                renamed,
-            );
-            let id = self.leaves.intern(pp_expr(&marked));
-            if self.deep_ids.contains(&id) {
-                // The renames were a no-op on this invariant: the init's
-                // deep slot (same id) is the correct exit slot too.
-                exit_slots.push(inv_slots[i].clone());
-            } else {
-                exit_slots.push(atom_ob_lit(id));
-            }
-        }
-        let inv_obligs_exit = raw_exp_list(&exit_slots);
+        // obligations' plain texts).
+        let inv_obligs_exit = raw_exp_list(&self.renamed_inv_slots(invs, &inv_slots)?);
 
         // Loop exit: the use telescope re-binds the mod-vars under their
         // SOURCE names, so the shadow renames for them end here
@@ -3799,17 +3960,46 @@ impl<'a> Serializer<'a> {
             self.rename_env.remove(name.as_str());
         }
 
+        // bootstrap-79 break-form EXIT REPLAY: production's exit_wrap
+        // re-walks the setup around the post-loop continuation
+        // (`build_wp_loop`: build_wp(cond_setup, Hyp(¬cond, after))), so
+        // the setup's calls consume their OWN emit ordinals (count_to_len
+        // id 7, copy_word id 20) and its hyps number per the post-loop
+        // path (the len bound is `_h_hoist_3` again, then the bare-¬cond
+        // exit hyp — the SAME ordinal as the walk guard `cond_name`,
+        // since both are the first hyp minted after the setup frames on
+        // their respective paths). Replay the walk for those counter
+        // effects only: the output is discarded (the Loop node carries
+        // ONE setup transcription; refWp derives both renderings) and the
+        // name/rename state is restored (the exit replay is a fresh goal
+        // path — production does NOT freshen tmp__2/tmp__1 there).
+        if let Some((o_setup, _)) = break_form {
+            let save_renames = self.rename_env.clone();
+            let save_bound = self.bound_names.clone();
+            let _replay_term = self.stm(o_setup)?;
+            let replay_guard = self.next_hyp_name();
+            if replay_guard != cond_name {
+                return Err("loop-break-form-replay-drift".to_string());
+            }
+            self.rename_env = save_renames;
+            self.bound_names = save_bound;
+        }
+
         Ok(format!(
-            "({}.StmData.Loop {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {})",
+            "({}.StmData.Loop {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {})",
             NS,
             box_(&inv_hyps),
             box_(&inv_obligs),
             box_(&inv_obligs_exit),
+            box_(&inv_obligs_break),
             box_(&binders),
             box_(&bounds),
             cond_name,
             cond_ann,
             neg_cond_ann,
+            neg_neg_cond_ann,
+            break_guard_ann,
+            break_use_ann,
             cond_poison,
             d_old_name,
             d_old_ty,
@@ -3819,6 +4009,7 @@ impl<'a> Serializer<'a> {
             // W6d.2a: decrease_oblig is now a DEEP `RawExp` (like Assert);
             // opaque fallback wraps the synthesized `0 ≤ D ∧ D < d_old` leaf id.
             atom_ob_lit(decrease_oblig),
+            box_(&setup_term),
             box_(&body_term),
         ))
     }
