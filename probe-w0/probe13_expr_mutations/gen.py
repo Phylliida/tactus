@@ -362,6 +362,98 @@ def mut_gensym_rename(sst):
     return sst[:sp[0]] + "999999" + sst[sp[1]:]
 
 
+# ── bootstrap-79: the break-form Loop kills (subject count_to_len — the
+# minimal call-in-cond while; ONE Loop node). One kill per new Loop-arm
+# output channel: the transcribed setup, the exit-reclose obligations,
+# and the three cond-flavored guard leaves. All SST-side.
+
+def _loop_args(sst):
+    """Locate the (single) `lib.StmData.Loop` node and return its positional
+    arg spans: (6 boxed lists, 12 scalars, decrease_oblig, setup, body).
+    Layout per tactus-core (b79): inv_hyps, inv_obligs, inv_obligs_exit,
+    inv_obligs_break, binders, binder_bounds, then cond_name, cond_ann,
+    neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann,
+    cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name,
+    d_old_eq_prop, then decrease_oblig (RawExp), setup, body."""
+    key = "lib.StmData.Loop "
+    j = sst.find(key)
+    assert j != -1, "loop: no `lib.StmData.Loop` node — subject lost its loop"
+    assert sst.find(key, j + 1) == -1, "loop: multiple Loop nodes; splitter assumes one"
+    i = j + len(key)
+    lists = []
+    for _ in range(6):
+        sp = take_sexpr(sst, i)
+        assert sst[sp[0]] == '(', f"loop: list arg not a paren group: {sst[sp[0]:sp[1]]!r}"
+        lists.append(sp)
+        i = sp[1]
+    scalars = []
+    for _ in range(12):
+        sp = take_sexpr(sst, i)
+        assert sst[sp[0]:sp[1]].isdigit(), f"loop: expected scalar, got {sst[sp[0]:sp[1]]!r}"
+        scalars.append(sp)
+        i = sp[1]
+    decrease = take_sexpr(sst, i)
+    setup = take_sexpr(sst, decrease[1])
+    body = take_sexpr(sst, setup[1])
+    assert sst[setup[0]] == '(' and sst[body[0]] == '(', "loop: setup/body not paren groups"
+    return lists, scalars, setup, body
+
+
+def loop_setup_drop(sst):
+    """b79 kill (SST-side): drop the transcribed cond-setup (setup → Skip):
+    refWp takes the CLASSICAL derivation — no exit-reclose family, the
+    classical cond-hyp maintain telescope, no setup prefix on the
+    post-loop continuation — so production's break-form goals diverge on
+    EVERY family. Models the Loop arm silently dropping the setup slot
+    (the byte-stability churn check in reverse)."""
+    _, _, (s0, s1), _ = _loop_args(sst)
+    assert "Skip" not in sst[s0:s1], "loop_setup_drop: setup already Skip (not a break-form subject)"
+    return sst[:s0] + "(Tactus.Box.mk lib.StmData.Skip)" + sst[s1:]
+
+
+def loop_break_oblig_drop(sst):
+    """b79 kill (SST-side): drop the exit-reclose obligations
+    (inv_obligs_break → Nil): the break-leaf goal family vanishes from
+    refWp's output while production emits |invs| exit-reclose theorems
+    (the normalized body's `if ¬exp { break }` break leaf)."""
+    lists, _, _, _ = _loop_args(sst)
+    s0, s1 = lists[3]
+    assert "RawExpList.Cons" in sst[s0:s1], "loop_break_oblig_drop: inv_obligs_break already Nil"
+    return sst[:s0] + "(Tactus.Box.mk lib.RawExpList.Nil)" + sst[s1:]
+
+
+def loop_guard_leaf_drop(sst):
+    """b79 kill (SST-side): degenerate the exit-guard leaf
+    (break_guard_ann — the SPAN-MARK'd `¬exp`, walk_if's annotation of
+    the synthesized guard) to the 999999 sentinel. The exit-reclose
+    telescope's guard hyp diverges from production's `/- @rust…-/ ¬(…)`."""
+    _, scalars, _, _ = _loop_args(sst)
+    s, e = scalars[4]  # break_guard_ann
+    assert sst[s:e] != "999999", "loop_guard_leaf_drop: break_guard_ann already sentinel?"
+    return sst[:s] + "999999" + sst[e:]
+
+
+def loop_negneg_leaf_drop(sst):
+    """b79 kill (SST-side): degenerate the maintain else-guard leaf
+    (neg_neg_cond_ann — the `¬(span_mark'd ¬exp)` double negation the
+    normalized If's else branch carries) to the 999999 sentinel."""
+    _, scalars, _, _ = _loop_args(sst)
+    s, e = scalars[3]  # neg_neg_cond_ann
+    assert sst[s:e] != "999999", "loop_negneg_leaf_drop: neg_neg_cond_ann already sentinel?"
+    return sst[:s] + "999999" + sst[e:]
+
+
+def loop_use_leaf_drop(sst):
+    """b79 kill (SST-side): degenerate the post-loop exit-fact leaf
+    (break_use_ann — the BARE `¬exp` production's exit_wrap pushes
+    unmarked) to the 999999 sentinel. The post-loop continuation's
+    ¬cond hyp diverges."""
+    _, scalars, _, _ = _loop_args(sst)
+    s, e = scalars[5]  # break_use_ann
+    assert sst[s:e] != "999999", "loop_use_leaf_drop: break_use_ann already sentinel?"
+    return sst[:s] + "999999" + sst[e:]
+
+
 # (fn, class, human description, mutation, which def the mutation edits, expect)
 #
 # expect="close": baseline bridges (=1) and the mutation kills (=0).
@@ -401,6 +493,13 @@ CLASSES = [
     ("call_inc", "mut_ens_hyp_drop",     "mut call: drop the instantiated-ensures hyp (Phase 3)",      mut_ens_hyp_drop,     "sst", "close"),
     ("call_inc", "mut_rebind_drop",      "mut call: drop the rebind FLet (Phase 4, stale-local)",      mut_rebind_drop,      "sst", "close"),
     ("call_inc", "mut_gensym_rename",    "mut call: single-site gensym-name divergence (counter channel)", mut_gensym_rename, "sst", "close"),
+    # bootstrap-79: the break-form Loop kills — one per new Loop-arm
+    # output channel, on the minimal call-in-cond subject count_to_len.
+    ("count_to_len", "loop_setup_drop",       "Loop break-form: drop the transcribed cond-setup (b79)",        loop_setup_drop,       "sst", "close"),
+    ("count_to_len", "loop_break_oblig_drop", "Loop break-form: drop the exit-reclose obligations (b79)",      loop_break_oblig_drop, "sst", "close"),
+    ("count_to_len", "loop_guard_leaf_drop",  "Loop break-form: degenerate the exit-guard span-mark'd ¬exp (b79)", loop_guard_leaf_drop, "sst", "close"),
+    ("count_to_len", "loop_negneg_leaf_drop", "Loop break-form: degenerate the maintain ¬(¬cond) else-guard (b79)", loop_negneg_leaf_drop, "sst", "close"),
+    ("count_to_len", "loop_use_leaf_drop",    "Loop break-form: degenerate the post-loop bare ¬cond (b79)",    loop_use_leaf_drop,    "sst", "close"),
 ]
 
 
