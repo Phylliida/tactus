@@ -1,0 +1,1 @@
+{"fn":"lib__u_fa_seq","vcs":[{"name":"_tactus_postcondition_u_fa_seq_at_lib_6007_13_1","leaf":"/- @rust:lib.rs:6007:13 -/ lib.frame_after f (lib.StmData.Seq a b) = lib.frame_after (lib.frame_after f a.deref) b.deref","spine":[{"k":"all","name":"f","ty":"lib.FrameList"},{"k":"all","name":"a","ty":"Tactus.Box lib.StmData"},{"k":"all","name":"b","ty":"Tactus.Box lib.StmData"}]}]}

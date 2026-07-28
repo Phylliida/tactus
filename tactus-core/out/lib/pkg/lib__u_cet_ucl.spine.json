@@ -1,0 +1,1 @@
+{"fn":"lib__u_cet_ucl","vcs":[{"name":"_tactus_postcondition_u_cet_ucl_at_lib_4858_13_1","leaf":"/- @rust:lib.rs:4858:13 -/ lib.close_e_tel (lib.FrameList.FUserCloser t) g = lib.close_e_tel t.deref g","spine":[{"k":"all","name":"t","ty":"Tactus.Box lib.FrameList"},{"k":"all","name":"g","ty":"lib.GoalData"}]}]}
