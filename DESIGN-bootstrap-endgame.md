@@ -362,8 +362,9 @@ Independent of the critical path; pick up in gap sessions:
 | 6 | A5 — Match arm (+ D model delta; batch churn w/ A3 + R1 per-goal-closer/force-wrap bit) | medium | new | — |
 | 6b | R2 — ledger mirror probe + walk_let recording (§10) | small-med | new | — |
 | 6c | R3 — wrap-mode Bool-let fixture (§10) | small | new | — |
-| 7 | A4 — call-mut arm (+ D model delta) | med-large | new (card first) | — |
-| 8 | A7 — stage-B callee-signature vocabulary | medium | new | — |
+| 7 | A4 — call-mut arm (+ D model delta) | med-large | b78 — S1..S4+S3-pre DONE 07-26; S5 BLOCKED (see 7b) | — |
+| 7b | break-form loop arm (4th-sync loop_normalize cert-lane debt; gates A4-S5 + find_cancellation return) | medium | b79 (carded 07-28, step-0 frozen) | — |
+| 8 | A7 — stage-B callee-signature vocabulary | medium | new | 7b (find_cancellation row) |
 | 9 | D — in-model tripwire column | small | new | — |
 | 10 | B1 — b67 caching + fingerprint + costs | medium | b67 | — |
 | 11 | B2 — b68 default flip | small | b68 | P2, P3, 1–8, 10 |
@@ -372,7 +373,10 @@ Independent of the critical path; pick up in gap sessions:
 | 13 | F — hygiene / vstd / differential | small ×3 | new ×3 | — |
 
 Items 2–4 are independent of each other and of 1; parallelize freely.
-7 and 8 are the only real machinery arcs left in the program.
+7, 7b and 8 are the only real machinery arcs left in the program.
+(7b inserted 2026-07-28: the 4th-sync loop_normalize pre-pass made
+call-in-cond whiles census-reject `break-or-continue`; Danielle
+sequenced the loop arm before A7.)
 ## 9. Open questions — all resolved 2026-07-24
 
 Danielle delegated these to Claude's judgment with the standing
