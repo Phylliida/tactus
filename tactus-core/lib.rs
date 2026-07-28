@@ -5733,10 +5733,14 @@ pub proof fn holds_all_close_each_e(hp: HpOracle, he: HeOracle, lv: LvOracle, f:
 // bootstrap-79: the Loop arm's branch bodies, EXTRACTED from
 // `wp_stm_sound` so the arm's postcondition VC stays small (inline, the
 // four break-form IH facts + the full split/close sequence blew the
-// whnf budget — gate-3). Each lemma takes its IH facts as `requires` —
-// they are NOT in the recursive cycle (no calls to `wp_stm_sound`), so
-// no termination VCs chain here. The ensures ctor matches the arm's
-// match-bound fields positionally, so the arm's call sites are defeq.
+// whnf budget — gate-3). The IH facts and the branch guard ride the
+// ensures as an IMPLICATION antecedent — NOT `requires`: a requires-
+// carrying callee generates assert/precondition VCs at the call sites,
+// which the Link discharge's fix closer pends on ("assert VCs in
+// recursive fn", gate-6). The lemmas stay OUT of the recursive cycle
+// (no calls to `wp_stm_sound`), so no termination VCs chain here. The
+// ensures ctor matches the arm's match-bound fields positionally, so
+// the arm's call sites are defeq.
 // ═════════════════════════════════════════════════════════════════════
 #[verifier::tactus_tactic("first | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc]) | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
 pub proof fn wp_stm_sound_loop_classical(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList,
@@ -5746,12 +5750,12 @@ pub proof fn wp_stm_sound_loop_classical(hp: HpOracle, he: HeOracle, lv: LvOracl
     neg_neg_cond_ann: u64, break_guard_ann: u64, break_use_ann: u64,
     cond_poison: u64, d_old_name: u64, d_old_ty: u64, d_old_val: u64, d_old_eq_name: u64,
     d_old_eq_prop: u64, decrease_oblig: RawExp, setup: Box<StmData>, body: Box<StmData>, st: St)
-    requires
-        is_skip(*setup) == 1,
-        holds_all(hp, he, lv,
-            wp_stm(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), st)
-            == exec_safe_f(hp, he, lv, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body, st),
-    ensures holds_all(hp, he, lv, wp_stm(f, StmData::Loop {
+    ensures
+        is_skip(*setup) == 1
+            && holds_all(hp, he, lv,
+                wp_stm(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), st)
+                == exec_safe_f(hp, he, lv, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body, st)
+        ==> holds_all(hp, he, lv, wp_stm(f, StmData::Loop {
             inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann,
             neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name,
             d_old_eq_prop, decrease_oblig, setup, body,
@@ -5790,18 +5794,18 @@ pub proof fn wp_stm_sound_loop_bf(hp: HpOracle, he: HeOracle, lv: LvOracle, f: F
     neg_neg_cond_ann: u64, break_guard_ann: u64, break_use_ann: u64,
     cond_poison: u64, d_old_name: u64, d_old_ty: u64, d_old_val: u64, d_old_eq_name: u64,
     d_old_eq_prop: u64, decrease_oblig: RawExp, setup: Box<StmData>, body: Box<StmData>, st: St)
-    requires
-        is_skip(*setup) != 1,
-        holds_all(hp, he, lv,
-            wp_stm(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), st)
-            == exec_safe_f(hp, he, lv, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup, st),
-        holds_all(hp, he, lv,
-            wp_stm(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), st)
-            == exec_safe_f(hp, he, lv, frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body, st),
-        holds_all(hp, he, lv,
-            wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup), st)
-            == exec_safe_f(hp, he, lv, loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup, st),
-    ensures holds_all(hp, he, lv, wp_stm(f, StmData::Loop {
+    ensures
+        is_skip(*setup) != 1
+            && holds_all(hp, he, lv,
+                wp_stm(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), st)
+                == exec_safe_f(hp, he, lv, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup, st)
+            && holds_all(hp, he, lv,
+                wp_stm(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), st)
+                == exec_safe_f(hp, he, lv, frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body, st)
+            && holds_all(hp, he, lv,
+                wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup), st)
+                == exec_safe_f(hp, he, lv, loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup, st)
+        ==> holds_all(hp, he, lv, wp_stm(f, StmData::Loop {
             inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann,
             neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name,
             d_old_eq_prop, decrease_oblig, setup, body,
@@ -6317,8 +6321,11 @@ pub proof fn wp_sound_bites_assert(hp: HpOracle, he: HeOracle, lv: LvOracle, o: 
 
 // (2) Loop INIT (probe24 witness 1): the invariant obligation must hold
 //     on ENTRY at the pre-loop state — deliverable only from the emitted
-//     init goal (he is opaque).
-#[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc])")]
+//     init goal (he is opaque). The closer carries `lib.is_skip` in the
+//     simp set (bootstrap-79): the b79 branch-gate `if is_skip(*setup)
+//     == 1` in u_esf_loop's post is a CLOSED ite here (setup = Skip) —
+//     the equation lemmas reduce it where the default set stalls.
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc, lib.is_skip])")]
 pub proof fn wp_sound_bites_loop_init(hp: HpOracle, he: HeOracle, lv: LvOracle,
     inv_hyps: Box<BinderList>, ob: Box<RawExp>, binders: Box<BinderList>,
     binder_bounds: Box<ParamBoundList>, cond_name: u64, cond_ann: u64, neg_cond_ann: u64,
@@ -6338,10 +6345,6 @@ pub proof fn wp_sound_bites_loop_init(hp: HpOracle, he: HeOracle, lv: LvOracle,
         }), st)
     ensures he(render_exp(*ob), st)
 {
-    // The b79 `if is_skip(*setup) == 1` branch gate: closed-literal
-    // reduction for the tactic (kernel iota; simp won't unfold a
-    // noncomputable spec fn's match).
-    assert(is_skip(StmData::Skip) == 1);
     wp_stm_sound(hp, he, lv, FrameList::FNil, StmData::Loop {
         inv_hyps,
         inv_obligs: Box::new(RawExpList::Cons(ob, Box::new(RawExpList::Nil))),
