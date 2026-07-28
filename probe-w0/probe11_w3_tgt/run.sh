@@ -17,6 +17,17 @@
 # assert-query serializer arms land, more tgt exec fns emit certs and this gate
 # re-runs with them.
 #
+# ── 2026-07-28 state (b78 S5 regen; supersedes the census facts above) ───────
+# 9 certs on disk, ALL CLOSE: runtime ×5 (apply_hom_gen/inv/symbol_exec,
+# impl__4__clone, is_inverse_pair_exec) + todd_coxeter_rt ×4. Two runtime fns
+# are documented ABSENT via the population pin below — find_cancellation_exec
+# (lost its b77-era cert) and copy_word (the b78-S5 call-mut subject) — both
+# census-reject `break-or-continue` since the 4th-sync loop_normalize pre-pass
+# rewrites their call-in-cond whiles to break-form. Unblock = the break-form
+# loop arm (board/bootstrap-78-a4-call-mut.md §5). Regen = the cold emit
+# below, run TWICE (once per module: runtime, todd_coxeter_rt) into the same
+# OUT.
+#
 # ── Regen the tgt cert (cold, cert on, targeted; ~80s) ───────────────────────
 #   OUT=probe-w0/probe11_w3_tgt/out
 #   source/target-verus/release/verus --lean-backend --crate-type=lib \
@@ -82,6 +93,31 @@ honest_fail_reason() {
 }
 is_honest_fail() { [ -n "$(honest_fail_reason "$1")" ]; }
 
+# ── Subject-population pin (b78 S5, 2026-07-28) ─────────────────────────────
+# A cert that VANISHES between regens is silent coverage loss (the loop below
+# only iterates what is on disk); a documented absence is the P2-legal
+# exception. Every previously-seen subject is either present below or listed
+# in expected_absent_reason with its census tag.
+#
+# 2026-07-28 regen state: the 4th-sync (fb23b6a) loop_normalize pre-pass
+# rewrites call-in-cond whiles (`while j < v.len()`) into break-form
+# (`loop { setup; if !exp { break; } body }`), and the stage-A stm walk
+# rejects BreakOrContinue loud BEFORE any other arm runs. Two runtime fns
+# tripped it: find_cancellation_exec (was certified + A7-class honest-fail
+# under b77 — its honest_fail_reason above is RETAINED, dormant, for the day
+# its cert returns) and copy_word (the b78-S5 call-mut subject — the tag
+# masks the call-mut census retirement S5 was to confirm). Unblock = the
+# break-form loop arm carded on board/bootstrap-78-a4-call-mut.md §5.
+expected_absent_reason() {
+  case "$1" in
+    runtime__find_cancellation_exec) printf '%s' 'break-or-continue census reject (b78 S5, 2026-07-28): loop_normalize break-form (call-in-cond while). Was certified + A7-class honest-fail (b77); cert returns when the break-form loop arm lands.' ;;
+    runtime__copy_word) printf '%s' 'break-or-continue census reject (b78 S5, 2026-07-28): same loop_normalize class; masks the call-mut census retirement. Becomes a subject when the loop arm lands — expect UNCLASSIFIED red then (card predicts A7-class honest-fail); classify at that point.' ;;
+    *) printf '%s' '' ;;
+  esac
+}
+# Every fn ever seen as a bridge subject or documented absentee.
+expected_subjects="runtime__apply_hom_gen runtime__apply_hom_inv runtime__apply_hom_symbol_exec runtime__impl__4__clone runtime__is_inverse_pair_exec runtime__find_cancellation_exec runtime__copy_word todd_coxeter_rt__inverse_column_exec todd_coxeter_rt__lemma_overflow_bounds todd_coxeter_rt__lemma_rt_trace_word_unfold todd_coxeter_rt__symbol_to_column_exec"
+
 echo "== W3 differential gate over tgt =="
 echo "cert dir : $CERT_DIR"
 echo "core out : $CORE_OUT"
@@ -99,6 +135,25 @@ printf "%-28s %-11s %8s %8s   %s\n" "fn" "verdict" "decide" "rfl" "class"
 printf "%-28s %-11s %8s %8s   %s\n" "--" "-------" "------" "---" "-----"
 
 fail=0
+
+# Population pin: every expected subject must be present OR documented-absent.
+for fn in $expected_subjects; do
+  if [ -f "$CERT_DIR/$fn.cert.lean" ]; then
+    reason="$(expected_absent_reason "$fn")"
+    if [ -n "$reason" ]; then
+      echo "SUBJECT-RETURNED: $fn has a cert again — retire its expected_absent_reason entry and classify the bridge verdict."; fail=1
+    fi
+  else
+    reason="$(expected_absent_reason "$fn")"
+    if [ -n "$reason" ]; then
+      echo "absent-ok  $fn"
+      echo "  ↳ reason: $reason"
+    else
+      echo "SUBJECT-VANISHED: $fn — no cert and no documented absence (silent coverage loss)"; fail=1
+    fi
+  fi
+done
+
 for cert in "$CERT_DIR"/*.cert.lean; do
   fn="$(basename "$cert" .cert.lean)"
   klass="CLOSE"; is_honest_fail "$fn" && klass="HONEST-FAIL"
