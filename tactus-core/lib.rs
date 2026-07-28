@@ -5730,6 +5730,153 @@ pub proof fn holds_all_close_each_e(hp: HpOracle, he: HeOracle, lv: LvOracle, f:
 }
 
 // ═════════════════════════════════════════════════════════════════════
+// bootstrap-79: the Loop arm's branch bodies, EXTRACTED from
+// `wp_stm_sound` so the arm's postcondition VC stays small (inline, the
+// four break-form IH facts + the full split/close sequence blew the
+// whnf budget — gate-3). Each lemma takes its IH facts as `requires` —
+// they are NOT in the recursive cycle (no calls to `wp_stm_sound`), so
+// no termination VCs chain here. The ensures ctor matches the arm's
+// match-bound fields positionally, so the arm's call sites are defeq.
+// ═════════════════════════════════════════════════════════════════════
+#[verifier::tactus_tactic("first | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc]) | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
+pub proof fn wp_stm_sound_loop_classical(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList,
+    inv_hyps: Box<BinderList>, inv_obligs: Box<RawExpList>, inv_obligs_exit: Box<RawExpList>,
+    inv_obligs_break: Box<RawExpList>, binders: Box<BinderList>,
+    binder_bounds: Box<ParamBoundList>, cond_name: u64, cond_ann: u64, neg_cond_ann: u64,
+    neg_neg_cond_ann: u64, break_guard_ann: u64, break_use_ann: u64,
+    cond_poison: u64, d_old_name: u64, d_old_ty: u64, d_old_val: u64, d_old_eq_name: u64,
+    d_old_eq_prop: u64, decrease_oblig: RawExp, setup: Box<StmData>, body: Box<StmData>, st: St)
+    requires
+        is_skip(*setup) == 1,
+        holds_all(hp, he, lv,
+            wp_stm(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), st)
+            == exec_safe_f(hp, he, lv, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body, st),
+    ensures holds_all(hp, he, lv, wp_stm(f, StmData::Loop {
+            inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann,
+            neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name,
+            d_old_eq_prop, decrease_oblig, setup, body,
+        }), st)
+        == exec_safe_f(hp, he, lv, f, StmData::Loop {
+            inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann,
+            neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name,
+            d_old_eq_prop, decrease_oblig, setup, body,
+        }, st)
+{
+    u_wp_loop(f, inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body);
+    u_esf_loop(hp, he, lv, f, inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body);
+    // the three ++ splits (init ++ (body ++ (reclose ++ decrease)))
+    holds_all_append(hp, he, lv, close_each_e(f, *inv_obligs),
+        goals_append(wp_stm(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body),
+            goals_append(close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit),
+                GoalList::Cons(Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)), Box::new(GoalList::Nil)))), st);
+    holds_all_append(hp, he, lv, wp_stm(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body),
+        goals_append(close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit),
+            GoalList::Cons(Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)), Box::new(GoalList::Nil))), st);
+    holds_all_append(hp, he, lv, close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit),
+        GoalList::Cons(Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)), Box::new(GoalList::Nil)), st);
+    // the four goal groups (body group = the IH fact in `requires`)
+    holds_all_close_each_e(hp, he, lv, f, *inv_obligs, st);          // init
+    holds_all_close_each_e(hp, he, lv, frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit, st);  // maintain-reclose
+    u_holds_all_cons(hp, he, lv, Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)), Box::new(GoalList::Nil));
+    u_holds_all_nil(hp, he, lv);
+    holds_close_e(hp, he, lv, frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig);  // decrease
+}
+
+#[verifier::tactus_tactic("first | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc]) | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
+pub proof fn wp_stm_sound_loop_bf(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList,
+    inv_hyps: Box<BinderList>, inv_obligs: Box<RawExpList>, inv_obligs_exit: Box<RawExpList>,
+    inv_obligs_break: Box<RawExpList>, binders: Box<BinderList>,
+    binder_bounds: Box<ParamBoundList>, cond_name: u64, cond_ann: u64, neg_cond_ann: u64,
+    neg_neg_cond_ann: u64, break_guard_ann: u64, break_use_ann: u64,
+    cond_poison: u64, d_old_name: u64, d_old_ty: u64, d_old_val: u64, d_old_eq_name: u64,
+    d_old_eq_prop: u64, decrease_oblig: RawExp, setup: Box<StmData>, body: Box<StmData>, st: St)
+    requires
+        is_skip(*setup) == 0,
+        holds_all(hp, he, lv,
+            wp_stm(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), st)
+            == exec_safe_f(hp, he, lv, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup, st),
+        holds_all(hp, he, lv,
+            wp_stm(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), st)
+            == exec_safe_f(hp, he, lv, frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body, st),
+        holds_all(hp, he, lv,
+            wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup), st)
+            == exec_safe_f(hp, he, lv, loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup, st),
+    ensures holds_all(hp, he, lv, wp_stm(f, StmData::Loop {
+            inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann,
+            neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name,
+            d_old_eq_prop, decrease_oblig, setup, body,
+        }), st)
+        == exec_safe_f(hp, he, lv, f, StmData::Loop {
+            inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann,
+            neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name,
+            d_old_eq_prop, decrease_oblig, setup, body,
+        }, st)
+{
+    u_wp_loop(f, inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body);
+    u_esf_loop(hp, he, lv, f, inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body);
+    // the six ++ splits (init ++ setup ++ exit-reclose ++ body
+    // ++ maintain-reclose ++ (decrease ++ replay))
+    holds_all_append(hp, he, lv, close_each_e(f, *inv_obligs),
+        goals_append(
+            wp_stm(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup),
+            goals_append(
+                close_each_e(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil))), *inv_obligs_break),
+                goals_append(
+                    wp_stm(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
+                    goals_append(
+                        close_each_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
+                        goals_append(
+                            GoalList::Cons(Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
+                            wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup)))))), st);
+    holds_all_append(hp, he, lv,
+        wp_stm(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup),
+        goals_append(
+            close_each_e(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil))), *inv_obligs_break),
+            goals_append(
+                wp_stm(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
+                goals_append(
+                    close_each_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
+                    goals_append(
+                        GoalList::Cons(Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
+                        wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup))))), st);
+    holds_all_append(hp, he, lv,
+        close_each_e(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil))), *inv_obligs_break),
+        goals_append(
+            wp_stm(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
+            goals_append(
+                close_each_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
+                goals_append(
+                    GoalList::Cons(Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
+                    wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup)))), st);
+    holds_all_append(hp, he, lv,
+        wp_stm(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
+        goals_append(
+            close_each_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
+            goals_append(
+                GoalList::Cons(Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
+                wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup))), st);
+    holds_all_append(hp, he, lv,
+        close_each_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
+        goals_append(
+            GoalList::Cons(Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
+            wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup)), st);
+    holds_all_append(hp, he, lv,
+        GoalList::Cons(Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
+        wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup), st);
+    // the seven goal groups (the three wp_stm groups = the IH facts)
+    holds_all_close_each_e(hp, he, lv, f, *inv_obligs, st);          // init
+    holds_all_close_each_e(hp, he, lv,
+        frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil))),
+        *inv_obligs_break, st);                                      // exit-reclose
+    holds_all_close_each_e(hp, he, lv,
+        frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
+        *inv_obligs_exit, st);                                       // maintain-reclose
+    u_holds_all_cons(hp, he, lv, Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil));
+    u_holds_all_nil(hp, he, lv);
+    holds_close_e(hp, he, lv, frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig);  // decrease
+}
+
+// ═════════════════════════════════════════════════════════════════════
 // W5 MAIN THEOREM (bootstrap-64, hand-Lean probe24 `wp_stm_sound`):
 // reference-WP soundness AND faithfulness on the FULL StmData vocabulary
 // — Skip/Assume/Assign/Assert/Call/Ret/DeadEnd/If/Seq/Loop — over an
@@ -5737,15 +5884,19 @@ pub proof fn holds_all_close_each_e(hp: HpOracle, he: HeOracle, lv: LvOracle, f:
 // never decomposes its havoc'd frames (mframe/endf stay opaque args to
 // the frame-agnostic bridge lemmas — the W5c Opt-2 resolution).
 // ═════════════════════════════════════════════════════════════════════
-// Closer note: the explicit `cases s <;> simp_all <;> omega` branch runs
-// FIRST — on the Loop termination VC `tactus_auto` itself burns the whole
-// whnf heartbeat budget (the 11-field Loop height reduction), so it cannot
-// be the first alternative; generic tactus_case_split tries `f` (the first
-// datatype local) before `s`; and the If/Seq termination goals
-// (`height t < 1 + height t + height e`) need omega after the simp
-// reduction. All five recursive-call termination VCs close in ~3s under
-// this branch (hand-isolated on the emitted theorems).
-#[verifier::tactus_tactic("first | (intros <;> cases s <;> simp_all (config := { zetaDelta := true }) [and_assoc] <;> omega) | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
+// Closer note: `cases s <;> omega` runs FIRST — the termination goals
+// are pure height inequalities once `cases s` exposes the ctor (omega
+// treats `height x` as an atom; `h_b < 1 + h_setup + h_b` needs no
+// simp), and on the b79 chain VCs (3 nested IH posts) the zetaDelta
+// simp_all branch burns the WHOLE budget (123s standalone vs 1.9s
+// omega-only, hand-isolated on the emitted theorems). VCs where the
+// height expression needs the simp reduction (If/Seq arms: `height t <
+// 1 + height t + height e`) fail omega in ~2s and fall through to the
+// pre-b79 branch below. Historical: the explicit simp_all branch runs
+// before tactus_auto because on the Loop termination VC tactus_auto
+// itself burns the whole whnf budget (the 11-field Loop height
+// reduction).
+#[verifier::tactus_tactic("first | (intros <;> cases s <;> omega) | (intros <;> cases s <;> simp_all (config := { zetaDelta := true }) [and_assoc] <;> omega) | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
 #[verifier::structural_decreases]
 #[verifier::heartbeats(1600000)]
 pub proof fn wp_stm_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, s: StmData, st: St)
@@ -5850,128 +6001,28 @@ pub proof fn wp_stm_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList
             // height inequality. bootstrap-79: the IHs also sit OUTSIDE the
             // branch split (inside, the termination VC picks up the
             // `is_skip` guard in its path condition and `cases s` +
-            // simp_all whnf-explodes on it), and they are paired into two
-            // `assert … by` blocks — sequential self-calls CHAIN each
-            // recursive call's termination VC under every previous call's
-            // postcondition, and past ~2 nested IH facts (each a
-            // `wp_stm`/`exec_safe_f` application over the open frame fns)
-            // the generated theorem's simp_all whnf-explodes. The
-            // assert-by scoping caps the chain: each block's inner VCs see
-            // only the previous CONJUNCTION, never the raw sequence. Each
-            // recursive call is on a subterm either way, so the other
-            // branch's IH facts are simply unused.
-            assert(
-                holds_all(hp, he, lv,
-                    wp_stm(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), st)
-                    == exec_safe_f(hp, he, lv, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body, st)
-                && holds_all(hp, he, lv,
-                    wp_stm(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), st)
-                    == exec_safe_f(hp, he, lv, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup, st)
-            ) by {
-                wp_stm_sound(hp, he, lv,
-                    loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop),
-                    *body, st);                                              // IH (classical body)
-                wp_stm_sound(hp, he, lv,
-                    frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)),
-                    *setup, st);                                             // IH (break-form setup, body run)
-            }
-            assert(
-                holds_all(hp, he, lv,
-                    wp_stm(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), st)
-                    == exec_safe_f(hp, he, lv, frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body, st)
-                && holds_all(hp, he, lv,
-                    wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup), st)
-                    == exec_safe_f(hp, he, lv, loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup, st)
-            ) by {
-                wp_stm_sound(hp, he, lv,
-                    frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))),
-                    *body, st);                                              // IH (break-form body)
-                wp_stm_sound(hp, he, lv,
-                    loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds),
-                    *setup, st);                                             // IH (break-form setup, exit replay)
-            }
-            u_wp_loop(f, inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body);
-            u_esf_loop(hp, he, lv, f, inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body);
+            // simp_all whnf-explodes on it). Each recursive call is on a
+            // subterm either way, so the other branch's IH facts are
+            // simply unused. (`assert … by` pairing does NOT work in the
+            // Tactus backend: lemma-call posts are DROPPED from assert-by
+            // blocks — the assert's VC sees only `True` — so the closer
+            // had to re-prove the IH equalities from scratch. gate-4.)
+            wp_stm_sound(hp, he, lv,
+                loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop),
+                *body, st);                                                  // IH (classical body)
+            wp_stm_sound(hp, he, lv,
+                frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)),
+                *setup, st);                                                 // IH (break-form setup, body run)
+            wp_stm_sound(hp, he, lv,
+                frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))),
+                *body, st);                                                  // IH (break-form body)
+            wp_stm_sound(hp, he, lv,
+                loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds),
+                *setup, st);                                                 // IH (break-form setup, exit replay)
             if is_skip(*setup) == 1 {
-            // the three ++ splits (init ++ (body ++ (reclose ++ decrease)))
-            holds_all_append(hp, he, lv, close_each_e(f, *inv_obligs),
-                goals_append(wp_stm(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body),
-                    goals_append(close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit),
-                        GoalList::Cons(Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)), Box::new(GoalList::Nil)))), st);
-            holds_all_append(hp, he, lv, wp_stm(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body),
-                goals_append(close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit),
-                    GoalList::Cons(Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)), Box::new(GoalList::Nil))), st);
-            holds_all_append(hp, he, lv, close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit),
-                GoalList::Cons(Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)), Box::new(GoalList::Nil)), st);
-            // the four goal groups (body group = the IH fact above)
-            holds_all_close_each_e(hp, he, lv, f, *inv_obligs, st);          // init
-            holds_all_close_each_e(hp, he, lv, frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit, st);  // maintain-reclose
-            u_holds_all_cons(hp, he, lv, Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)), Box::new(GoalList::Nil));
-            u_holds_all_nil(hp, he, lv);
-            holds_close_e(hp, he, lv, frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig);  // decrease
+                wp_stm_sound_loop_classical(hp, he, lv, f, inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body, st);
             } else {
-            // Break-form (bootstrap-79): seven goal groups. Same
-            // discipline as the classical branch — everything inlined.
-            // the six ++ splits (init ++ setup ++ exit-reclose ++ body
-            // ++ maintain-reclose ++ (decrease ++ replay))
-            holds_all_append(hp, he, lv, close_each_e(f, *inv_obligs),
-                goals_append(
-                    wp_stm(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup),
-                    goals_append(
-                        close_each_e(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil))), *inv_obligs_break),
-                        goals_append(
-                            wp_stm(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
-                            goals_append(
-                                close_each_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
-                                goals_append(
-                                    GoalList::Cons(Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
-                                    wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup)))))), st);
-            holds_all_append(hp, he, lv,
-                wp_stm(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup),
-                goals_append(
-                    close_each_e(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil))), *inv_obligs_break),
-                    goals_append(
-                        wp_stm(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
-                        goals_append(
-                            close_each_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
-                            goals_append(
-                                GoalList::Cons(Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
-                                wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup))))), st);
-            holds_all_append(hp, he, lv,
-                close_each_e(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil))), *inv_obligs_break),
-                goals_append(
-                    wp_stm(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
-                    goals_append(
-                        close_each_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
-                        goals_append(
-                            GoalList::Cons(Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
-                            wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup)))), st);
-            holds_all_append(hp, he, lv,
-                wp_stm(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
-                goals_append(
-                    close_each_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
-                    goals_append(
-                        GoalList::Cons(Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
-                        wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup))), st);
-            holds_all_append(hp, he, lv,
-                close_each_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
-                goals_append(
-                    GoalList::Cons(Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
-                    wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup)), st);
-            holds_all_append(hp, he, lv,
-                GoalList::Cons(Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
-                wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup), st);
-            // the seven goal groups (the three wp_stm groups = the IH facts)
-            holds_all_close_each_e(hp, he, lv, f, *inv_obligs, st);          // init
-            holds_all_close_each_e(hp, he, lv,
-                frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil))),
-                *inv_obligs_break, st);                                      // exit-reclose
-            holds_all_close_each_e(hp, he, lv,
-                frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
-                *inv_obligs_exit, st);                                       // maintain-reclose
-            u_holds_all_cons(hp, he, lv, Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil));
-            u_holds_all_nil(hp, he, lv);
-            holds_close_e(hp, he, lv, frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig);  // decrease
+                wp_stm_sound_loop_bf(hp, he, lv, f, inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body, st);
             }
         }
         StmData::Skip => {
