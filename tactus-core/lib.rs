@@ -5791,7 +5791,7 @@ pub proof fn wp_stm_sound_loop_bf(hp: HpOracle, he: HeOracle, lv: LvOracle, f: F
     cond_poison: u64, d_old_name: u64, d_old_ty: u64, d_old_val: u64, d_old_eq_name: u64,
     d_old_eq_prop: u64, decrease_oblig: RawExp, setup: Box<StmData>, body: Box<StmData>, st: St)
     requires
-        is_skip(*setup) == 0,
+        is_skip(*setup) != 1,
         holds_all(hp, he, lv,
             wp_stm(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), st)
             == exec_safe_f(hp, he, lv, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup, st),
@@ -5889,14 +5889,18 @@ pub proof fn wp_stm_sound_loop_bf(hp: HpOracle, he: HeOracle, lv: LvOracle, f: F
 // treats `height x` as an atom; `h_b < 1 + h_setup + h_b` needs no
 // simp), and on the b79 chain VCs (3 nested IH posts) the zetaDelta
 // simp_all branch burns the WHOLE budget (123s standalone vs 1.9s
-// omega-only, hand-isolated on the emitted theorems). VCs where the
-// height expression needs the simp reduction (If/Seq arms: `height t <
-// 1 + height t + height e`) fail omega in ~2s and fall through to the
-// pre-b79 branch below. Historical: the explicit simp_all branch runs
-// before tactus_auto because on the Loop termination VC tactus_auto
-// itself burns the whole whnf budget (the 11-field Loop height
-// reduction).
-#[verifier::tactus_tactic("first | (intros <;> cases s <;> omega) | (intros <;> cases s <;> simp_all (config := { zetaDelta := true }) [and_assoc] <;> omega) | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
+// omega-only, hand-isolated on the emitted theorems). Second: the
+// constructor/contradiction/assumption branch — the Loop arm's
+// part-lemma precondition VCs (conjunctions of the branch guard + IH
+// facts, all in ctx) and the arm's postcondition VC (the part-lemma
+// posts give the goal modulo `s = Loop <projections>`, which `cases s`
+// + iota recovers; the 19 off-cases die by contradiction) close in
+// ~3s, where zetaDelta simp_all explodes. VCs where the height
+// expression needs the simp reduction (If/Seq arms) fail both in ~2s
+// and fall through to the pre-b79 branch. Historical: the explicit
+// simp_all branch runs before tactus_auto because on the Loop
+// termination VC tactus_auto itself burns the whole whnf budget.
+#[verifier::tactus_tactic("first | (intros <;> cases s <;> omega) | (intros <;> (try constructor) <;> cases s <;> (try contradiction) <;> assumption) | (intros <;> cases s <;> simp_all (config := { zetaDelta := true }) [and_assoc] <;> omega) | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
 #[verifier::structural_decreases]
 #[verifier::heartbeats(1600000)]
 pub proof fn wp_stm_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, s: StmData, st: St)
