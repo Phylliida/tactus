@@ -425,3 +425,32 @@ assert VCs the Link discharge pends on, (c) extracted part-lemmas
 with implies-posts don't unify across the match-arm projection
 boundary — prefer INLINE arms + tactic tuning, tuned on
 hand-isolated generated theorems, never blind.
+
+## Link-discharge composer arm (Danielle: build it now, 2026-07-28)
+
+The part-lemma extraction that made `wp_stm_sound`'s Loop arm fit the
+budget introduced TWO new sidecar classes no recursive fn had before:
+(a) assert VCs in a recursive fn (the part-lemma call preconditions —
+each = the callee's requires instantiated: the branch guard + the
+recursive IH equalities as is_self CallFacts), and (b) a proof-level
+if-split (`if is_skip(*setup) == 1`) inside one arm — two postcondition
+VCs sharing the Loop variant sig and the ensures leaf, distinguished
+only by a non-variant branch hyp (`Branch{None}`). Both pend loudly
+today (`close_fix` "assert VCs in recursive fn" + the app_args
+"requires-carrying callee" guard + the arm/conjunct grid).
+
+Composer design (validated against gate-6 oleans before generalizing):
+- Assert VCs compose as ordinary app_args applications — their spines
+  (Branch{None} → the woven `if`'s `h`; is_self Calls → the fix's own
+  recursive `_closed` apps, i.e. the IHs; Height → hdec) are already
+  composable. Feed each requires-carrying Call node's extra hypothesis
+  binder with its assert VC's app (order-paired per arm + a leaf sanity
+  check; mismatch pends loud).
+- If-split weaving: when one variant arm has multiple post VCs with the
+  SAME sig and SAME leaf but complementary non-variant branch hyps
+  (`P` / `¬P`), emit a nested `if h : P then <pos app> else <neg app>`
+  in the arm's final term; the branch premises feed `h` (variant-test
+  branches keep the existing `(by simp)`/ctor-discriminant path).
+- The part-lemmas themselves already close via the straight-line Req
+  arm (their requires are ordinary closed-theorem binders) — the
+  caller-side feeding is the only new composition.
