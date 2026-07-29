@@ -1443,6 +1443,27 @@ def FrameListWf (x : lib.FrameList) : Prop :=
   | lib.FrameList.FUserCloser x0 => FrameListWf x0.deref
 termination_by structural x
 
+def ParamListWf (x : lib.ParamList) : Prop :=
+  match x with
+  | lib.ParamList.Nil => True
+  | lib.ParamList.Cons x0 x1 x2 => (0 ≤ x0 ∧ x0 < 18446744073709551616) ∧ TypDataWf x1 ∧ ParamListWf x2.deref
+termination_by structural x
+
+def MutParamListWf (x : lib.MutParamList) : Prop :=
+  match x with
+  | lib.MutParamList.Nil => True
+  | lib.MutParamList.Cons x0 x1 x2 x3 => (0 ≤ x0 ∧ x0 < 18446744073709551616) ∧ (0 ≤ x1 ∧ x1 < 18446744073709551616) ∧ (0 ≤ x2 ∧ x2 < 18446744073709551616) ∧ MutParamListWf x3.deref
+termination_by structural x
+
+def LeafListWf (x : lib.LeafList) : Prop :=
+  match x with
+  | lib.LeafList.Nil => True
+  | lib.LeafList.Cons x0 x1 => (0 ≤ x0 ∧ x0 < 18446744073709551616) ∧ LeafListWf x1.deref
+termination_by structural x
+
+def FnCtxDataWf (x : lib.FnCtxData) : Prop :=
+  BinderListWf x.typ_params ∧ BinderListWf x.params ∧ ParamBoundListWf x.param_bounds ∧ BinderListWf x.reqs ∧ MutParamListWf x.mut_params ∧ LeafListWf x.enss ∧ (0 ≤ x.closer_default ∧ x.closer_default < 18446744073709551616)
+
 mutual
 def RawArmListWf (x : lib.RawArmList) : Prop :=
   match x with
@@ -1633,6 +1654,79 @@ theorem loop_maintain_frame_wf (f : lib.FrameList) (hwf_f : FrameListWf f) (inv_
 theorem d_old_frame_wf (d_old_name : Int) (h_d_old_name_bound : 0 ≤ d_old_name ∧ d_old_name < 18446744073709551616) (d_old_ty : Int) (h_d_old_ty_bound : 0 ≤ d_old_ty ∧ d_old_ty < 18446744073709551616) (d_old_val : Int) (h_d_old_val_bound : 0 ≤ d_old_val ∧ d_old_val < 18446744073709551616) (d_old_eq_name : Int) (h_d_old_eq_name_bound : 0 ≤ d_old_eq_name ∧ d_old_eq_name < 18446744073709551616) (d_old_eq_prop : Int) (h_d_old_eq_prop_bound : 0 ≤ d_old_eq_prop ∧ d_old_eq_prop < 18446744073709551616) :
     FrameListWf (lib.d_old_frame d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop) :=
   ⟨h_d_old_name_bound, h_d_old_ty_bound, h_d_old_val_bound, h_d_old_eq_name_bound, h_d_old_eq_prop_bound, trivial⟩
+
+theorem strip_hyps_wf (f : lib.FrameList) (hwf_f : FrameListWf f) :
+    FrameListWf (lib.strip_hyps f) :=
+  match f, hwf_f with
+  | lib.FrameList.FNil, _ =>
+      trivial
+  | lib.FrameList.FBind x ty t, ⟨hw1, hw2, hw3⟩ =>
+      ⟨hw1, hw2, (strip_hyps_wf (t.deref) hw3)⟩
+  | lib.FrameList.FHyp _hn _h _p t, ⟨hw4, hw5, hw6, hw7⟩ =>
+      (strip_hyps_wf (t.deref) hw7)
+  | lib.FrameList.FLet x v t, ⟨hw8, hw9, hw10⟩ =>
+      ⟨hw8, hw9, (strip_hyps_wf (t.deref) hw10)⟩
+  | lib.FrameList.FLetH x ty v en ep t, ⟨hw11, hw12, hw13, hw14, hw15, hw16⟩ =>
+      ⟨hw11, hw12, hw13, hw14, hw15, (strip_hyps_wf (t.deref) hw16)⟩
+  | lib.FrameList.FLetR x v t, ⟨hw17, hw18, hw19⟩ =>
+      ⟨hw17, hw18, (strip_hyps_wf (t.deref) hw19)⟩
+  | lib.FrameList.FUserCloser t, hw20 =>
+      (strip_hyps_wf (t.deref) hw20)
+termination_by structural f
+
+theorem ret_frame_wf (f : lib.FrameList) (hwf_f : FrameListWf f) (rb : lib.RetBind) (hwf_rb : RetBindWf rb) :
+    FrameListWf (lib.ret_frame f rb) :=
+  match rb, hwf_rb with
+  | lib.RetBind.RetNone, _ =>
+      hwf_f
+  | lib.RetBind.RetLet name val, ⟨hw1, hw2⟩ =>
+      (frame_append_wf (f) hwf_f (lib.FrameList.FLet name val (Tactus.Box.mk lib.FrameList.FNil)) ⟨hw1, hw2, trivial⟩)
+  | lib.RetBind.RetLetH name ty val en ep, ⟨hw3, hw4, hw5, hw6, hw7⟩ =>
+      (frame_append_wf (f) hwf_f (lib.FrameList.FLetH name ty val en ep (Tactus.Box.mk lib.FrameList.FNil)) ⟨hw3, hw4, hw5, hw6, hw7, trivial⟩)
+
+theorem binders_to_frame_wf (b : lib.BinderList) (hwf_b : BinderListWf b) :
+    FrameListWf (lib.binders_to_frame b) :=
+  match b, hwf_b with
+  | lib.BinderList.Nil, _ =>
+      trivial
+  | lib.BinderList.Cons id typ t, ⟨hw1, hw2, hw3⟩ =>
+      ⟨hw1, hw2, (binders_to_frame_wf (t.deref) hw3)⟩
+termination_by structural b
+
+theorem ctor_pos_frame_wf (b : lib.BinderList) (hwf_b : BinderListWf b) (en : Int) (h_en_bound : 0 ≤ en ∧ en < 18446744073709551616) (ep : Int) (h_ep_bound : 0 ≤ ep ∧ ep < 18446744073709551616) (epo : Int) (h_epo_bound : 0 ≤ epo ∧ epo < 18446744073709551616) :
+    FrameListWf (lib.ctor_pos_frame b en ep epo) :=
+  (frame_append_wf (lib.binders_to_frame b) (binders_to_frame_wf (b) hwf_b) (lib.FrameList.FHyp en ep epo (Tactus.Box.mk lib.FrameList.FNil)) ⟨h_en_bound, h_ep_bound, h_epo_bound, trivial⟩)
+
+theorem mut_preamble_frame_wf (m : lib.MutParamList) (hwf_m : MutParamListWf m) :
+    FrameListWf (lib.mut_preamble_frame m) :=
+  match m, hwf_m with
+  | lib.MutParamList.Nil, _ =>
+      trivial
+  | lib.MutParamList.Cons p at_pre deref_val t, ⟨hw1, hw2, hw3, hw4⟩ =>
+      ⟨hw2, hw3, ⟨hw1, hw3, (mut_preamble_frame_wf (t.deref) hw4)⟩⟩
+termination_by structural m
+
+theorem seed_params_wf (params : lib.BinderList) (hwf_params : BinderListWf params) (bounds : lib.ParamBoundList) (hwf_bounds : ParamBoundListWf bounds) :
+    FrameListWf (lib.seed_params params bounds) :=
+  match params, hwf_params with
+  | lib.BinderList.Nil, _ =>
+      trivial
+  | lib.BinderList.Cons id typ t, ⟨hw1, hw2, hw3⟩ =>
+      match bounds, hwf_bounds with
+  | lib.ParamBoundList.Bound hname prop bt, ⟨hw4, hw5, hw6⟩ =>
+      ⟨hw1, hw2, ⟨hw4, hw5, (seed_params_wf (t.deref) hw3 (bt.deref) hw6)⟩⟩
+  | lib.ParamBoundList.NoBound bt, hw7 =>
+      ⟨hw1, hw2, (seed_params_wf (t.deref) hw3 (bt.deref) hw7)⟩
+  | lib.ParamBoundList.Nil, _ =>
+      ⟨hw1, hw2, (seed_params_wf (t.deref) hw3 (lib.ParamBoundList.Nil) trivial)⟩
+termination_by structural params
+
+theorem seed_frame_wf (c : lib.FnCtxData) (hwf_c : FnCtxDataWf c) :
+    FrameListWf (lib.seed_frame c) :=
+  (frame_append_wf (lib.binders_to_frame c.typ_params) (binders_to_frame_wf (c.typ_params) hwf_c.1) (lib.frame_append (lib.seed_params c.params c.param_bounds) (lib.frame_append (lib.binders_to_frame c.reqs) (lib.frame_append (lib.mut_preamble_frame c.mut_params) (if c.closer_default = 1 then lib.FrameList.FNil else lib.FrameList.FUserCloser (Tactus.Box.mk lib.FrameList.FNil))))) (frame_append_wf (lib.seed_params c.params c.param_bounds) (seed_params_wf (c.params) hwf_c.2.1 (c.param_bounds) hwf_c.2.2.1) (lib.frame_append (lib.binders_to_frame c.reqs) (lib.frame_append (lib.mut_preamble_frame c.mut_params) (if c.closer_default = 1 then lib.FrameList.FNil else lib.FrameList.FUserCloser (Tactus.Box.mk lib.FrameList.FNil)))) (frame_append_wf (lib.binders_to_frame c.reqs) (binders_to_frame_wf (c.reqs) hwf_c.2.2.2.1) (lib.frame_append (lib.mut_preamble_frame c.mut_params) (if c.closer_default = 1 then lib.FrameList.FNil else lib.FrameList.FUserCloser (Tactus.Box.mk lib.FrameList.FNil))) (frame_append_wf (lib.mut_preamble_frame c.mut_params) (mut_preamble_frame_wf (c.mut_params) hwf_c.2.2.2.2.1) (if c.closer_default = 1 then lib.FrameList.FNil else lib.FrameList.FUserCloser (Tactus.Box.mk lib.FrameList.FNil)) (if hc1 : c.closer_default = 1 then
+        (congrArg FrameListWf (if_pos hc1)).mpr (trivial)
+      else
+        (congrArg FrameListWf (if_neg hc1)).mpr (trivial))))))
 
 theorem u_cce_cons_closed : _tactus_postcondition_u_cce_cons_at_lib_4885_13_1_stmt := _tactus_postcondition_u_cce_cons_at_lib_4885_13_1_closed
 
@@ -2531,6 +2625,147 @@ theorem wp_stm_sound_loop_classical_closed (hp : Int → (Int → Int) → Prop)
   let tmp__10 := lib.frame_after (lib.loop_maintain_frame f inv_hyps.deref binders.deref binder_bounds.deref cond_name cond_ann cond_poison d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop) body.deref;
   _tactus_postcondition_wp_stm_sound_loop_classical_at_lib_5754_13_11 hp he lv f inv_hyps inv_obligs inv_obligs_exit inv_obligs_break binders binder_bounds cond_name h_cond_name_bound cond_ann h_cond_ann_bound neg_cond_ann h_neg_cond_ann_bound neg_neg_cond_ann h_neg_neg_cond_ann_bound break_guard_ann h_break_guard_ann_bound break_use_ann h_break_use_ann_bound cond_poison h_cond_poison_bound d_old_name h_d_old_name_bound d_old_ty h_d_old_ty_bound d_old_val h_d_old_val_bound d_old_eq_name h_d_old_eq_name_bound d_old_eq_prop h_d_old_eq_prop_bound decrease_oblig setup body st h_req0 h_req1 () (u_wp_loop_closed f inv_hyps inv_obligs inv_obligs_exit inv_obligs_break binders binder_bounds cond_name h_cond_name_bound cond_ann h_cond_ann_bound neg_cond_ann h_neg_cond_ann_bound neg_neg_cond_ann h_neg_neg_cond_ann_bound break_guard_ann h_break_guard_ann_bound break_use_ann h_break_use_ann_bound cond_poison h_cond_poison_bound d_old_name h_d_old_name_bound d_old_ty h_d_old_ty_bound d_old_val h_d_old_val_bound d_old_eq_name h_d_old_eq_name_bound d_old_eq_prop h_d_old_eq_prop_bound decrease_oblig setup body) () (u_esf_loop_closed hp he lv f inv_hyps inv_obligs inv_obligs_exit inv_obligs_break binders binder_bounds cond_name h_cond_name_bound cond_ann h_cond_ann_bound neg_cond_ann h_neg_cond_ann_bound neg_neg_cond_ann h_neg_neg_cond_ann_bound break_guard_ann h_break_guard_ann_bound break_use_ann h_break_use_ann_bound cond_poison h_cond_poison_bound d_old_name h_d_old_name_bound d_old_ty h_d_old_ty_bound d_old_val h_d_old_val_bound d_old_eq_name h_d_old_eq_name_bound d_old_eq_prop h_d_old_eq_prop_bound decrease_oblig setup body) () (holds_all_append_closed hp he lv tmp__1 tmp__2 st) () (holds_all_append_closed hp he lv tmp__3 tmp__4 st) () (holds_all_append_closed hp he lv tmp__5 tmp__6 st) () (holds_all_close_each_e_closed hp he lv f inv_obligs.deref st hwf_f) () (holds_all_close_each_e_closed hp he lv tmp__7 inv_obligs_exit.deref st (frame_after_wf (lib.loop_maintain_frame f inv_hyps.deref binders.deref binder_bounds.deref cond_name cond_ann cond_poison d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop) (loop_maintain_frame_wf f hwf_f inv_hyps.deref hwf_inv_hyps binders.deref hwf_binders binder_bounds.deref hwf_binder_bounds cond_name h_cond_name_bound cond_ann h_cond_ann_bound cond_poison h_cond_poison_bound d_old_name h_d_old_name_bound d_old_ty h_d_old_ty_bound d_old_val h_d_old_val_bound d_old_eq_name h_d_old_eq_name_bound d_old_eq_prop h_d_old_eq_prop_bound) body.deref hwf_body)) () (u_holds_all_cons_closed hp he lv (Tactus.Box.mk tmp__8) (Tactus.Box.mk tmp__9)) () (u_holds_all_nil_closed hp he lv) () (holds_close_e_closed hp he lv tmp__10 decrease_oblig (frame_after_wf (lib.loop_maintain_frame f inv_hyps.deref binders.deref binder_bounds.deref cond_name cond_ann cond_poison d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop) (loop_maintain_frame_wf f hwf_f inv_hyps.deref hwf_inv_hyps binders.deref hwf_binders binder_bounds.deref hwf_binder_bounds cond_name h_cond_name_bound cond_ann h_cond_ann_bound cond_poison h_cond_poison_bound d_old_name h_d_old_name_bound d_old_ty h_d_old_ty_bound d_old_val h_d_old_val_bound d_old_eq_name h_d_old_eq_name_bound d_old_eq_prop h_d_old_eq_prop_bound) body.deref hwf_body))
 
+theorem wp_stm_sound_closed (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (f : lib.FrameList) (s : lib.StmData) (st : Int → Int) (hwf_f : FrameListWf f) (hwf : StmDataWf s) :
+    (lib.holds_all hp he lv (lib.wp_stm f s) st = lib.exec_safe_f hp he lv f s st) :=
+  match s, hwf with
+  | StmData.Assert o hn h hpz, ⟨hwf_val0, h_wf_val1, h_wf_val2, h_wf_val3⟩ =>
+      let tmp__1 := lib.close_e f o;
+      let tmp__2 := lib.GoalList.Nil;
+      _tactus_postcondition_wp_stm_sound_at_lib_5907_13_6 hp he lv f (StmData.Assert o hn h hpz) st (by simp) () (u_wp_assert_closed f o hn h_wf_val1 h h_wf_val2 hpz h_wf_val3) () (u_holds_all_cons_closed hp he lv (Tactus.Box.mk tmp__1) (Tactus.Box.mk tmp__2)) () (u_holds_all_nil_closed hp he lv) () (holds_close_e_closed hp he lv f o hwf_f) () (u_esf_assert_closed hp he lv f o hn h_wf_val1 h h_wf_val2 hpz h_wf_val3)
+  | StmData.Assume hn e hpz, ⟨h_wf_val0, h_wf_val1, h_wf_val2⟩ =>
+      _tactus_postcondition_wp_stm_sound_at_lib_5907_13_10 hp he lv f (StmData.Assume hn e hpz) st (by simp) (by simp) () (u_wp_assume_closed f hn h_wf_val0 e h_wf_val1 hpz h_wf_val2) () (u_holds_all_nil_closed hp he lv) () (u_esf_assume_closed hp he lv f hn h_wf_val0 e h_wf_val1 hpz h_wf_val2)
+  | StmData.Assign x rhs, ⟨h_wf_val0, h_wf_val1⟩ =>
+      _tactus_postcondition_wp_stm_sound_at_lib_5907_13_14 hp he lv f (StmData.Assign x rhs) st (by simp) (by simp) (by simp) () (u_wp_assign_closed f x h_wf_val0 rhs h_wf_val1) () (u_holds_all_nil_closed hp he lv) () (u_esf_assign_closed hp he lv f x h_wf_val0 rhs h_wf_val1)
+  | StmData.AssignH x ty v en ep, ⟨h_wf_val0, h_wf_val1, h_wf_val2, h_wf_val3, h_wf_val4⟩ =>
+      _tactus_postcondition_wp_stm_sound_at_lib_5907_13_18 hp he lv f (StmData.AssignH x ty v en ep) st (by simp) (by simp) (by simp) (by simp) () (u_wp_assignh_closed f x h_wf_val0 ty h_wf_val1 v h_wf_val2 en h_wf_val3 ep h_wf_val4) () (u_holds_all_nil_closed hp he lv) () (u_esf_assignh_closed hp he lv f x h_wf_val0 ty h_wf_val1 v h_wf_val2 en h_wf_val3 ep h_wf_val4)
+  | StmData.AssignR x v, ⟨h_wf_val0, h_wf_val1⟩ =>
+      _tactus_postcondition_wp_stm_sound_at_lib_5907_13_22 hp he lv f (StmData.AssignR x v) st (by simp) (by simp) (by simp) (by simp) (by simp) () (u_wp_assignr_closed f x h_wf_val0 v h_wf_val1) () (u_holds_all_nil_closed hp he lv) () (u_esf_assignr_closed hp he lv f x h_wf_val0 v h_wf_val1)
+  | StmData.Call reqs post, ⟨hwf_reqs, hwf_post⟩ =>
+      _tactus_postcondition_wp_stm_sound_at_lib_5907_13_26 hp he lv f (StmData.Call reqs post) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) () (u_wp_call_closed f reqs post) () (holds_all_close_each_e_closed hp he lv f reqs.deref st hwf_f) () (u_esf_call_closed hp he lv f reqs post)
+  | StmData.DeadEnd b, hwf_val0 =>
+      have hdec := _tactus_termination_wp_stm_sound_at_lib_5946_13_29 hp he lv f (StmData.DeadEnd b) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) () (u_wp_deadend_closed f b) () (u_esf_deadend_closed hp he lv f b)
+      _tactus_postcondition_wp_stm_sound_at_lib_5907_13_31 hp he lv f (StmData.DeadEnd b) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) () (u_wp_deadend_closed f b) () (u_esf_deadend_closed hp he lv f b) hdec () (wp_stm_sound_closed hp he lv f b.deref st hwf_f hwf_val0)
+  | StmData.AssertQueryNl b tq, ⟨hwf_val0, hwf_val1⟩ =>
+      let tmp__3 := lib.strip_hyps f;
+      let tmp__4 := lib.wp_stm (lib.strip_hyps f) b.deref;
+      let tmp__5 := lib.GoalList.Cons (Tactus.Box.mk (lib.close_e (lib.frame_after (lib.strip_hyps f) b.deref) tq)) (Tactus.Box.mk lib.GoalList.Nil);
+      let tmp__6 := lib.close_e (lib.frame_after (lib.strip_hyps f) b.deref) tq;
+      let tmp__7 := lib.GoalList.Nil;
+      let tmp__8 := lib.frame_after (lib.strip_hyps f) b.deref;
+      have hdec := _tactus_termination_wp_stm_sound_at_lib_5951_13_34 hp he lv f (StmData.AssertQueryNl b tq) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) () (u_wp_aqnl_closed f b tq) () (u_esf_aqnl_closed hp he lv f b tq)
+      _tactus_postcondition_wp_stm_sound_at_lib_5907_13_40 hp he lv f (StmData.AssertQueryNl b tq) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) () (u_wp_aqnl_closed f b tq) () (u_esf_aqnl_closed hp he lv f b tq) hdec () (wp_stm_sound_closed hp he lv tmp__3 b.deref st (strip_hyps_wf f hwf_f) hwf_val0) () (holds_all_append_closed hp he lv tmp__4 tmp__5 st) () (u_holds_all_cons_closed hp he lv (Tactus.Box.mk tmp__6) (Tactus.Box.mk tmp__7)) () (u_holds_all_nil_closed hp he lv) () (holds_close_e_closed hp he lv tmp__8 tq (frame_after_wf (lib.strip_hyps f) (strip_hyps_wf f hwf_f) b.deref hwf_val0))
+  | StmData.AssertQueryTactus o hn h hpz, ⟨hwf_val0, h_wf_val1, h_wf_val2, h_wf_val3⟩ =>
+      let tmp__9 := lib.close_e (lib.frame_append f (lib.FrameList.FUserCloser (Tactus.Box.mk lib.FrameList.FNil))) o;
+      let tmp__10 := lib.GoalList.Nil;
+      let tmp__11 := lib.frame_append f (lib.FrameList.FUserCloser (Tactus.Box.mk lib.FrameList.FNil));
+      _tactus_postcondition_wp_stm_sound_at_lib_5907_13_46 hp he lv f (StmData.AssertQueryTactus o hn h hpz) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) () (u_wp_aqt_closed f o hn h_wf_val1 h h_wf_val2 hpz h_wf_val3) () (u_holds_all_cons_closed hp he lv (Tactus.Box.mk tmp__9) (Tactus.Box.mk tmp__10)) () (u_holds_all_nil_closed hp he lv) () (holds_close_e_closed hp he lv tmp__11 o (frame_append_wf f hwf_f (lib.FrameList.FUserCloser (Tactus.Box.mk lib.FrameList.FNil)) trivial)) () (u_esf_aqt_closed hp he lv f o hn h_wf_val1 h h_wf_val2 hpz h_wf_val3)
+  | StmData.Ret es rb, ⟨hwf_val0, hwf_val1⟩ =>
+      let tmp__12 := lib.ret_frame f rb;
+      _tactus_postcondition_wp_stm_sound_at_lib_5907_13_50 hp he lv f (StmData.Ret es rb) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) () (u_wp_ret_closed f es rb) () (holds_all_close_each_e_closed hp he lv tmp__12 es.deref st (ret_frame_wf f hwf_f rb hwf_val1)) () (u_esf_ret_closed hp he lv f es rb)
+  | StmData.If c cn nc ncn cp t e, ⟨h_wf_val0, h_wf_val1, h_wf_val2, h_wf_val3, h_wf_val4, hwf_val5, hwf_val6⟩ =>
+      let tmp__13 := lib.wp_stm (lib.frame_append f (lib.FrameList.FHyp cn c cp (Tactus.Box.mk lib.FrameList.FNil))) t.deref;
+      let tmp__14 := lib.wp_stm (lib.frame_append f (lib.FrameList.FHyp ncn nc cp (Tactus.Box.mk lib.FrameList.FNil))) e.deref;
+      let tmp__15 := lib.frame_append f (lib.FrameList.FHyp cn c cp (Tactus.Box.mk lib.FrameList.FNil));
+      let tmp__16 := lib.frame_append f (lib.FrameList.FHyp ncn nc cp (Tactus.Box.mk lib.FrameList.FNil));
+      have hdec0 := _tactus_termination_wp_stm_sound_at_lib_5987_13_54 hp he lv f (StmData.If c cn nc ncn cp t e) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) () (u_wp_if_closed f c h_wf_val0 cn h_wf_val1 nc h_wf_val2 ncn h_wf_val3 cp h_wf_val4 t e) () (u_esf_if_closed hp he lv f c h_wf_val0 cn h_wf_val1 nc h_wf_val2 ncn h_wf_val3 cp h_wf_val4 t e) () (holds_all_append_closed hp he lv tmp__13 tmp__14 st)
+      have hdec1 := _tactus_termination_wp_stm_sound_at_lib_5988_13_56 hp he lv f (StmData.If c cn nc ncn cp t e) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) () (u_wp_if_closed f c h_wf_val0 cn h_wf_val1 nc h_wf_val2 ncn h_wf_val3 cp h_wf_val4 t e) () (u_esf_if_closed hp he lv f c h_wf_val0 cn h_wf_val1 nc h_wf_val2 ncn h_wf_val3 cp h_wf_val4 t e) () (holds_all_append_closed hp he lv tmp__13 tmp__14 st) hdec0 () (wp_stm_sound_closed hp he lv tmp__15 t.deref st (frame_append_wf f hwf_f (lib.FrameList.FHyp cn c cp (Tactus.Box.mk lib.FrameList.FNil)) ⟨h_wf_val1, h_wf_val0, h_wf_val4, trivial⟩) hwf_val5)
+      _tactus_postcondition_wp_stm_sound_at_lib_5907_13_58 hp he lv f (StmData.If c cn nc ncn cp t e) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) () (u_wp_if_closed f c h_wf_val0 cn h_wf_val1 nc h_wf_val2 ncn h_wf_val3 cp h_wf_val4 t e) () (u_esf_if_closed hp he lv f c h_wf_val0 cn h_wf_val1 nc h_wf_val2 ncn h_wf_val3 cp h_wf_val4 t e) () (holds_all_append_closed hp he lv tmp__13 tmp__14 st) hdec0 () (wp_stm_sound_closed hp he lv tmp__15 t.deref st (frame_append_wf f hwf_f (lib.FrameList.FHyp cn c cp (Tactus.Box.mk lib.FrameList.FNil)) ⟨h_wf_val1, h_wf_val0, h_wf_val4, trivial⟩) hwf_val5) hdec1 () (wp_stm_sound_closed hp he lv tmp__16 e.deref st (frame_append_wf f hwf_f (lib.FrameList.FHyp ncn nc cp (Tactus.Box.mk lib.FrameList.FNil)) ⟨h_wf_val3, h_wf_val2, h_wf_val4, trivial⟩) hwf_val6)
+  | StmData.IfCtor pos_binders eq_name eq_prop eq_poison neg_name neg_prop neg_poison thn els, ⟨hwf_pos_binders, h_wf_eq_name, h_wf_eq_prop, h_wf_eq_poison, h_wf_neg_name, h_wf_neg_prop, h_wf_neg_poison, hwf_thn, hwf_els⟩ =>
+      let tmp__17 := lib.wp_stm (lib.frame_append f (lib.ctor_pos_frame pos_binders.deref eq_name eq_prop eq_poison)) thn.deref;
+      let tmp__18 := lib.wp_stm (lib.frame_append f (lib.FrameList.FHyp neg_name neg_prop neg_poison (Tactus.Box.mk lib.FrameList.FNil))) els.deref;
+      let tmp__19 := lib.frame_append f (lib.ctor_pos_frame pos_binders.deref eq_name eq_prop eq_poison);
+      let tmp__20 := lib.frame_append f (lib.FrameList.FHyp neg_name neg_prop neg_poison (Tactus.Box.mk lib.FrameList.FNil));
+      have hdec0 := _tactus_termination_wp_stm_sound_at_lib_5996_13_62 hp he lv f (StmData.IfCtor pos_binders eq_name eq_prop eq_poison neg_name neg_prop neg_poison thn els) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) () (u_wp_ifctor_closed f pos_binders eq_name h_wf_eq_name eq_prop h_wf_eq_prop eq_poison h_wf_eq_poison neg_name h_wf_neg_name neg_prop h_wf_neg_prop neg_poison h_wf_neg_poison thn els) () (u_esf_ifctor_closed hp he lv f pos_binders eq_name h_wf_eq_name eq_prop h_wf_eq_prop eq_poison h_wf_eq_poison neg_name h_wf_neg_name neg_prop h_wf_neg_prop neg_poison h_wf_neg_poison thn els) () (holds_all_append_closed hp he lv tmp__17 tmp__18 st)
+      have hdec1 := _tactus_termination_wp_stm_sound_at_lib_5997_13_64 hp he lv f (StmData.IfCtor pos_binders eq_name eq_prop eq_poison neg_name neg_prop neg_poison thn els) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) () (u_wp_ifctor_closed f pos_binders eq_name h_wf_eq_name eq_prop h_wf_eq_prop eq_poison h_wf_eq_poison neg_name h_wf_neg_name neg_prop h_wf_neg_prop neg_poison h_wf_neg_poison thn els) () (u_esf_ifctor_closed hp he lv f pos_binders eq_name h_wf_eq_name eq_prop h_wf_eq_prop eq_poison h_wf_eq_poison neg_name h_wf_neg_name neg_prop h_wf_neg_prop neg_poison h_wf_neg_poison thn els) () (holds_all_append_closed hp he lv tmp__17 tmp__18 st) hdec0 () (wp_stm_sound_closed hp he lv tmp__19 thn.deref st (frame_append_wf f hwf_f (lib.ctor_pos_frame pos_binders.deref eq_name eq_prop eq_poison) (ctor_pos_frame_wf pos_binders.deref hwf_pos_binders eq_name h_wf_eq_name eq_prop h_wf_eq_prop eq_poison h_wf_eq_poison)) hwf_thn)
+      _tactus_postcondition_wp_stm_sound_at_lib_5907_13_66 hp he lv f (StmData.IfCtor pos_binders eq_name eq_prop eq_poison neg_name neg_prop neg_poison thn els) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) () (u_wp_ifctor_closed f pos_binders eq_name h_wf_eq_name eq_prop h_wf_eq_prop eq_poison h_wf_eq_poison neg_name h_wf_neg_name neg_prop h_wf_neg_prop neg_poison h_wf_neg_poison thn els) () (u_esf_ifctor_closed hp he lv f pos_binders eq_name h_wf_eq_name eq_prop h_wf_eq_prop eq_poison h_wf_eq_poison neg_name h_wf_neg_name neg_prop h_wf_neg_prop neg_poison h_wf_neg_poison thn els) () (holds_all_append_closed hp he lv tmp__17 tmp__18 st) hdec0 () (wp_stm_sound_closed hp he lv tmp__19 thn.deref st (frame_append_wf f hwf_f (lib.ctor_pos_frame pos_binders.deref eq_name eq_prop eq_poison) (ctor_pos_frame_wf pos_binders.deref hwf_pos_binders eq_name h_wf_eq_name eq_prop h_wf_eq_prop eq_poison h_wf_eq_poison)) hwf_thn) hdec1 () (wp_stm_sound_closed hp he lv tmp__20 els.deref st (frame_append_wf f hwf_f (lib.FrameList.FHyp neg_name neg_prop neg_poison (Tactus.Box.mk lib.FrameList.FNil)) ⟨h_wf_neg_name, h_wf_neg_prop, h_wf_neg_poison, trivial⟩) hwf_els)
+  | StmData.Loop inv_hyps inv_obligs inv_obligs_exit inv_obligs_break binders binder_bounds cond_name cond_ann neg_cond_ann neg_neg_cond_ann break_guard_ann break_use_ann cond_poison d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop decrease_oblig setup body, ⟨hwf_inv_hyps, hwf_inv_obligs, hwf_inv_obligs_exit, hwf_inv_obligs_break, hwf_binders, hwf_binder_bounds, h_wf_cond_name, h_wf_cond_ann, h_wf_neg_cond_ann, h_wf_neg_neg_cond_ann, h_wf_break_guard_ann, h_wf_break_use_ann, h_wf_cond_poison, h_wf_d_old_name, h_wf_d_old_ty, h_wf_d_old_val, h_wf_d_old_eq_name, h_wf_d_old_eq_prop, hwf_decrease_oblig, hwf_setup, hwf_body⟩ =>
+      let tmp__21 := lib.loop_maintain_frame f inv_hyps.deref binders.deref binder_bounds.deref cond_name cond_ann cond_poison d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop;
+      let tmp__22 := lib.frame_append (lib.loop_telescope_base f inv_hyps.deref binders.deref binder_bounds.deref) (lib.d_old_frame d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop);
+      let tmp__23 := lib.frame_append (lib.frame_after (lib.frame_append (lib.loop_telescope_base f inv_hyps.deref binders.deref binder_bounds.deref) (lib.d_old_frame d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop)) setup.deref) (lib.FrameList.FHyp cond_name neg_neg_cond_ann cond_poison (Tactus.Box.mk lib.FrameList.FNil));
+      let tmp__24 := lib.loop_telescope_base f inv_hyps.deref binders.deref binder_bounds.deref;
+      have hdec0 := _tactus_termination_wp_stm_sound_at_lib_6014_13_67 hp he lv f (StmData.Loop inv_hyps inv_obligs inv_obligs_exit inv_obligs_break binders binder_bounds cond_name cond_ann neg_cond_ann neg_neg_cond_ann break_guard_ann break_use_ann cond_poison d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop decrease_oblig setup body) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp)
+      have hdec1 := _tactus_termination_wp_stm_sound_at_lib_6017_13_69 hp he lv f (StmData.Loop inv_hyps inv_obligs inv_obligs_exit inv_obligs_break binders binder_bounds cond_name cond_ann neg_cond_ann neg_neg_cond_ann break_guard_ann break_use_ann cond_poison d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop decrease_oblig setup body) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) hdec0 () (wp_stm_sound_closed hp he lv tmp__21 body.deref st (loop_maintain_frame_wf f hwf_f inv_hyps.deref hwf_inv_hyps binders.deref hwf_binders binder_bounds.deref hwf_binder_bounds cond_name h_wf_cond_name cond_ann h_wf_cond_ann cond_poison h_wf_cond_poison d_old_name h_wf_d_old_name d_old_ty h_wf_d_old_ty d_old_val h_wf_d_old_val d_old_eq_name h_wf_d_old_eq_name d_old_eq_prop h_wf_d_old_eq_prop) hwf_body)
+      have hdec2 := _tactus_termination_wp_stm_sound_at_lib_6020_13_71 hp he lv f (StmData.Loop inv_hyps inv_obligs inv_obligs_exit inv_obligs_break binders binder_bounds cond_name cond_ann neg_cond_ann neg_neg_cond_ann break_guard_ann break_use_ann cond_poison d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop decrease_oblig setup body) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) hdec0 () (wp_stm_sound_closed hp he lv tmp__21 body.deref st (loop_maintain_frame_wf f hwf_f inv_hyps.deref hwf_inv_hyps binders.deref hwf_binders binder_bounds.deref hwf_binder_bounds cond_name h_wf_cond_name cond_ann h_wf_cond_ann cond_poison h_wf_cond_poison d_old_name h_wf_d_old_name d_old_ty h_wf_d_old_ty d_old_val h_wf_d_old_val d_old_eq_name h_wf_d_old_eq_name d_old_eq_prop h_wf_d_old_eq_prop) hwf_body) hdec1 () (wp_stm_sound_closed hp he lv tmp__22 setup.deref st (frame_append_wf (lib.loop_telescope_base f inv_hyps.deref binders.deref binder_bounds.deref) (loop_telescope_base_wf f hwf_f inv_hyps.deref hwf_inv_hyps binders.deref hwf_binders binder_bounds.deref hwf_binder_bounds) (lib.d_old_frame d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop) (d_old_frame_wf d_old_name h_wf_d_old_name d_old_ty h_wf_d_old_ty d_old_val h_wf_d_old_val d_old_eq_name h_wf_d_old_eq_name d_old_eq_prop h_wf_d_old_eq_prop)) hwf_setup)
+      have hdec3 := _tactus_termination_wp_stm_sound_at_lib_6023_13_73 hp he lv f (StmData.Loop inv_hyps inv_obligs inv_obligs_exit inv_obligs_break binders binder_bounds cond_name cond_ann neg_cond_ann neg_neg_cond_ann break_guard_ann break_use_ann cond_poison d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop decrease_oblig setup body) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) hdec0 () (wp_stm_sound_closed hp he lv tmp__21 body.deref st (loop_maintain_frame_wf f hwf_f inv_hyps.deref hwf_inv_hyps binders.deref hwf_binders binder_bounds.deref hwf_binder_bounds cond_name h_wf_cond_name cond_ann h_wf_cond_ann cond_poison h_wf_cond_poison d_old_name h_wf_d_old_name d_old_ty h_wf_d_old_ty d_old_val h_wf_d_old_val d_old_eq_name h_wf_d_old_eq_name d_old_eq_prop h_wf_d_old_eq_prop) hwf_body) hdec1 () (wp_stm_sound_closed hp he lv tmp__22 setup.deref st (frame_append_wf (lib.loop_telescope_base f inv_hyps.deref binders.deref binder_bounds.deref) (loop_telescope_base_wf f hwf_f inv_hyps.deref hwf_inv_hyps binders.deref hwf_binders binder_bounds.deref hwf_binder_bounds) (lib.d_old_frame d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop) (d_old_frame_wf d_old_name h_wf_d_old_name d_old_ty h_wf_d_old_ty d_old_val h_wf_d_old_val d_old_eq_name h_wf_d_old_eq_name d_old_eq_prop h_wf_d_old_eq_prop)) hwf_setup) hdec2 () (wp_stm_sound_closed hp he lv tmp__23 body.deref st (frame_append_wf (lib.frame_after (lib.frame_append (lib.loop_telescope_base f inv_hyps.deref binders.deref binder_bounds.deref) (lib.d_old_frame d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop)) setup.deref) (frame_after_wf (lib.frame_append (lib.loop_telescope_base f inv_hyps.deref binders.deref binder_bounds.deref) (lib.d_old_frame d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop)) (frame_append_wf (lib.loop_telescope_base f inv_hyps.deref binders.deref binder_bounds.deref) (loop_telescope_base_wf f hwf_f inv_hyps.deref hwf_inv_hyps binders.deref hwf_binders binder_bounds.deref hwf_binder_bounds) (lib.d_old_frame d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop) (d_old_frame_wf d_old_name h_wf_d_old_name d_old_ty h_wf_d_old_ty d_old_val h_wf_d_old_val d_old_eq_name h_wf_d_old_eq_name d_old_eq_prop h_wf_d_old_eq_prop)) setup.deref hwf_setup) (lib.FrameList.FHyp cond_name neg_neg_cond_ann cond_poison (Tactus.Box.mk lib.FrameList.FNil)) ⟨h_wf_cond_name, h_wf_neg_neg_cond_ann, h_wf_cond_poison, trivial⟩) hwf_body)
+      if h : lib.is_skip setup.deref = 1 then
+        _tactus_postcondition_wp_stm_sound_at_lib_5907_13_77 hp he lv f (StmData.Loop inv_hyps inv_obligs inv_obligs_exit inv_obligs_break binders binder_bounds cond_name cond_ann neg_cond_ann neg_neg_cond_ann break_guard_ann break_use_ann cond_poison d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop decrease_oblig setup body) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) hdec0 () (wp_stm_sound_closed hp he lv tmp__21 body.deref st (loop_maintain_frame_wf f hwf_f inv_hyps.deref hwf_inv_hyps binders.deref hwf_binders binder_bounds.deref hwf_binder_bounds cond_name h_wf_cond_name cond_ann h_wf_cond_ann cond_poison h_wf_cond_poison d_old_name h_wf_d_old_name d_old_ty h_wf_d_old_ty d_old_val h_wf_d_old_val d_old_eq_name h_wf_d_old_eq_name d_old_eq_prop h_wf_d_old_eq_prop) hwf_body) hdec1 () (wp_stm_sound_closed hp he lv tmp__22 setup.deref st (frame_append_wf (lib.loop_telescope_base f inv_hyps.deref binders.deref binder_bounds.deref) (loop_telescope_base_wf f hwf_f inv_hyps.deref hwf_inv_hyps binders.deref hwf_binders binder_bounds.deref hwf_binder_bounds) (lib.d_old_frame d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop) (d_old_frame_wf d_old_name h_wf_d_old_name d_old_ty h_wf_d_old_ty d_old_val h_wf_d_old_val d_old_eq_name h_wf_d_old_eq_name d_old_eq_prop h_wf_d_old_eq_prop)) hwf_setup) hdec2 () (wp_stm_sound_closed hp he lv tmp__23 body.deref st (frame_append_wf (lib.frame_after (lib.frame_append (lib.loop_telescope_base f inv_hyps.deref binders.deref binder_bounds.deref) (lib.d_old_frame d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop)) setup.deref) (frame_after_wf (lib.frame_append (lib.loop_telescope_base f inv_hyps.deref binders.deref binder_bounds.deref) (lib.d_old_frame d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop)) (frame_append_wf (lib.loop_telescope_base f inv_hyps.deref binders.deref binder_bounds.deref) (loop_telescope_base_wf f hwf_f inv_hyps.deref hwf_inv_hyps binders.deref hwf_binders binder_bounds.deref hwf_binder_bounds) (lib.d_old_frame d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop) (d_old_frame_wf d_old_name h_wf_d_old_name d_old_ty h_wf_d_old_ty d_old_val h_wf_d_old_val d_old_eq_name h_wf_d_old_eq_name d_old_eq_prop h_wf_d_old_eq_prop)) setup.deref hwf_setup) (lib.FrameList.FHyp cond_name neg_neg_cond_ann cond_poison (Tactus.Box.mk lib.FrameList.FNil)) ⟨h_wf_cond_name, h_wf_neg_neg_cond_ann, h_wf_cond_poison, trivial⟩) hwf_body) hdec3 () (wp_stm_sound_closed hp he lv tmp__24 setup.deref st (loop_telescope_base_wf f hwf_f inv_hyps.deref hwf_inv_hyps binders.deref hwf_binders binder_bounds.deref hwf_binder_bounds) hwf_setup) h () (wp_stm_sound_loop_classical_closed hp he lv f inv_hyps inv_obligs inv_obligs_exit inv_obligs_break binders binder_bounds cond_name h_wf_cond_name cond_ann h_wf_cond_ann neg_cond_ann h_wf_neg_cond_ann neg_neg_cond_ann h_wf_neg_neg_cond_ann break_guard_ann h_wf_break_guard_ann break_use_ann h_wf_break_use_ann cond_poison h_wf_cond_poison d_old_name h_wf_d_old_name d_old_ty h_wf_d_old_ty d_old_val h_wf_d_old_val d_old_eq_name h_wf_d_old_eq_name d_old_eq_prop h_wf_d_old_eq_prop decrease_oblig setup body st h (wp_stm_sound_closed hp he lv tmp__21 body.deref st (loop_maintain_frame_wf f hwf_f inv_hyps.deref hwf_inv_hyps binders.deref hwf_binders binder_bounds.deref hwf_binder_bounds cond_name h_wf_cond_name cond_ann h_wf_cond_ann cond_poison h_wf_cond_poison d_old_name h_wf_d_old_name d_old_ty h_wf_d_old_ty d_old_val h_wf_d_old_val d_old_eq_name h_wf_d_old_eq_name d_old_eq_prop h_wf_d_old_eq_prop) hwf_body) hwf_f hwf_inv_hyps hwf_binders hwf_binder_bounds hwf_body)
+      else
+        _tactus_postcondition_wp_stm_sound_at_lib_5907_13_80 hp he lv f (StmData.Loop inv_hyps inv_obligs inv_obligs_exit inv_obligs_break binders binder_bounds cond_name cond_ann neg_cond_ann neg_neg_cond_ann break_guard_ann break_use_ann cond_poison d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop decrease_oblig setup body) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) hdec0 () (wp_stm_sound_closed hp he lv tmp__21 body.deref st (loop_maintain_frame_wf f hwf_f inv_hyps.deref hwf_inv_hyps binders.deref hwf_binders binder_bounds.deref hwf_binder_bounds cond_name h_wf_cond_name cond_ann h_wf_cond_ann cond_poison h_wf_cond_poison d_old_name h_wf_d_old_name d_old_ty h_wf_d_old_ty d_old_val h_wf_d_old_val d_old_eq_name h_wf_d_old_eq_name d_old_eq_prop h_wf_d_old_eq_prop) hwf_body) hdec1 () (wp_stm_sound_closed hp he lv tmp__22 setup.deref st (frame_append_wf (lib.loop_telescope_base f inv_hyps.deref binders.deref binder_bounds.deref) (loop_telescope_base_wf f hwf_f inv_hyps.deref hwf_inv_hyps binders.deref hwf_binders binder_bounds.deref hwf_binder_bounds) (lib.d_old_frame d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop) (d_old_frame_wf d_old_name h_wf_d_old_name d_old_ty h_wf_d_old_ty d_old_val h_wf_d_old_val d_old_eq_name h_wf_d_old_eq_name d_old_eq_prop h_wf_d_old_eq_prop)) hwf_setup) hdec2 () (wp_stm_sound_closed hp he lv tmp__23 body.deref st (frame_append_wf (lib.frame_after (lib.frame_append (lib.loop_telescope_base f inv_hyps.deref binders.deref binder_bounds.deref) (lib.d_old_frame d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop)) setup.deref) (frame_after_wf (lib.frame_append (lib.loop_telescope_base f inv_hyps.deref binders.deref binder_bounds.deref) (lib.d_old_frame d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop)) (frame_append_wf (lib.loop_telescope_base f inv_hyps.deref binders.deref binder_bounds.deref) (loop_telescope_base_wf f hwf_f inv_hyps.deref hwf_inv_hyps binders.deref hwf_binders binder_bounds.deref hwf_binder_bounds) (lib.d_old_frame d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop) (d_old_frame_wf d_old_name h_wf_d_old_name d_old_ty h_wf_d_old_ty d_old_val h_wf_d_old_val d_old_eq_name h_wf_d_old_eq_name d_old_eq_prop h_wf_d_old_eq_prop)) setup.deref hwf_setup) (lib.FrameList.FHyp cond_name neg_neg_cond_ann cond_poison (Tactus.Box.mk lib.FrameList.FNil)) ⟨h_wf_cond_name, h_wf_neg_neg_cond_ann, h_wf_cond_poison, trivial⟩) hwf_body) hdec3 () (wp_stm_sound_closed hp he lv tmp__24 setup.deref st (loop_telescope_base_wf f hwf_f inv_hyps.deref hwf_inv_hyps binders.deref hwf_binders binder_bounds.deref hwf_binder_bounds) hwf_setup) h () (wp_stm_sound_loop_bf_closed hp he lv f inv_hyps inv_obligs inv_obligs_exit inv_obligs_break binders binder_bounds cond_name h_wf_cond_name cond_ann h_wf_cond_ann neg_cond_ann h_wf_neg_cond_ann neg_neg_cond_ann h_wf_neg_neg_cond_ann break_guard_ann h_wf_break_guard_ann break_use_ann h_wf_break_use_ann cond_poison h_wf_cond_poison d_old_name h_wf_d_old_name d_old_ty h_wf_d_old_ty d_old_val h_wf_d_old_val d_old_eq_name h_wf_d_old_eq_name d_old_eq_prop h_wf_d_old_eq_prop decrease_oblig setup body st h (wp_stm_sound_closed hp he lv tmp__22 setup.deref st (frame_append_wf (lib.loop_telescope_base f inv_hyps.deref binders.deref binder_bounds.deref) (loop_telescope_base_wf f hwf_f inv_hyps.deref hwf_inv_hyps binders.deref hwf_binders binder_bounds.deref hwf_binder_bounds) (lib.d_old_frame d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop) (d_old_frame_wf d_old_name h_wf_d_old_name d_old_ty h_wf_d_old_ty d_old_val h_wf_d_old_val d_old_eq_name h_wf_d_old_eq_name d_old_eq_prop h_wf_d_old_eq_prop)) hwf_setup) (wp_stm_sound_closed hp he lv tmp__23 body.deref st (frame_append_wf (lib.frame_after (lib.frame_append (lib.loop_telescope_base f inv_hyps.deref binders.deref binder_bounds.deref) (lib.d_old_frame d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop)) setup.deref) (frame_after_wf (lib.frame_append (lib.loop_telescope_base f inv_hyps.deref binders.deref binder_bounds.deref) (lib.d_old_frame d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop)) (frame_append_wf (lib.loop_telescope_base f inv_hyps.deref binders.deref binder_bounds.deref) (loop_telescope_base_wf f hwf_f inv_hyps.deref hwf_inv_hyps binders.deref hwf_binders binder_bounds.deref hwf_binder_bounds) (lib.d_old_frame d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop) (d_old_frame_wf d_old_name h_wf_d_old_name d_old_ty h_wf_d_old_ty d_old_val h_wf_d_old_val d_old_eq_name h_wf_d_old_eq_name d_old_eq_prop h_wf_d_old_eq_prop)) setup.deref hwf_setup) (lib.FrameList.FHyp cond_name neg_neg_cond_ann cond_poison (Tactus.Box.mk lib.FrameList.FNil)) ⟨h_wf_cond_name, h_wf_neg_neg_cond_ann, h_wf_cond_poison, trivial⟩) hwf_body) (wp_stm_sound_closed hp he lv tmp__24 setup.deref st (loop_telescope_base_wf f hwf_f inv_hyps.deref hwf_inv_hyps binders.deref hwf_binders binder_bounds.deref hwf_binder_bounds) hwf_setup) hwf_f hwf_inv_hyps hwf_binders hwf_binder_bounds hwf_setup hwf_body)
+  | StmData.Skip, _ =>
+      _tactus_postcondition_wp_stm_sound_at_lib_5907_13_84 hp he lv f (StmData.Skip) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) () (u_wp_skip_closed f) () (u_holds_all_nil_closed hp he lv) () (u_esf_skip_closed hp he lv f)
+  | StmData.Seq a b, ⟨hwf_val0, hwf_val1⟩ =>
+      let tmp__25 := lib.wp_stm f a.deref;
+      let tmp__26 := lib.wp_stm (lib.frame_after f a.deref) b.deref;
+      let tmp__27 := lib.frame_after f a.deref;
+      have hdec0 := _tactus_termination_wp_stm_sound_at_lib_6041_13_88 hp he lv f (StmData.Seq a b) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) () (u_wp_seq_closed f a b) () (u_esf_seq_closed hp he lv f a b) () (holds_all_append_closed hp he lv tmp__25 tmp__26 st)
+      have hdec1 := _tactus_termination_wp_stm_sound_at_lib_6042_13_90 hp he lv f (StmData.Seq a b) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) () (u_wp_seq_closed f a b) () (u_esf_seq_closed hp he lv f a b) () (holds_all_append_closed hp he lv tmp__25 tmp__26 st) hdec0 () (wp_stm_sound_closed hp he lv f a.deref st hwf_f hwf_val0)
+      _tactus_postcondition_wp_stm_sound_at_lib_5907_13_92 hp he lv f (StmData.Seq a b) st (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) (by simp) () (u_wp_seq_closed f a b) () (u_esf_seq_closed hp he lv f a b) () (holds_all_append_closed hp he lv tmp__25 tmp__26 st) hdec0 () (wp_stm_sound_closed hp he lv f a.deref st hwf_f hwf_val0) hdec1 () (wp_stm_sound_closed hp he lv tmp__27 b.deref st (frame_after_wf f hwf_f a.deref hwf_val0) hwf_val1)
+termination_by lib.StmData.height s
+decreasing_by all_goals (simp only [StmData.height, if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add] <;> omega)
+
+theorem closure_creation_sound_closed (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (f : lib.FrameList) (body : Tactus.Box lib.StmData) (ext : Int) (h_ext_bound : 0 ≤ ext ∧ ext < 18446744073709551616) (st : Int → Int) (hwf_f : FrameListWf f) (hwf_body : StmDataWf body.deref) :
+    (lib.holds_all hp he lv (lib.wp_stm f (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.DeadEnd body)) (Tactus.Box.mk (lib.StmData.Assume 0 ext 0)))) st = lib.exec_safe_f hp he lv f body.deref st) :=
+  let tmp__1 := lib.StmData.Seq (Tactus.Box.mk (lib.StmData.DeadEnd body)) (Tactus.Box.mk (lib.StmData.Assume 0 ext 0));
+  let tmp__2 := lib.StmData.DeadEnd body;
+  let tmp__3 := lib.StmData.Assume 0 ext 0;
+  let tmp__4 := lib.frame_after f (lib.StmData.DeadEnd body);
+  _tactus_postcondition_closure_creation_sound_at_lib_6184_13_6 hp he lv f body ext h_ext_bound st () (wp_stm_sound_closed hp he lv f tmp__1 st hwf_f ⟨hwf_body, ⟨(by omega), h_ext_bound, (by omega)⟩⟩) () (u_esf_seq_closed hp he lv f (Tactus.Box.mk tmp__2) (Tactus.Box.mk tmp__3)) () (u_esf_deadend_closed hp he lv f body) () (u_fa_deadend_closed f body) () (u_esf_assume_closed hp he lv tmp__4 0 (by omega) ext h_ext_bound 0 (by omega))
+
+theorem closure_forwards_contract_closed (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (body : Tactus.Box lib.StmData) (ext : Int) (h_ext_bound : 0 ≤ ext ∧ ext < 18446744073709551616) (h : Int) (h_h_bound : 0 ≤ h ∧ h < 18446744073709551616) (obl : lib.RawExp) (st : Int → Int) (hwf_body : StmDataWf body.deref) (hwf_obl : RawExpWf obl) :
+    (lib.holds_all hp he lv (lib.wp_stm lib.FrameList.FNil (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.DeadEnd body)) (Tactus.Box.mk (lib.StmData.Assume 0 ext 0)))) (Tactus.Box.mk (lib.StmData.Assert obl 0 h 0)))) st = (lib.exec_safe_f hp he lv lib.FrameList.FNil body.deref st ∧ (∀ (v : Int), he (lib.render_exp obl) (lib.upd st 0 v)))) :=
+  let tmp__1 := lib.FrameList.FNil;
+  let tmp__2 := lib.StmData.Seq (Tactus.Box.mk (lib.StmData.Seq (Tactus.Box.mk (lib.StmData.DeadEnd body)) (Tactus.Box.mk (lib.StmData.Assume 0 ext 0)))) (Tactus.Box.mk (lib.StmData.Assert obl 0 h 0));
+  let tmp__3 := lib.FrameList.FNil;
+  let tmp__4 := lib.StmData.Seq (Tactus.Box.mk (lib.StmData.DeadEnd body)) (Tactus.Box.mk (lib.StmData.Assume 0 ext 0));
+  let tmp__5 := lib.StmData.Assert obl 0 h 0;
+  let tmp__6 := lib.FrameList.FNil;
+  let tmp__7 := lib.StmData.DeadEnd body;
+  let tmp__8 := lib.StmData.Assume 0 ext 0;
+  let tmp__9 := lib.FrameList.FNil;
+  let tmp__10 := lib.FrameList.FNil;
+  let tmp__11 := lib.frame_after lib.FrameList.FNil (lib.StmData.DeadEnd body);
+  let tmp__12 := lib.FrameList.FNil;
+  let tmp__13 := lib.StmData.DeadEnd body;
+  let tmp__14 := lib.StmData.Assume 0 ext 0;
+  let tmp__15 := lib.frame_after lib.FrameList.FNil (lib.StmData.DeadEnd body);
+  let tmp__16 := lib.FrameList.FHyp 0 ext 0 (Tactus.Box.mk lib.FrameList.FNil);
+  let tmp__17 := lib.FrameList.FHyp 0 ext 0 (Tactus.Box.mk lib.FrameList.FNil);
+  let tmp__18 := lib.FrameList.FNil;
+  let tmp__19 := lib.FrameList.FNil;
+  let tmp__20 := lib.FrameList.FNil;
+  let tmp__21 := lib.FrameList.FHyp 0 ext 0 (Tactus.Box.mk lib.FrameList.FNil);
+  let tmp__22 := lib.FrameList.FHyp 0 ext 0 (Tactus.Box.mk lib.FrameList.FNil);
+  let tmp__23 := lib.FrameList.FNil;
+  let tmp__24 := lib.FrameList.FHyp 0 ext 0 (Tactus.Box.mk lib.FrameList.FNil);
+  let tmp__25 := lib.FrameList.FHyp 0 ext 0 (Tactus.Box.mk lib.FrameList.FNil);
+  let tmp__26 := lib.FrameList.FNil;
+  _tactus_postcondition_closure_forwards_contract_at_lib_6266_13_23 hp he lv body ext h_ext_bound h h_h_bound obl st () (wp_stm_sound_closed hp he lv tmp__1 tmp__2 st trivial ⟨⟨hwf_body, ⟨(by omega), h_ext_bound, (by omega)⟩⟩, ⟨hwf_obl, (by omega), h_h_bound, (by omega)⟩⟩) () (u_esf_seq_closed hp he lv tmp__3 (Tactus.Box.mk tmp__4) (Tactus.Box.mk tmp__5)) () (u_esf_seq_closed hp he lv tmp__6 (Tactus.Box.mk tmp__7) (Tactus.Box.mk tmp__8)) () (u_esf_deadend_closed hp he lv tmp__9 body) () (u_fa_deadend_closed tmp__10 body) () (u_esf_assume_closed hp he lv tmp__11 0 (by omega) ext h_ext_bound 0 (by omega)) () (u_fa_seq_closed tmp__12 (Tactus.Box.mk tmp__13) (Tactus.Box.mk tmp__14)) () (u_fa_assume_closed tmp__15 ext h_ext_bound) () (u_fapp_fnil_closed tmp__16) () (u_esf_assert_closed hp he lv tmp__17 obl 0 (by omega) h h_h_bound 0 (by omega)) () (u_gate_hyp_closed 0 (by omega) ext h_ext_bound 0 (by omega) (Tactus.Box.mk tmp__18)) () (u_gate_nil_closed) () (u_gatep_hyp_closed 0 (by omega) ext h_ext_bound 0 (by omega) (Tactus.Box.mk tmp__19)) () (u_gatep_nil_closed) () (u_gateu_hyp_closed 0 (by omega) ext h_ext_bound 0 (by omega) (Tactus.Box.mk tmp__20)) () (u_gateu_nil_closed) () (u_cse_hoist_mode_closed hp he lv tmp__21 obl) () (u_cseh_unfold_closed hp he lv tmp__22 obl) () (u_cset_hyp_closed hp he lv 0 (by omega) ext h_ext_bound 0 (by omega) (Tactus.Box.mk tmp__23) tmp__24 obl) () (u_cset_nil_closed hp he lv tmp__25 obl) () (u_cser_hyp_closed hp he lv 0 (by omega) ext h_ext_bound 0 (by omega) (Tactus.Box.mk tmp__26) obl) () (u_cser_nil_closed hp he lv obl)
+
+theorem wp_sound_bites_assert_closed (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (o : lib.RawExp) (h : Int) (h_h_bound : 0 ≤ h ∧ h < 18446744073709551616) (st : Int → Int) (h_req0 : lib.holds_all hp he lv (lib.wp_stm lib.FrameList.FNil (lib.StmData.Assert o 0 h 0)) st) (hwf_o : RawExpWf o) :
+    (he (lib.render_exp o) st) :=
+  let tmp__1 := lib.FrameList.FNil;
+  let tmp__2 := lib.StmData.Assert o 0 h 0;
+  let tmp__3 := lib.FrameList.FNil;
+  _tactus_postcondition_wp_sound_bites_assert_at_lib_6311_13_4 hp he lv o h h_h_bound st h_req0 () (wp_stm_sound_closed hp he lv tmp__1 tmp__2 st trivial ⟨hwf_o, (by omega), h_h_bound, (by omega)⟩) () (u_esf_assert_closed hp he lv tmp__3 o 0 (by omega) h h_h_bound 0 (by omega)) () (u_cse_nil_closed hp he lv o)
+
+theorem wp_sound_bites_loop_init_closed (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (inv_hyps : Tactus.Box lib.BinderList) (ob : Tactus.Box lib.RawExp) (binders : Tactus.Box lib.BinderList) (binder_bounds : Tactus.Box lib.ParamBoundList) (cond_name : Int) (h_cond_name_bound : 0 ≤ cond_name ∧ cond_name < 18446744073709551616) (cond_ann : Int) (h_cond_ann_bound : 0 ≤ cond_ann ∧ cond_ann < 18446744073709551616) (neg_cond_ann : Int) (h_neg_cond_ann_bound : 0 ≤ neg_cond_ann ∧ neg_cond_ann < 18446744073709551616) (cond_poison : Int) (h_cond_poison_bound : 0 ≤ cond_poison ∧ cond_poison < 18446744073709551616) (d_old_name : Int) (h_d_old_name_bound : 0 ≤ d_old_name ∧ d_old_name < 18446744073709551616) (d_old_ty : Int) (h_d_old_ty_bound : 0 ≤ d_old_ty ∧ d_old_ty < 18446744073709551616) (d_old_val : Int) (h_d_old_val_bound : 0 ≤ d_old_val ∧ d_old_val < 18446744073709551616) (d_old_eq_name : Int) (h_d_old_eq_name_bound : 0 ≤ d_old_eq_name ∧ d_old_eq_name < 18446744073709551616) (d_old_eq_prop : Int) (h_d_old_eq_prop_bound : 0 ≤ d_old_eq_prop ∧ d_old_eq_prop < 18446744073709551616) (decrease_oblig : lib.RawExp) (body : Tactus.Box lib.StmData) (st : Int → Int) (h_req0 : lib.holds_all hp he lv (lib.wp_stm lib.FrameList.FNil (lib.StmData.Loop inv_hyps (Tactus.Box.mk (lib.RawExpList.Cons ob (Tactus.Box.mk lib.RawExpList.Nil))) (Tactus.Box.mk (lib.RawExpList.Cons ob (Tactus.Box.mk lib.RawExpList.Nil))) (Tactus.Box.mk lib.RawExpList.Nil) binders binder_bounds cond_name cond_ann neg_cond_ann 999999 999999 999999 cond_poison d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop decrease_oblig (Tactus.Box.mk lib.StmData.Skip) body)) st) (hwf_inv_hyps : BinderListWf inv_hyps.deref) (hwf_ob : RawExpWf ob.deref) (hwf_binders : BinderListWf binders.deref) (hwf_binder_bounds : ParamBoundListWf binder_bounds.deref) (hwf_decrease_oblig : RawExpWf decrease_oblig) (hwf_body : StmDataWf body.deref) :
+    (he (lib.render_exp ob.deref) st) :=
+  let tmp__1 := lib.FrameList.FNil;
+  let tmp__2 := lib.StmData.Loop inv_hyps (Tactus.Box.mk (lib.RawExpList.Cons ob (Tactus.Box.mk lib.RawExpList.Nil))) (Tactus.Box.mk (lib.RawExpList.Cons ob (Tactus.Box.mk lib.RawExpList.Nil))) (Tactus.Box.mk lib.RawExpList.Nil) binders binder_bounds cond_name cond_ann neg_cond_ann 999999 999999 999999 cond_poison d_old_name d_old_ty d_old_val d_old_eq_name d_old_eq_prop decrease_oblig (Tactus.Box.mk lib.StmData.Skip) body;
+  let tmp__3 := lib.FrameList.FNil;
+  let tmp__4 := lib.RawExpList.Cons ob (Tactus.Box.mk lib.RawExpList.Nil);
+  let tmp__5 := lib.RawExpList.Cons ob (Tactus.Box.mk lib.RawExpList.Nil);
+  let tmp__6 := lib.RawExpList.Nil;
+  let tmp__7 := lib.StmData.Skip;
+  let tmp__8 := lib.RawExpList.Cons ob (Tactus.Box.mk lib.RawExpList.Nil);
+  let tmp__9 := lib.RawExpList.Nil;
+  _tactus_postcondition_wp_sound_bites_loop_init_at_lib_6342_13_5 hp he lv inv_hyps ob binders binder_bounds cond_name h_cond_name_bound cond_ann h_cond_ann_bound neg_cond_ann h_neg_cond_ann_bound cond_poison h_cond_poison_bound d_old_name h_d_old_name_bound d_old_ty h_d_old_ty_bound d_old_val h_d_old_val_bound d_old_eq_name h_d_old_eq_name_bound d_old_eq_prop h_d_old_eq_prop_bound decrease_oblig body st h_req0 () (wp_stm_sound_closed hp he lv tmp__1 tmp__2 st trivial ⟨hwf_inv_hyps, ⟨hwf_ob, trivial⟩, ⟨hwf_ob, trivial⟩, trivial, hwf_binders, hwf_binder_bounds, h_cond_name_bound, h_cond_ann_bound, h_neg_cond_ann_bound, (by omega), (by omega), (by omega), h_cond_poison_bound, h_d_old_name_bound, h_d_old_ty_bound, h_d_old_val_bound, h_d_old_eq_name_bound, h_d_old_eq_prop_bound, hwf_decrease_oblig, trivial, hwf_body⟩) () (u_esf_loop_closed hp he lv tmp__3 inv_hyps (Tactus.Box.mk tmp__4) (Tactus.Box.mk tmp__5) (Tactus.Box.mk tmp__6) binders binder_bounds cond_name h_cond_name_bound cond_ann h_cond_ann_bound neg_cond_ann h_neg_cond_ann_bound 999999 (by omega) 999999 (by omega) 999999 (by omega) cond_poison h_cond_poison_bound d_old_name h_d_old_name_bound d_old_ty h_d_old_ty_bound d_old_val h_d_old_val_bound d_old_eq_name h_d_old_eq_name_bound d_old_eq_prop h_d_old_eq_prop_bound decrease_oblig (Tactus.Box.mk tmp__7) body) () (u_cso_nil_closed hp he lv tmp__8) () (u_obligs_cons_closed he ob (Tactus.Box.mk tmp__9))
+
+theorem ref_wp_sound_closed (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (c : lib.FnCtxData) (h_c_bound : 0 ≤ c.closer_default ∧ c.closer_default < 18446744073709551616) (s : lib.StmData) (st : Int → Int) (hwf_s : StmDataWf s) (hwf_c : FnCtxDataWf c) :
+    (lib.holds_all hp he lv (lib.ref_wp c s) st = lib.exec_safe_f hp he lv (lib.seed_frame c) s st) :=
+  let tmp__1 := lib.seed_frame c;
+  _tactus_postcondition_ref_wp_sound_at_lib_6058_13_3 hp he lv c h_c_bound s st () (u_ref_wp_closed c h_c_bound s) () (wp_stm_sound_closed hp he lv tmp__1 s st (seed_frame_wf c hwf_c) hwf_s)
+
 end lib
 #tactus_check_axioms lib.u_cce_cons_closed []
 #tactus_check_axioms lib.u_cce_nil_closed []
@@ -2724,3 +2959,9 @@ end lib
 #tactus_check_axioms lib.holds_all_close_each_e_closed []
 #tactus_check_axioms lib.wp_stm_sound_loop_bf_closed []
 #tactus_check_axioms lib.wp_stm_sound_loop_classical_closed []
+#tactus_check_axioms lib.wp_stm_sound_closed []
+#tactus_check_axioms lib.closure_creation_sound_closed []
+#tactus_check_axioms lib.closure_forwards_contract_closed []
+#tactus_check_axioms lib.wp_sound_bites_assert_closed []
+#tactus_check_axioms lib.wp_sound_bites_loop_init_closed []
+#tactus_check_axioms lib.ref_wp_sound_closed []
