@@ -857,11 +857,32 @@ fn call_app(
                 })
                 .collect();
             for (wp, dt) in &meta.wf_params {
+                // bootstrap-79: a BOXED callee param's wf demand is
+                // keyed `<param>.deref` in the callee meta — match the
+                // base param, and feed the arm's wf component for the
+                // field (the destructured `hwf_<field>`), not the
+                // deref-component path.
+                let base_wp = wp.strip_suffix(".deref").unwrap_or(wp);
                 let i = pnames
                     .iter()
-                    .position(|p| p == wp)
+                    .position(|p| *p == base_wp)
                     .ok_or_else(|| format!("wf param {} not in {}", wp, callee))?;
                 let feeder = &cargs[i];
+                if wp != base_wp {
+                    match env.arm_comps.get(feeder.text.as_str()) {
+                        Some((comp, _)) => {
+                            t.push(' ');
+                            t.push_str(comp);
+                            continue;
+                        }
+                        None => {
+                            return Err(format!(
+                                "boxed-param wf for {} ({}Wf) not composable at {}",
+                                wp, dt, callee
+                            ))
+                        }
+                    }
+                }
                 if let Some(stripped) = feeder.text.strip_suffix(".deref") {
                     // Scrutinee child: the arm's rec component.
                     if let Some((comp, true)) = env.arm_comps.get(stripped) {
@@ -977,9 +998,12 @@ fn own_wf_demands(
                         })
                         .collect();
                     for (wp, dt) in &meta.wf_params {
+                        // bootstrap-79: boxed callee params key their
+                        // wf demand as `<param>.deref` — match the base.
+                        let base_wp = wp.strip_suffix(".deref").unwrap_or(wp);
                         let i = pnames
                             .iter()
-                            .position(|p| p == wp)
+                            .position(|p| *p == base_wp)
                             .ok_or_else(|| format!("wf param {} not in {}", wp, callee))?;
                         let a = &args[i];
                         if let Some(t) = a.tag.strip_prefix("param:") {
@@ -1283,12 +1307,14 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
         }
     }
     // Scrutinee: every branch must be a variant test on ONE var, one dt.
+    // bootstrap-79: test-less Branch nodes (a proof-level non-variant
+    // guard, e.g. the break-form `is_skip` if) are exempt — they weave
+    // as the arm's nested `if`, not as match discriminants.
     let mut scrut_var: Option<&str> = None;
     let mut dt: Option<&str> = None;
     for vc in &sc.vcs {
         for n in &vc.spine {
-            if let Node::Branch { test } = n {
-                let t = test.as_ref().ok_or("non-variant branch in recursive fn")?;
+            if let Node::Branch { test: Some(t) } = n {
                 if *scrut_var.get_or_insert(&t.scrut) != t.scrut {
                     return Err("multi-scrutinee match".into());
                 }
