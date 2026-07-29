@@ -454,3 +454,44 @@ Composer design (validated against gate-6 oleans before generalizing):
 - The part-lemmas themselves already close via the straight-line Req
   arm (their requires are ordinary closed-theorem binders) — the
   caller-side feeding is the only new composition.
+
+## DONE (2026-07-28, one session)
+
+- **tactus-core** (`b9bbaf8`…`fdedebb`, gates 1-9): Loop arity 16→21
+  (`setup`, `inv_obligs_break`, `neg_neg_cond_ann`, `break_guard_ann`,
+  `break_use_ann`); `loop_telescope_base`/`d_old_frame` helpers;
+  `is_skip(*setup)` split in `wp_stm`/`frame_after`/`exec_safe_f`;
+  `wp_stm_sound` covers both derivations. **285/0 + package gate 52
+  modules + axiom closures kernel-verified.** wp_stm_sound needed 8
+  gate iterations — lessons recorded in
+  `memory/reference_tactus_proof_authoring_idioms.md` (assert-by drops
+  lemma posts; chained termination VCs; part-lemmas don't unify across
+  the match-projection boundary; omega-first ladder).
+- **Link-discharge composer arm** (`05829413`…`3cf80dc3`, gates
+  10-14): assert VCs in recursive fn compose — `call_app` +
+  `feed_requires` (guard from the woven `if`, caller-IH self-closed
+  apps), `if_split_text` (complementary guards → nested if),
+  boxed-param wf feeds, test-less Branch exemption. Unit pins ×3.
+  **Discharge 198/0-pending** (wp_stm_sound_closed composed).
+- **Serializer** (same commits + `a5ca6223`, `227ecd03`): break-form
+  pattern match, ONE setup transcription, exit-reclose obligs, double
+  setup walk (counter replay), `loop-break-form-replay-drift` guard;
+  `neg_neg_cond_ann` leaf shape fix (`¬(span_mark(¬cond))`, found by
+  probe9 per-goal diagnosis); **Ret-dest-collision fix** (first
+  subject copy_word: freshened return binder + ensures rebuild,
+  value stays plain).
+- **Probes**: probe9 ALL classified (count_to_len A7 honest-fail —
+  goals 2/3/4 close, leaf-normalized spine bridge closes; every
+  classical bridge byte-stable). probe13 → 20 classes (5 new Loop
+  kills via the strips comparison). probe11: copy_word +
+  find_cancellation_exec certs RETURN, both classified A7 (spine
+  bridges close; non-view goals close outright incl. push mut frames +
+  the renamed Ret) — **call-mut census tag population 0 on tgt,
+  break-or-continue back to 0** (b78 S5 acceptance). probe14 ✓,
+  probe37 loop closure ✓, probe38 ✓.
+- **Battery**: lean_verify units 428/0; e2e (running).
+
+**A7 note**: count_to_len/copy_word/find_cancellation honest-fails are
+ALL the vec_read deep-leaf class (view()-bearing leaves) — the
+break-form assembly itself is byte-perfect everywhere; they close
+when A7 (stage-B callee-signature vocab) lands.

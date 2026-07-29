@@ -556,3 +556,13 @@ row in the gate report updates automatically (tags are data-driven).
   (probe14/probe37), refWp preamble derivation, W5/FnCtx consumption,
   serializer FnCtx path passes real `mut_param_names` into the
   `build_req_binders` reuse.
+
+## S5 DISCHARGED (2026-07-28, via bootstrap-79)
+
+The break-form loop arm (b79) landed: copy_word + find_cancellation_exec
+certs emit again (`call-mut` and `break-or-continue` census populations
+are 0 on tgt — S5's acceptance). Both are A7-class honest-fails as
+predicted above (frame assembly byte-perfect; leaf-normalized spine
+bridges close over all 15/21 goals; the push mut frames + the
+Ret-dest-collision rename close outright). find_cancellation_exec
+recovered its b77-era cert. Full record on the b79 card.

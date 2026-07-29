@@ -1,5 +1,23 @@
 # NEXT — bootstrap work queue (2026-07-21; superseded 2026-07-24)
 
+**2026-07-28: b79 (break-form loop arm) DONE — see
+`board/bootstrap-79-break-form-loop-arm.md` (full record).** The
+loop_normalize coverage regression is closed: `StmData::Loop` gains
+`setup`/`inv_obligs_break`/`neg_neg_cond_ann`/`break_guard_ann`/
+`break_use_ann` (arity 16→21), refWp derives the THREE invariant goal
+families from ONE setup transcription, `wp_stm_sound` covers both loop
+forms (285/0 + package gate green), and the Link discharge gained the
+assert-VC composer arm (**198/0-pending**). copy_word +
+find_cancellation_exec certs RETURN (call-mut + break-or-continue
+census populations 0 on tgt — b78 S5 acceptance); all three
+break-form subjects are A7-class honest-fails (frame assembly
+byte-perfect; they close when A7 lands). probe9/11/13/14/37/38 all
+green (probe13 → 20 classes). **NEXT per the endgame map: b78 S5
+proper is DISCHARGED (its acceptance was the loop arm) → A7 (stage-B
+callee-signature vocab — closes vec_read, vec_push7, fill_zeros,
+count_to_len, copy_word, find_cancellation_exec) → B (b67 caching +
+b68 flip).**
+
 **2026-07-24 evening: endgame rows 5+6 (A3+A5+R1 batch) LANDED —
 `board/bootstrap-77-a3a5r1-batch-churn.md`.** tactus-core 254/0 +
 discharge 172/0; probe9 all-green (head_exec CLOSES via IfCtor);
