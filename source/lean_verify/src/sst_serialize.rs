@@ -781,27 +781,28 @@ impl<'a> Serializer<'a> {
         Ok(self.leaves.intern(pp_expr(&LExpr::not(marked))))
     }
 
-    /// Render `¬(¬<annotated e>)` as a leaf (bootstrap-79) — the
+    /// Render `¬(/- @rust:…-/ ¬<e>)` as a leaf (bootstrap-79) — the
     /// normalized If's ELSE-guard hypothesis on the maintain path.
-    /// `loop_normalize` synthesizes `if !exp { break; }`, so the else
-    /// branch's guard is the negation of the span_mark'd `¬exp` —
-    /// production's If walk pushes `LExpr::not(cond_marked)` where
-    /// `cond_marked` is exactly the marked `¬exp` `neg_oblig_leaf`
-    /// builds. Reconstructed via the identical `span_mark` → `not` →
-    /// `not` → `pp_expr` path (the @rust comment stays on the INNER
-    /// `¬exp`, matching the goal side's `¬(/- @rust:… -/ ¬(…))`).
+    /// `loop_normalize` synthesizes `if !exp { break; }` whose cond is
+    /// the span_mark'd `¬exp`; the else branch's guard is that marked
+    /// negation wrapped in ONE more (unmarked) `not` —
+    /// `LExpr::not(span_mark(loc, LExpr::not(render(e))))` — so the
+    /// @rust comment sits INSIDE the outer ¬, around the inner one
+    /// (count_to_len maintain goal evidence). NOT
+    /// `LExpr::not(LExpr::not(span_mark(…)))` — that puts the comment
+    /// on the bare cond and diverges from production.
     fn neg_neg_oblig_leaf(&mut self, e: &Exp) -> Sr<u64> {
         let inner_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked_with_ctx(e, &self.render_ctx())
             .map_err(|reason| format!("leaf-render: {}", reason))?;
         let inner = self.apply_renames(&inner_raw);
         let loc = crate::obligation_naming::format_rust_loc(&e.span);
-        let marked = LExpr::span_mark(
+        let marked_neg = LExpr::span_mark(
             loc,
             Some(e.span.clone()),
             AssertKind::Obligation(ObligationKind::Plain),
-            inner,
+            LExpr::not(inner),
         );
-        Ok(self.leaves.intern(pp_expr(&LExpr::not(LExpr::not(marked)))))
+        Ok(self.leaves.intern(pp_expr(&LExpr::not(marked_neg))))
     }
 
     /// Render `/- @rust:…-/ ¬<e>` — the span_mark'd NEGATION (bootstrap-79,
