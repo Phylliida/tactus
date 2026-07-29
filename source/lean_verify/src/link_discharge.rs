@@ -542,6 +542,7 @@ fn leading_alls(spine: &[Node]) -> (&[Node], usize) {
 
 // ── positional application builder ──────────────────────────────────
 
+#[derive(Clone, Copy)]
 struct AppEnv<'a> {
     fn_rel: &'a str,
     /// Scrutinee param name → the arm's pattern expression (fix arms).
@@ -577,6 +578,12 @@ struct AppEnv<'a> {
     /// The VC's term-mode lets (name → value text) — wf-arg texts often
     /// name a let (`tmp__3`); resolution chases the value.
     lets: &'a HashMap<String, String>,
+    /// bootstrap-79 (assert VCs in recursive fn): the arm's woven
+    /// `if h : <guard_prop> then … else …` — the guard prop text and
+    /// the hypothesis name feeding Branch{None} premises and
+    /// guard-shaped requires of requires-carrying callees.
+    guard_prop: Option<&'a str>,
+    guard_h: Option<&'a str>,
 }
 
 /// Build the positional application of `vc`'s theorem through the
@@ -617,7 +624,16 @@ fn app_args(vc: &Vc, upto: Option<usize>, env: &AppEnv) -> Result<Vec<String>, S
                 }
             }
             Node::Let { .. } => {}
-            Node::Branch { .. } => args.push("(by simp)".to_string()),
+            Node::Branch { test } => {
+                // bootstrap-79: inside an arm with a woven guard `if`,
+                // non-variant branch premises are the guard itself —
+                // feed the `if`'s hypothesis. Variant-test branches
+                // (and guard-free arms) keep the discriminant path.
+                match (test, env.guard_h) {
+                    (None, Some(h)) => args.push(h.to_string()),
+                    _ => args.push("(by simp)".to_string()),
+                }
+            }
             Node::Height => {
                 let h = env
                     .hdec_names
@@ -627,159 +643,7 @@ fn app_args(vc: &Vc, upto: Option<usize>, env: &AppEnv) -> Result<Vec<String>, S
                 hdec_idx += 1;
             }
             Node::Call { callee, is_self, args: cargs } => {
-                let head = if *is_self {
-                    format!("{}_closed", env.fn_rel)
-                } else {
-                    format!("{}_closed", callee)
-                };
-                // Interleave bound proofs per the callee's own leading-
-                // All order (params and their h_*_bound binders).
-                let callee_sc =
-                    env.sidecars.get(if *is_self { env.fn_rel } else { callee.as_str() });
-                // A requires-carrying callee's closed theorem has an
-                // extra hypothesis binder the recorded args cannot
-                // feed — pend loudly rather than emit a broken
-                // application (no such call sites exist today).
-                if callee_sc.map_or(false, |c| {
-                    c.vcs.iter().any(|v| {
-                        v.spine.iter().any(|n| matches!(n, Node::Req { .. }))
-                    })
-                }) {
-                    return Err(format!(
-                        "callee {} carries requires (call-site discharge unsupported)",
-                        callee
-                    ));
-                }
-                let callee_lead: Vec<&Node> = callee_sc
-                    .and_then(|c| c.vcs.first())
-                    .map(|v| leading_alls(&v.spine).0.iter().collect())
-                    .unwrap_or_default();
-                let paren = |txt: &str| {
-                    if txt.chars().any(|c| c == ' ') && !txt.starts_with('(') {
-                        format!("({})", txt)
-                    } else {
-                        txt.to_string()
-                    }
-                };
-                let mut t = format!("({}", head);
-                if callee_lead.is_empty() {
-                    // No callee sidecar (shouldn't happen post-guard):
-                    // fall back to plain param order.
-                    for a in cargs {
-                        t.push(' ');
-                        t.push_str(&paren(&a.text));
-                    }
-                } else {
-                    let mut arg_i = 0usize;
-                    for cl in &callee_lead {
-                        let Node::All { name, .. } = cl else { continue };
-                        if name.starts_with("h_") && name.ends_with("_bound") {
-                            let feeder = cargs
-                                .get(arg_i.wrapping_sub(1))
-                                .ok_or("bound binder before any param")?;
-                            match feeder.tag.as_str() {
-                                tag if tag.starts_with("param:") => {
-                                    let bname = format!("h_{}_bound", &tag[6..]);
-                                    let have = env.own_lead.iter().any(|n| {
-                                        matches!(n, Node::All { name, .. } if *name == bname)
-                                    });
-                                    if !have {
-                                        return Err(format!(
-                                            "caller lacks {} for {}",
-                                            bname, callee
-                                        ));
-                                    }
-                                    t.push(' ');
-                                    t.push_str(&bname);
-                                }
-                                "lit" => t.push_str(" (by omega)"),
-                                _ => {
-                                    // R-b: an expr-fed bound whose arg is a
-                                    // scrutinee projection discharges by the
-                                    // arm's wf component.
-                                    match env.arm_comps.get(feeder.text.as_str()) {
-                                        Some((comp, false)) => {
-                                            t.push(' ');
-                                            t.push_str(comp);
-                                        }
-                                        _ => {
-                                            return Err(format!(
-                                                "expr-fed bound at {} (wf-transport)",
-                                                callee
-                                            ))
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            let a = cargs
-                                .get(arg_i)
-                                .ok_or("callee params exceed recorded args")?;
-                            t.push(' ');
-                            t.push_str(&paren(&a.text));
-                            arg_i += 1;
-                        }
-                    }
-                    if arg_i != cargs.len() {
-                        return Err("recorded args exceed callee params".into());
-                    }
-                    // R-b: append the callee's wf args (its synthesized
-                    // signature ends with wf params, in meta order).
-                    let meta = if *is_self {
-                        Some(env.own_meta.clone())
-                    } else {
-                        env.closed.get(callee.as_str()).cloned()
-                    };
-                    if let Some(meta) = meta {
-                        let pnames: Vec<&str> = callee_lead
-                            .iter()
-                            .filter_map(|n| match n {
-                                Node::All { name, .. }
-                                    if !(name.starts_with("h_")
-                                        && name.ends_with("_bound")) =>
-                                {
-                                    Some(name.as_str())
-                                }
-                                _ => None,
-                            })
-                            .collect();
-                        for (wp, dt) in &meta.wf_params {
-                            let i = pnames
-                                .iter()
-                                .position(|p| p == wp)
-                                .ok_or_else(|| format!("wf param {} not in {}", wp, callee))?;
-                            let feeder = &cargs[i];
-                            if let Some(stripped) = feeder.text.strip_suffix(".deref") {
-                                // Scrutinee child: the arm's rec component.
-                                if let Some((comp, true)) = env.arm_comps.get(stripped) {
-                                    t.push(' ');
-                                    t.push_str(comp);
-                                    continue;
-                                }
-                            }
-                            match feeder.tag.as_str() {
-                                tag if tag.starts_with("param:") => {
-                                    let p = &tag[6..];
-                                    let b = env.own_wf.get(p).ok_or_else(|| {
-                                        format!("needs own wf for param {} ({}Wf)", p, dt)
-                                    })?;
-                                    t.push(' ');
-                                    t.push_str(b);
-                                }
-                                _ => {
-                                    // R-c: spec-fn results / constructors
-                                    // resolve via synthesized lemmas.
-                                    let p = resolve_wf_text(&feeder.text, dt, env)
-                                        .map_err(|e| format!("{} (of {})", e, callee))?;
-                                    t.push(' ');
-                                    t.push_str(&p);
-                                }
-                            }
-                        }
-                    }
-                }
-                t.push(')');
-                args.push(t);
+                args.push(call_app(callee, *is_self, cargs, vc, env)?);
             }
             // The equation premise `binder = v`: with `let binder := v`
             // in scope (replay_lets), `rfl` closes by zeta-defeq.
@@ -796,6 +660,239 @@ fn app_args(vc: &Vc, upto: Option<usize>, env: &AppEnv) -> Result<Vec<String>, S
 fn app_text(vc: &Vc, upto: Option<usize>, env: &AppEnv) -> Result<String, String> {
     let args = app_args(vc, upto, env)?;
     Ok(format!("{} {}", vc.name, args.join(" ")))
+}
+
+/// bootstrap-79 (assert VCs in recursive fn): feed a requires-carrying
+/// callee's hypothesis binders at the call site. Each requires premise
+/// is either the arm's woven GUARD (`if h : P then … else …` — prop
+/// text-matched against `env.guard_prop`, fed `h`) or an IH equality —
+/// the caller's OWN postcondition shape, fed by the self-closed
+/// application whose recorded self-Call's frame the prop mentions
+/// (matched on the full `lib.wp_stm <frame> <stm>` text after chasing
+/// the VC's lets; longest frame text wins so a `frame_append(base, …)`
+/// frame is not shadowed by its `base` prefix). Anything else pends
+/// loud — never a silent mis-feed.
+fn feed_requires(
+    callee: &str,
+    callee_reqs: &[(String, String)],
+    post_vc: &Vc,
+    env: &AppEnv,
+) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for (name, prop) in callee_reqs {
+        if let Some(g) = env.guard_prop {
+            if prop == g || *prop == format!("¬({})", g) {
+                out.push(env.guard_h.unwrap().to_string());
+                continue;
+            }
+        }
+        // The IH shape: the caller's own postcondition with the frame
+        // text of one of its recorded self-Calls.
+        let mut best: Option<(usize, &Vec<Arg>)> = None;
+        for n in &post_vc.spine {
+            let Node::Call { is_self: true, args: cargs, .. } = n else { continue };
+            // cargs = [hp, he, lv, frame?, stm?, st] — the frame arg is
+            // index 3 when present (an expr, possibly a let name).
+            let Some(frame_arg) = cargs.get(3) else { continue };
+            let frame = env
+                .lets
+                .get(&frame_arg.text)
+                .cloned()
+                .unwrap_or_else(|| frame_arg.text.clone());
+            let stm = cargs.get(4).map(|a| a.text.clone()).unwrap_or_default();
+            let needle = format!("lib.wp_stm ({}) {}", frame, stm);
+            if prop.contains(&needle) && best.map_or(true, |(bl, _)| needle.len() > bl) {
+                best = Some((needle.len(), cargs));
+            }
+        }
+        let Some((_, cargs)) = best else {
+            return Err(format!(
+                "requires premise {} of {} (`{}`) is neither the arm guard nor a caller-IH shape",
+                name, callee, prop
+            ));
+        };
+        out.push(call_app(env.fn_rel, true, cargs, post_vc, env)?);
+    }
+    Ok(out)
+}
+
+/// The full application of a callee's `_closed` theorem: positional
+/// params interleaved with bound proofs (per the callee's own leading
+/// Alls), then any REQUIRES feeds (bootstrap-79), then the callee's wf
+/// args. `post_vc` is the caller VC carrying the Call node (the
+/// requires feeds match their IH shapes against its self-Calls).
+fn call_app(
+    callee: &str,
+    is_self: bool,
+    cargs: &[Arg],
+    post_vc: &Vc,
+    env: &AppEnv,
+) -> Result<String, String> {
+    let head = if is_self {
+        format!("{}_closed", env.fn_rel)
+    } else {
+        format!("{}_closed", callee)
+    };
+    // Interleave bound proofs per the callee's own leading-All order
+    // (params and their h_*_bound binders).
+    let callee_sc = env.sidecars.get(if is_self { env.fn_rel } else { callee });
+    let callee_lead: Vec<&Node> = callee_sc
+        .and_then(|c| c.vcs.first())
+        .map(|v| leading_alls(&v.spine).0.iter().collect())
+        .unwrap_or_default();
+    // bootstrap-79: a requires-carrying callee's closed theorem carries
+    // hypothesis binders after its params — feed them (guard / caller
+    // IH), or pend loud when the caller can't.
+    let callee_reqs: Vec<(String, String)> = callee_sc
+        .map(|c| {
+            c.vcs
+                .iter()
+                .flat_map(|v| v.spine.iter())
+                .filter_map(|n| match n {
+                    Node::Req { name, prop } => Some((name.clone(), prop.clone())),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let req_feeds = if callee_reqs.is_empty() {
+        Vec::new()
+    } else {
+        feed_requires(callee, &callee_reqs, post_vc, env)?
+    };
+    let paren = |txt: &str| {
+        if txt.chars().any(|c| c == ' ') && !txt.starts_with('(') {
+            format!("({})", txt)
+        } else {
+            txt.to_string()
+        }
+    };
+    let mut t = format!("({}", head);
+    if callee_lead.is_empty() {
+        // No callee sidecar (shouldn't happen post-guard):
+        // fall back to plain param order.
+        for a in cargs {
+            t.push(' ');
+            t.push_str(&paren(&a.text));
+        }
+    } else {
+        let mut arg_i = 0usize;
+        for cl in &callee_lead {
+            let Node::All { name, .. } = cl else { continue };
+            if name.starts_with("h_") && name.ends_with("_bound") {
+                let feeder = cargs
+                    .get(arg_i.wrapping_sub(1))
+                    .ok_or("bound binder before any param")?;
+                match feeder.tag.as_str() {
+                    tag if tag.starts_with("param:") => {
+                        let bname = format!("h_{}_bound", &tag[6..]);
+                        let have = env.own_lead.iter().any(|n| {
+                            matches!(n, Node::All { name, .. } if *name == bname)
+                        });
+                        if !have {
+                            return Err(format!(
+                                "caller lacks {} for {}",
+                                bname, callee
+                            ));
+                        }
+                        t.push(' ');
+                        t.push_str(&bname);
+                    }
+                    "lit" => t.push_str(" (by omega)"),
+                    _ => {
+                        // R-b: an expr-fed bound whose arg is a
+                        // scrutinee projection discharges by the
+                        // arm's wf component.
+                        match env.arm_comps.get(feeder.text.as_str()) {
+                            Some((comp, false)) => {
+                                t.push(' ');
+                                t.push_str(comp);
+                            }
+                            _ => {
+                                return Err(format!(
+                                    "expr-fed bound at {} (wf-transport)",
+                                    callee
+                                ))
+                            }
+                        }
+                    }
+                }
+            } else {
+                let a = cargs
+                    .get(arg_i)
+                    .ok_or("callee params exceed recorded args")?;
+                t.push(' ');
+                t.push_str(&paren(&a.text));
+                arg_i += 1;
+            }
+        }
+        if arg_i != cargs.len() {
+            return Err("recorded args exceed callee params".into());
+        }
+        // The requires feeds sit between the params and the wf args
+        // (the callee's closed signature order: params, Req binders,
+        // wf params).
+        for f in &req_feeds {
+            t.push(' ');
+            t.push_str(f);
+        }
+        // R-b: append the callee's wf args (its synthesized
+        // signature ends with wf params, in meta order).
+        let meta = if is_self {
+            Some(env.own_meta.clone())
+        } else {
+            env.closed.get(callee).cloned()
+        };
+        if let Some(meta) = meta {
+            let pnames: Vec<&str> = callee_lead
+                .iter()
+                .filter_map(|n| match n {
+                    Node::All { name, .. }
+                        if !(name.starts_with("h_")
+                            && name.ends_with("_bound")) =>
+                    {
+                        Some(name.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            for (wp, dt) in &meta.wf_params {
+                let i = pnames
+                    .iter()
+                    .position(|p| p == wp)
+                    .ok_or_else(|| format!("wf param {} not in {}", wp, callee))?;
+                let feeder = &cargs[i];
+                if let Some(stripped) = feeder.text.strip_suffix(".deref") {
+                    // Scrutinee child: the arm's rec component.
+                    if let Some((comp, true)) = env.arm_comps.get(stripped) {
+                        t.push(' ');
+                        t.push_str(comp);
+                        continue;
+                    }
+                }
+                match feeder.tag.as_str() {
+                    tag if tag.starts_with("param:") => {
+                        let p = &tag[6..];
+                        let b = env.own_wf.get(p).ok_or_else(|| {
+                            format!("needs own wf for param {} ({}Wf)", p, dt)
+                        })?;
+                        t.push(' ');
+                        t.push_str(b);
+                    }
+                    _ => {
+                        // R-c: spec-fn results / constructors
+                        // resolve via synthesized lemmas.
+                        let p = resolve_wf_text(&feeder.text, dt, env)
+                            .map_err(|e| format!("{} (of {})", e, callee))?;
+                        t.push(' ');
+                        t.push_str(&p);
+                    }
+                }
+            }
+        }
+    }
+    t.push(')');
+    Ok(t)
 }
 
 /// Lets that must be replayed in term mode before the applications:
@@ -1031,6 +1128,8 @@ fn close_straight_line(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, 
             wf_specs: ctx.wf_specs,
             ns: ctx.ns,
             lets: &let_table,
+            guard_prop: None,
+            guard_h: None,
         };
         let mut apps = Vec::new();
         let mut err: Option<String> = None;
@@ -1095,12 +1194,76 @@ fn close_straight_line(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, 
     Ok(Outcome::Closed { text, kind: "straight-line", meta })
 }
 
+/// bootstrap-79 (assert VCs in recursive fn): compose an if-split
+/// conjunct — two post VCs sharing one leaf, distinguished by a
+/// non-variant guard (the b79 part-lemma calls' first requires
+/// premise). Validates the shape (exactly one requires-carrying callee
+/// per side, complementary guard props) and emits
+/// `if h : <guard> then <pos app> else <neg app>`; inside, the
+/// guard-fed premises (Branch{None}, guard-shaped requires) take `h`.
+/// Any other shape pends loud.
+fn if_split_text(pos: &Vc, neg: &Vc, env: &AppEnv) -> Result<String, String> {
+    let req_callee = |vc: &Vc| -> Result<String, String> {
+        let mut found: Option<String> = None;
+        for n in &vc.spine {
+            let Node::Call { callee, is_self: false, .. } = n else { continue };
+            let has_reqs = env.sidecars.get(callee.as_str()).map_or(false, |c| {
+                c.vcs.iter().any(|v| v.spine.iter().any(|m| matches!(m, Node::Req { .. })))
+            });
+            if has_reqs {
+                if found.is_some() {
+                    return Err("if-split branch with >1 requires-carrying call".into());
+                }
+                found = Some(callee.clone());
+            }
+        }
+        found.ok_or_else(|| "if-split branch without a requires-carrying call".into())
+    };
+    let first_req_prop = |c: &str| -> Result<String, String> {
+        env.sidecars
+            .get(c)
+            .and_then(|sc| {
+                sc.vcs.iter().flat_map(|v| v.spine.iter()).find_map(|n| match n {
+                    Node::Req { prop, .. } => Some(prop.clone()),
+                    _ => None,
+                })
+            })
+            .ok_or_else(|| format!("callee {} lacks a requires premise", c))
+    };
+    let c1 = req_callee(pos)?;
+    let c2 = req_callee(neg)?;
+    let p1 = first_req_prop(&c1)?;
+    let p2 = first_req_prop(&c2)?;
+    let (guard, vc_pos, vc_neg) = if p2 == format!("¬({})", p1) {
+        (p1, pos, neg)
+    } else if p1 == format!("¬({})", p2) {
+        (p2, neg, pos)
+    } else {
+        return Err(format!("if-split guards not complementary: `{}` vs `{}`", p1, p2));
+    };
+    let genv = AppEnv { guard_prop: Some(&guard), guard_h: Some("h"), ..*env };
+    Ok(format!(
+        "if h : {} then\n        {}\n      else\n        {}",
+        guard,
+        app_text(vc_pos, None, &genv)?,
+        app_text(vc_neg, None, &genv)?
+    ))
+}
+
 /// Fix synthesis: lowered-match recursion (single scrutinee).
 fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
     let posts: Vec<&Vc> = sc.vcs.iter().filter(|v| v.is_post).collect();
     let terms: Vec<&Vc> = sc.vcs.iter().filter(|v| v.is_term).collect();
-    if sc.vcs.iter().any(|v| !v.is_post && !v.is_term) {
-        return Err("assert VCs in recursive fn".into());
+    // bootstrap-79: assert VCs are allowed in a recursive fn ONLY as
+    // `_tactus_precondition_` VCs — the requires discharge of a
+    // requires-carrying callee (the b79 part-lemmas). They are not
+    // composed directly: the callee's requires are fed at the call
+    // site (guard from the woven `if`, caller-IH self-closed apps).
+    // Any other assert class stays a loud pend.
+    for v in &sc.vcs {
+        if !v.is_post && !v.is_term && !v.name.contains("_tactus_precondition_") {
+            return Err(format!("unclassified assert VC {} in recursive fn", v.name));
+        }
     }
     // Hoist/requires composition is validated on the straight-line
     // path only (no recursive instance exists today) — pend loudly
@@ -1313,19 +1476,29 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
         let arity = accessors.len();
         let arm_posts: Vec<&Vc> = posts.iter().copied().filter(|p| sig_of(p) == *sig).collect();
         let arm_terms: Vec<&Vc> = terms.iter().copied().filter(|t| sig_of(t) == *sig).collect();
-        if arm_posts.len() != conjuncts.len() {
-            return Err("arm/conjunct grid mismatch".into());
-        }
-        let arm_posts: Vec<&Vc> = conjuncts
+        // Per-conjunct groups: normally ONE post VC per conjunct leaf.
+        // bootstrap-79: TWO post VCs sharing a conjunct leaf are an
+        // if-split candidate (the arm's proof branches on a
+        // non-variant guard — validated at emission in `if_split_text`).
+        let arm_post_groups: Vec<Vec<&Vc>> = conjuncts
             .iter()
             .map(|c| {
                 arm_posts
                     .iter()
                     .copied()
-                    .find(|p| strip_mark(&p.leaf) == *c)
-                    .ok_or_else(|| "arm missing a conjunct".to_string())
+                    .filter(|p| strip_mark(&p.leaf) == *c)
+                    .collect()
             })
-            .collect::<Result<_, _>>()?;
+            .collect();
+        for g in &arm_post_groups {
+            if g.is_empty() {
+                return Err("arm missing a conjunct".into());
+            }
+            if g.len() > 2 {
+                return Err("arm has >2 post VCs for one conjunct (unclassified split)".into());
+            }
+        }
+        let arm_posts: Vec<&Vc> = arm_post_groups.iter().map(|g| g[0]).collect();
         let base = alias_name.unwrap_or(scrut_param);
         let mut field_names: Vec<Option<String>> = vec![None; arity];
         let mut field_accessor: Vec<Option<String>> = vec![None; arity];
@@ -1467,6 +1640,8 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
             wf_specs: ctx.wf_specs,
             ns: ctx.ns,
             lets: &let_table,
+            guard_prop: None,
+            guard_h: None,
         };
         // Height premises weave in via `have hdec := <term-thm app>`
         // INSIDE the arm (self-refs legal there). The decreasing goals
@@ -1508,6 +1683,8 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
             wf_specs: ctx.wf_specs,
             ns: ctx.ns,
             lets: &let_table,
+            guard_prop: None,
+            guard_h: None,
         };
         let lets = replay_lets(
             arm_posts[0],
@@ -1515,8 +1692,12 @@ fn close_fix(rel: &str, sc: &FnSidecar, ctx: &Ctx) -> Result<Outcome, String> {
             alias_name.map(|a| (a, pattern.as_str())),
         );
         let mut apps = Vec::new();
-        for p in &arm_posts {
-            apps.push(app_text(p, None, &env)?);
+        for g in &arm_post_groups {
+            if g.len() == 1 {
+                apps.push(app_text(g[0], None, &env)?);
+            } else {
+                apps.push(if_split_text(g[0], g[1], &env)?);
+            }
         }
         let final_term = if apps.len() == 1 {
             apps.into_iter().next().unwrap()

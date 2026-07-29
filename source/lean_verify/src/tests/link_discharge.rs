@@ -160,6 +160,9 @@ fn requires_close_carries_hypothesis_binder() {
 #[test]
 fn requires_carrying_callee_pends_loudly() {
     // A caller whose call premise targets the requires-carrying fn.
+    // bootstrap-79: the class is now COMPOSED when the premise is the
+    // arm guard or a caller-IH shape; this premise is neither, so the
+    // fn still pends — with the sharper reason.
     let caller = r#"{"fn":"lib__caller","vcs":[{
       "name":"_tactus_postcondition_caller_at_lib_4_1_1",
       "leaf":"True",
@@ -175,10 +178,174 @@ fn requires_carrying_callee_pends_loudly() {
     t.closed.insert("req_pin".to_string(), ClosedMeta::default());
     match try_close("caller", &t.sidecars["caller"], &t.ctx()) {
         Outcome::Pending(r) => {
-            assert!(r.contains("carries requires"), "reason: {}", r)
+            assert!(r.contains("neither the arm guard nor a caller-IH shape"), "reason: {}", r)
         }
         Outcome::Closed { text, .. } => panic!("should pend, closed: {}", text),
     }
+}
+
+// ── bootstrap-79: requires feeding (guard / caller-IH) + if-split ───
+
+/// A requires-carrying callee (part-lemma analog): one guard premise,
+/// one caller-IH premise.
+const PARTLEMMA_SIDECAR: &str = r#"{"fn":"lib__partlemma","vcs":[{
+  "name":"_tactus_postcondition_partlemma_at_lib_7_1_1",
+  "leaf":"lib.holds_all hp he lv (lib.wp_stm f (lib.StmData.Skip)) st = lib.exec_safe_f hp he lv f (lib.StmData.Skip) st",
+  "spine":[
+    {"k":"all","name":"hp","ty":"Int → (Int → Int) → Prop"},
+    {"k":"all","name":"he","ty":"lib.ExprData → (Int → Int) → Prop"},
+    {"k":"all","name":"lv","ty":"Int → (Int → Int) → Int"},
+    {"k":"all","name":"f","ty":"lib.FrameList"},
+    {"k":"all","name":"setup","ty":"Tactus.Box lib.StmData"},
+    {"k":"all","name":"st","ty":"Int → Int"},
+    {"k":"all","name":"h_req0","ty":"lib.is_skip setup.deref = 1","p":"requires","i":0},
+    {"k":"all","name":"h_req1","ty":"lib.holds_all hp he lv (lib.wp_stm (lib.loop_telescope_base f) setup.deref) st = lib.exec_safe_f hp he lv (lib.loop_telescope_base f) setup.deref st","p":"requires","i":1}
+  ]}]}"#;
+
+/// The caller VC: a self-Call (the IH) and a Call to the part-lemma.
+fn caller_vc() -> Vc {
+    Vc {
+        name: "_tactus_postcondition_caller_at_lib_8_1_1".to_string(),
+        leaf: "lib.holds_all hp he lv (lib.wp_stm f s) st = lib.exec_safe_f hp he lv f s st".to_string(),
+        is_post: true,
+        is_term: false,
+        spine: vec![
+            Node::All { name: "hp".into(), ty: "Int → (Int → Int) → Prop".into() },
+            Node::All { name: "he".into(), ty: "lib.ExprData → (Int → Int) → Prop".into() },
+            Node::All { name: "lv".into(), ty: "Int → (Int → Int) → Int".into() },
+            Node::All { name: "f".into(), ty: "lib.FrameList".into() },
+            Node::All { name: "s".into(), ty: "lib.StmData".into() },
+            Node::All { name: "st".into(), ty: "Int → Int".into() },
+            Node::Let { name: "tmp__1".into(), v: "lib.loop_telescope_base f".into() },
+            Node::Call {
+                callee: "caller".into(),
+                is_self: true,
+                args: vec![
+                    Arg { text: "hp".into(), tag: "param:hp".into() },
+                    Arg { text: "he".into(), tag: "param:he".into() },
+                    Arg { text: "lv".into(), tag: "param:lv".into() },
+                    Arg { text: "tmp__1".into(), tag: "expr".into() },
+                    Arg { text: "setup.deref".into(), tag: "expr".into() },
+                    Arg { text: "st".into(), tag: "param:st".into() },
+                ],
+            },
+            Node::Branch { test: None },
+            Node::Call {
+                callee: "partlemma".into(),
+                is_self: false,
+                args: vec![
+                    Arg { text: "hp".into(), tag: "param:hp".into() },
+                    Arg { text: "he".into(), tag: "param:he".into() },
+                    Arg { text: "lv".into(), tag: "param:lv".into() },
+                    Arg { text: "f".into(), tag: "param:f".into() },
+                    Arg { text: "setup".into(), tag: "expr".into() },
+                    Arg { text: "st".into(), tag: "param:st".into() },
+                ],
+            },
+        ],
+    }
+}
+
+fn pin_env<'a>(t: &'a Tables, guard: Option<&'a str>) -> AppEnv<'a> {
+    static NO_STRINGS: &[String] = &[];
+    static OWN_LEAD: &[Node] = &[];
+    static OWN_WF: std::sync::LazyLock<HashMap<String, String>> =
+        std::sync::LazyLock::new(HashMap::new);
+    static OWN_META: std::sync::LazyLock<ClosedMeta> =
+        std::sync::LazyLock::new(ClosedMeta::default);
+    static OWN_COMPS: std::sync::LazyLock<HashMap<String, (String, bool)>> =
+        std::sync::LazyLock::new(HashMap::new);
+    static LETS: std::sync::LazyLock<HashMap<String, String>> = std::sync::LazyLock::new(|| {
+        HashMap::from([("tmp__1".to_string(), "lib.loop_telescope_base f".to_string())])
+    });
+    AppEnv {
+        fn_rel: "caller",
+        scrut_subst: None,
+        scrut_alias: None,
+        arm_accessors: NO_STRINGS,
+        hdec_names: NO_STRINGS,
+        sidecars: &t.sidecars,
+        own_lead: OWN_LEAD,
+        closed: &t.closed,
+        own_wf: &OWN_WF,
+        arm_comps: &OWN_COMPS,
+        own_meta: &OWN_META,
+        wf_lemmas: &t.wf_lemmas,
+        wf_specs: &t.wf_specs,
+        ns: "lib",
+        lets: &LETS,
+        guard_prop: guard,
+        guard_h: guard.map(|_| "h"),
+    }
+}
+
+#[test]
+fn requires_feed_guard_and_ih() {
+    let mut t = Tables::new();
+    t.sidecars.insert("partlemma".to_string(), parse_sidecar(PARTLEMMA_SIDECAR).unwrap());
+    t.closed.insert("partlemma".to_string(), ClosedMeta::default());
+    let vc = caller_vc();
+    let env = pin_env(&t, Some("lib.is_skip setup.deref = 1"));
+    let app = call_app("partlemma", false, &vc.spine[9].call_args(), &vc, &env)
+        .expect("requires-carrying call composes");
+    // Guard premise fed the woven `if`'s hypothesis…
+    assert!(app.contains(" h "), "guard fed: {}", app);
+    // …and the IH premise fed the self-closed application.
+    assert!(app.contains("(caller_closed hp he lv tmp__1 setup.deref st)"), "ih fed: {}", app);
+}
+
+#[test]
+fn requires_feed_unmatched_pends() {
+    let mut t = Tables::new();
+    t.sidecars.insert("partlemma".to_string(), parse_sidecar(PARTLEMMA_SIDECAR).unwrap());
+    t.closed.insert("partlemma".to_string(), ClosedMeta::default());
+    let vc = caller_vc();
+    // No guard env: the guard premise is unfeedable.
+    let env = pin_env(&t, None);
+    let err = call_app("partlemma", false, &vc.spine[9].call_args(), &vc, &env)
+        .expect_err("unfeedable requires premise pends");
+    assert!(err.contains("neither the arm guard nor a caller-IH shape"), "reason: {}", err);
+}
+
+impl Node {
+    fn call_args(&self) -> &[Arg] {
+        match self {
+            Node::Call { args, .. } => args,
+            _ => panic!("not a call node"),
+        }
+    }
+}
+
+#[test]
+fn if_split_weaves_guard_if() {
+    // Two post VCs sharing the leaf, one per guard side.
+    let mut pos = caller_vc();
+    pos.name = "_tactus_postcondition_caller_at_lib_9_1_1".into();
+    let mut neg = caller_vc();
+    neg.name = "_tactus_postcondition_caller_at_lib_9_1_2".into();
+    neg.spine[9] = Node::Call {
+        callee: "partlemma_neg".into(),
+        is_self: false,
+        args: neg.spine[9].call_args().to_vec(),
+    };
+    // The bf side: callee's first requires is the negated guard.
+    let neg_lemma = PARTLEMMA_SIDECAR
+        .replace("lib.is_skip setup.deref = 1", "¬(lib.is_skip setup.deref = 1)")
+        .replace("partlemma", "partlemma_neg");
+    let mut t = Tables::new();
+    t.sidecars.insert("partlemma".to_string(), parse_sidecar(PARTLEMMA_SIDECAR).unwrap());
+    t.sidecars.insert("partlemma_neg".to_string(), parse_sidecar(&neg_lemma).unwrap());
+    t.closed.insert("partlemma".to_string(), ClosedMeta::default());
+    t.closed.insert("partlemma_neg".to_string(), ClosedMeta::default());
+    let env = pin_env(&t, None);
+    let text = if_split_text(&pos, &neg, &env).expect("if-split composes");
+    assert!(text.starts_with("if h : lib.is_skip setup.deref = 1 then"), "if head: {}", text);
+    // Both sides feed the woven h for their guard premise + branch node.
+    let mut halves = text.split("\n      else\n        ");
+    let pos_half = halves.next().expect("pos half");
+    let neg_half = halves.next().expect("neg half");
+    assert!(pos_half.contains(" h "), "pos guard feeds: {}", text);
+    assert!(neg_half.contains(" h "), "neg guard feeds: {}", text);
 }
 
 #[test]
