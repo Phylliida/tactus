@@ -445,6 +445,12 @@ struct Serializer<'a> {
     /// slot is `oblig_slot`'s output — a deep `RawExp.Span(loc, raw)` when the
     /// ensures is coverable (id recorded in `deep_ids`), else `atom_ob(id)`.
     pending_ens_oblig: Vec<String>,
+    /// The span_mark'd ensures obligation LExprs behind
+    /// `pending_ens_oblig` (bootstrap-79): the Ret arm re-renders them
+    /// with a dest-collision rename applied (production freshens a
+    /// taken return binder and renders the ensures with the rename in
+    /// effect — copy_word's `out` → `out_hoist1`).
+    pending_ens_marked: Vec<LExpr>,
     /// W6d.2b emit gate — the obligation leaf ids that went DEEP on the
     /// reference (SST) side: `oblig_slot`'s `raw_exp` succeeded, so the slot
     /// emitted `RawExp.Span(loc, raw)` instead of `atom_ob(id)`. The goal walk
@@ -701,6 +707,14 @@ impl<'a> Serializer<'a> {
     /// W2 bridge. `kind` never reaches the pp output (only `rust_loc` +
     /// `inner` do — see `lean_pp`), so `Plain` suffices for byte-match.
     fn oblig_leaf(&mut self, e: &Exp) -> Sr<u64> {
+        let marked = self.marked_oblig_lexpr(e)?;
+        Ok(self.leaves.intern(pp_expr(&marked)))
+    }
+
+    /// The span_mark'd obligation LExpr (no intern) — kept so the Ret
+    /// arm can apply a dest-collision rename and re-intern
+    /// (bootstrap-79, `ret_terminal_opt`).
+    fn marked_oblig_lexpr(&mut self, e: &Exp) -> Sr<LExpr> {
         // Render through the binder-aware ctx (bootstrap-18) so a `&`-param
         // deref matches production's postcondition leaf. The ctx's `&self`
         // borrow ends with this statement (`inner` is owned), before
@@ -711,13 +725,12 @@ impl<'a> Serializer<'a> {
             .map_err(|reason| format!("leaf-render: {}", reason))?;
         let inner = self.apply_renames(&inner_raw);
         let loc = crate::obligation_naming::format_rust_loc(&e.span);
-        let marked = LExpr::span_mark(
+        Ok(LExpr::span_mark(
             loc,
             Some(e.span.clone()),
             AssertKind::Obligation(ObligationKind::Plain),
             inner,
-        );
-        Ok(self.leaves.intern(pp_expr(&marked)))
+        ))
     }
 
     /// W6d.2b emit gate — the deep-or-atom obligation SLOT for one raw SST
@@ -3233,7 +3246,43 @@ impl<'a> Serializer<'a> {
                 // (closed via `close_each_e`). Each slot was built at setup by
                 // `oblig_slot` — a deep `RawExp.Span(loc, raw)` for a coverable
                 // ensures (id in `deep_ids`), else the `atom_ob(id)` fallback.
-                let list = raw_exp_list(&self.pending_ens_oblig);
+                // bootstrap-79 (Ret-dest collision): production freshens the
+                // return binder when the declared dest name is ALREADY taken
+                // at the return site (copy_word: the loop's havoc set claims
+                // `out`, so the ret binder becomes `out_hoist1` with eq-hyp
+                // `_h_out_hoist1_hoist1 : out_hoist1 = out`, and the ensures
+                // leaf renders with the rename in effect). Mirror the shadow
+                // mirror: freshen via `fresh_let_name` (records the rename),
+                // rebuild the ensures obligations with the rename applied,
+                // and bind under the fresh name. (The coerced VALUE below
+                // renders AFTER this — the local stays plain —
+                // `out_hoist1 = out`.)
+                let dest_collision = self
+                    .pending_ret_lname
+                    .as_ref()
+                    .map_or(false, |d| self.bound_names.contains(d));
+                let (ret_name, list) = if dest_collision {
+                    let dest = self.pending_ret_lname.clone().unwrap();
+                    // The rename applies to the ENSURES obligations
+                    // (and the fresh binder/eq-name), NOT to the return
+                    // VALUE (`out_hoist1 = out`, not `= out_hoist1`) —
+                    // restore the rename env after the rebuild.
+                    let save_renames = self.rename_env.clone();
+                    let fresh = self.fresh_let_name(&dest);
+                    let mut new_oblig = Vec::new();
+                    for marked in self.pending_ens_marked.clone().iter() {
+                        let renamed = self.apply_renames(marked);
+                        let id = self.leaves.intern(pp_expr(&renamed));
+                        new_oblig.push(atom_ob_lit(id));
+                    }
+                    self.rename_env = save_renames;
+                    (Some(fresh), raw_exp_list(&new_oblig))
+                } else {
+                    (
+                        self.pending_ret_lname.clone(),
+                        raw_exp_list(&self.pending_ens_oblig),
+                    )
+                };
                 // Return-value binding (finding-4): production prepends
                 // `let <ret> := <e>` before the postcondition (the walker's
                 // `let_bind_synthetic(sanitize(ret), <e_ast>, …)`, peeled
@@ -3245,8 +3294,9 @@ impl<'a> Serializer<'a> {
                 // walker's coercion / if-value lifting is NOT replicated here
                 // (a stage-A caveat — a divergence fails the bridge to close,
                 // never silent-passes).
-                let retbind = match (self.pending_ret_name, ret_exp) {
-                    (Some(nleaf), Some(e)) => {
+                let retbind = match (ret_name, ret_exp) {
+                    (Some(ret_name), Some(e)) => {
+                        let nleaf = self.text_leaf(&ret_name);
                         // Render the return value with the binder-aware ctx
                         // (bootstrap-18) so an explicit `&`-param `*p` derefs
                         // to `p.deref`, then apply production's per-leaf
@@ -3287,6 +3337,11 @@ impl<'a> Serializer<'a> {
                         };
                         let coerced = self.apply_renames(&coerced_raw);
                         let vleaf = self.leaves.intern(pp_expr(&coerced));
+                        // The b79 collision rename (above) already set
+                        // `ret_name` to the freshened binder; the eq
+                        // pair takes its LeanName form.
+                        let ret_lname =
+                            Some(crate::lean_name::LeanName::synthetic(ret_name.clone()));
                         // N1-hoist (bootstrap-74 slice 2): the return
                         // binding is a typed let — hoist it to
                         // `RetLetH` (binder pair `(r : T)
@@ -3296,8 +3351,6 @@ impl<'a> Serializer<'a> {
                         // equation stays `RetLet` (wrap — a Bool ret is
                         // the documented RetLetR-less caveat: production
                         // residue-wraps it, the bridge honest-fails).
-                        let ret_lname = self.pending_ret_lname.clone()
-                            .map(crate::lean_name::LeanName::synthetic);
                         // Wrap-mode fn: the legacy Return route keeps
                         // the goal-position let — never RetLetH.
                         let hoistable = !self.wrap_mode
@@ -4443,6 +4496,7 @@ fn serialize<'a>(
     // read of `pending_ens_oblig`; the raw_exp atoms intern in ensures order,
     // exactly where the old `oblig_leaf` interned the span_mark'd leaf.
     let mut ens_oblig: Vec<String> = Vec::new();
+    let mut ens_marked: Vec<LExpr> = Vec::new();
     let mut ens_all_deep = true;
     for e in ens_rewritten.iter() {
         let (id, slot) = s.oblig_slot(e)?;
@@ -4452,10 +4506,12 @@ fn serialize<'a>(
         // is only faithful when every ensures is a real `Span` (an `atom_ob`
         // conjunct would render to `Atom` and diverge from the goal side).
         ens_all_deep &= s.deep_ids.contains(&id);
+        ens_marked.push(s.marked_oblig_lexpr(e)?);
         ens_oblig.push(slot);
     }
     s.pending_ens_all_deep = ens_all_deep;
     s.pending_ens_oblig = ens_oblig;
+    s.pending_ens_marked = ens_marked;
     // Return-var name leaf (finding-4): production binds `let <sanitize(ret)>
     // := <e>` before the postcondition (the `Return` walker's
     // `let_bind_synthetic(sanitize(name), …)`). `dest` is the declared
