@@ -88,6 +88,16 @@ export LEAN_PATH="$CORE_OUT:$CORE_OUT/pkg:$PRELUDE"
 honest_fail_reason() {
   case "$1" in
     runtime__find_cancellation_exec) printf '%s' 'stage-B reference-renderer coercion derivation (bootstrap-77, 2026-07-24): the vec_read class, newly VISIBLE because the fn finally serializes (its assert-query-tactus census tag retired). Stage-A assembly matches (goal count 21 = production; spines align); the per-goal divergence is deep-leaf ONLY — the reference render_exp derives `App idx (FieldProj (Atom v) deref)` where production writes `App idx (Atom v)` (View.view call arg on the &Vec param — per-arg spec-call coercions need the callee signature the fixed-vocabulary mirror does not carry). Same class and same fix as probe9 vec_read: endgame A7 (stage-B callee-signature vocabulary).' ;;
+    # bootstrap-79 (2026-07-28): copy_word CERT RETURNED (the break-form
+    # loop arm). A7-class as the b78 card predicted: the
+    # entry/exit-reclose/maintain invariants and the first AQT assert
+    # are view()-bearing (vec_read deref class — goals 0,1,3,4,7,10,11
+    # diverge deep-leaf only); ALL frame channels validate — goals
+    # 2,5,6,8,9,12,13,14 close outright (incl. the mut-call push frames
+    # and the Ret-dest-collision `out` → `out_hoist1` rename, found
+    # here for the first time and FIXED serializer-side), and the
+    # leaf-normalized spine bridge closes over all 15 goals.
+    runtime__copy_word) printf '%s' 'A7 stage-B deep-leaf class on view()-bearing leaves (vec_read class; b78 card prediction confirmed). The b79 break-form assembly is byte-perfect — non-view goals close outright incl. the push mut frames + the Ret-dest-collision rename (out → out_hoist1, first collision subject, fixed by the b79 Ret-arm work); leaf-normalized spine bridge closes over all 15 goals. Closes with A7 stage-B callee-signature vocab.' ;;
     *) printf '%s' '' ;;
   esac
 }
@@ -99,19 +109,11 @@ is_honest_fail() { [ -n "$(honest_fail_reason "$1")" ]; }
 # exception. Every previously-seen subject is either present below or listed
 # in expected_absent_reason with its census tag.
 #
-# 2026-07-28 regen state: the 4th-sync (fb23b6a) loop_normalize pre-pass
-# rewrites call-in-cond whiles (`while j < v.len()`) into break-form
-# (`loop { setup; if !exp { break; } body }`), and the stage-A stm walk
-# rejects BreakOrContinue loud BEFORE any other arm runs. Two runtime fns
-# tripped it: find_cancellation_exec (was certified + A7-class honest-fail
-# under b77 — its honest_fail_reason above is RETAINED, dormant, for the day
-# its cert returns) and copy_word (the b78-S5 call-mut subject — the tag
-# masks the call-mut census retirement S5 was to confirm). Unblock = the
-# break-form loop arm carded on board/bootstrap-78-a4-call-mut.md §5.
+# 2026-07-28 regen state (RESOLVED same day, bootstrap-79): the 4th-sync
+# loop_normalize break-form is now MIRRORED (the b79 loop arm landed —
+# both fns emit certs again; copy_word classified A7-class above).
 expected_absent_reason() {
   case "$1" in
-    runtime__find_cancellation_exec) printf '%s' 'break-or-continue census reject (b78 S5, 2026-07-28): loop_normalize break-form (call-in-cond while). Was certified + A7-class honest-fail (b77); cert returns when the break-form loop arm lands.' ;;
-    runtime__copy_word) printf '%s' 'break-or-continue census reject (b78 S5, 2026-07-28): same loop_normalize class; masks the call-mut census retirement. Becomes a subject when the loop arm lands — expect UNCLASSIFIED red then (card predicts A7-class honest-fail); classify at that point.' ;;
     *) printf '%s' '' ;;
   esac
 }
