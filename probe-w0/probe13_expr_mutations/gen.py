@@ -518,6 +518,20 @@ def main():
     L.append("-- INDEPENDENTLY re-derives the correct structure. If any mutation still")
     L.append("-- equalled 1, its `= 0` example would error.")
     L.append("")
+    L.append("-- bootstrap-79: the leaf-normalized comparison used by the count_to_len")
+    L.append("-- Loop classes — the subject is A7-class (view()-bearing leaves diverge")
+    L.append("-- on the documented vec_read deref class), so the frame channels under")
+    L.append("-- test are compared with every obligation leaf normalized to a constant.")
+    L.append("noncomputable def strip : lib.GoalData → lib.GoalData")
+    L.append("  | .All x t b => .All x t ⟨strip b.deref⟩")
+    L.append("  | .Imp h b => .Imp h ⟨strip b.deref⟩")
+    L.append("  | .Let x v b => .Let x v ⟨strip b.deref⟩")
+    L.append("  | .LeafE _ => .LeafE (lib.ExprData.Atom 0)")
+    L.append("  | .Leaf _ => .Leaf 0")
+    L.append("noncomputable def strips : lib.GoalList → lib.GoalList")
+    L.append("  | .Cons g t => .Cons ⟨strip g.deref⟩ ⟨(strips t.deref)⟩")
+    L.append("  | .Nil => .Nil")
+    L.append("")
 
     fired = 0
     for fn, cls, human, mut_fn, side, expect in CLASSES:
@@ -542,14 +556,22 @@ def main():
             L.append("")
             fired += 1
             continue
+        # bootstrap-79: count_to_len's Loop classes use the leaf-normalized
+        # comparison (the A7 leaf divergence is orthogonal to the frame
+        # channels under test).
+        norm = fn == "count_to_len"
+        def cmp(sst_term, goals_term):
+            if norm:
+                return f"lib.goals_eq (strips (lib.ref_wp {cls}_ctx {sst_term})) (strips {goals_term})"
+            return f"lib.goals_eq (lib.ref_wp {cls}_ctx {sst_term}) {goals_term}"
         if side == "goals":
             L.append(f"@[reducible] def {cls}_goals_mut : lib.GoalList := {mut_fn(goals)}")
-            kill = f"lib.goals_eq (lib.ref_wp {cls}_ctx {cls}_sst) {cls}_goals_mut"
+            kill = cmp(f"{cls}_sst", f"{cls}_goals_mut")
         else:  # sst-side mutation: the reference's own input is perturbed
             L.append(f"@[reducible] def {cls}_sst_mut : lib.StmData := {mut_fn(sst)}")
-            kill = f"lib.goals_eq (lib.ref_wp {cls}_ctx {cls}_sst_mut) {cls}_goals"
+            kill = cmp(f"{cls}_sst_mut", f"{cls}_goals")
         L.append(f"-- baseline: the unperturbed deep bridge closes.")
-        L.append(f"example : lib.goals_eq (lib.ref_wp {cls}_ctx {cls}_sst) {cls}_goals = 1 := by decide")
+        L.append(f"example : {cmp(f'{cls}_sst', f'{cls}_goals')} = 1 := by decide")
         L.append(f"-- kill: the single-edit mutation FLIPS the bridge.")
         L.append(f"example : {kill} = 0 := by decide")
         L.append("")
