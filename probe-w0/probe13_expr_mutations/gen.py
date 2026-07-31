@@ -19,7 +19,9 @@ classes plus the P1 poison-channel class, each on its own live cert:
   * deref_drop   (head_exec,  G2 auto-deref):             drop the `.deref` FieldProj
   * wrong_field  (mk_point,   G3 struct field):           emit a WRONG field accessor
   * wrong_width  (add_capped, G6 HasType overflow):       2^64 bound -> 2^32
-  * poison_flip  (add_capped, P1 trusted wrap-gate mark): poison bit 1 -> 0,
+  * poison_*     (add_capped, F4 derived-poison channel, bootstrap-80 stage 2):
+                  residue_names zeroed (miss) / cons spurious (spurious) /
+                  residue-mentioning prop_deeps dropped (missing entry),
                  SST-side — pins that a serializer mismark flips the bridge
                  (DESIGN-bootstrap-endgame §1 P1)
   * ifctor_eq_drop / ifctor_binder_drop / ifctor_neg_drop / ifctor_arm_swap
@@ -148,49 +150,102 @@ def wrong_width(goals):
     return goals.replace(POW64, POW32, 1)
 
 
-def poison_drop(sst):
-    """P1 poison-channel kill (endgame policy P1, DESIGN-bootstrap-endgame §1).
+def _split_mk_args(ctx):
+    """Split `(lib.FnCtxData.mk a1 … a9)` into its 9 positional args."""
+    s = ctx.strip()
+    assert s.startswith("(lib.FnCtxData.mk "), f"unexpected ctx shape: {s[:60]!r}"
+    inner = s[len("(lib.FnCtxData.mk "):-1]
+    args, i, n = [], 0, len(inner)
+    while i < n:
+        while i < n and inner[i] == " ":
+            i += 1
+        if i >= n:
+            break
+        if inner[i] == "(":
+            j = match_paren(inner, i)
+            args.append(inner[i:j + 1])
+            i = j + 1
+        else:
+            j = i
+            while j < n and inner[j] != " ":
+                j += 1
+            args.append(inner[i:j])
+            i = j
+    assert len(args) == 9, f"FnCtxData.mk arity {len(args)} != 9 (stale probe vs vocab?)"
+    return args
 
-    The N1 wrap-gate poison mark is a SEMANTIC PREDICATE computed by the
-    trusted serializer (`hyp_poison` — "does this hyp prop mention an
-    in-scope residue name"), not a transcription — the model's gate only
-    READS it. This mutation pins that the channel is live in the bridge:
-    zero EVERY poison mark in the SST literal (the reference's INPUT) —
-    exactly what a broken `hyp_poison` (spuriously returning 0) would
-    emit — and ref_wp HOISTS goals production WRAPPED; the verdict must
-    flip. All marks, not one: production pushes a duplicated hyp pair
-    per assert (FINDINGS-b74-slice2 §3, the Assert forward hyp + the
-    following Assume carry the SAME poisoned prop), so a single-bit flip
-    is masked by the twin — discovered live by this harness's first run.
-    Note this is an SST-side mutation, unlike the four goal-side
-    coercion classes: the mark's consumer is ref_wp itself."""
-    n = 0
 
-    def flip_after(key, tail_re, sst):
-        nonlocal n
-        out, i = [], 0
-        while True:
-            j = sst.find(key, i)
-            if j == -1:
-                out.append(sst[i:])
-                return "".join(out)
-            k = match_paren(sst, j + len(key))  # end of the leading tree arg
-            m = re.match(tail_re, sst[k + 1:])
-            if m and m.group(0).endswith(" 1)"):
-                out.append(sst[i:k + 1] + m.group(0)[:-2] + "0)")
-                n += 1
-                i = k + 1 + m.end()
-            else:
-                out.append(sst[i:j + len(key)])
-                i = j + len(key)
+def _join_mk(args):
+    return "(lib.FnCtxData.mk " + " ".join(args) + ")"
 
-    # Assert (ob…) NAME HYP POISON) — the obligation is a paren tree.
-    sst = flip_after("lib.StmData.Assert ", r" (\d+) (\d+) 1\)", sst)
-    # Assume NAME HYP POISON) — all-numeric, plain regex.
-    sst2 = re.sub(r"(lib\.StmData\.Assume \d+ \d+) 1\)", r"\g<1> 0)", sst)
-    n += len(re.findall(r"lib\.StmData\.Assume \d+ \d+ 1\)", sst))
-    assert n > 0, "poison_drop: no poison marks set — fixture lost its poisoned pair"
-    return sst2
+
+def poison_residue_drop(ctx):
+    """F4 derivation-input kill, MISS direction (bootstrap-80 stage 2 —
+    the re-pointed P1 channel). The poison mark is now DERIVED
+    reference-side (`poisoned_props` over the ctx's residue_names +
+    prop_deeps); the era-1 StmData bits are unread, so the old
+    zero-the-bits kill is dead by construction. Zeroing residue_names
+    makes the derivation miss the REAL residue mention: refWp HOISTS
+    goals production WRAPPED; the verdict must flip."""
+    args = _split_mk_args(ctx)
+    assert args[6] != "lib.LeafList.Nil", "poison_residue_drop: no residues in ctx"
+    args[6] = "lib.LeafList.Nil"
+    return _join_mk(args)
+
+
+def poison_residue_spurious(ctx):
+    """F4 derivation-input kill, SPURIOUS direction: cons a name that DOES
+    occur in the deep props (param id 0 = x, mentioned by every pre-residue
+    assert prop) onto residue_names — the derived set poisons every hyp
+    mentioning it, refWp WRAPS goals production HOISTED; the verdict must
+    flip. (Both directions live: this and poison_residue_drop.)"""
+    args = _split_mk_args(ctx)
+    args[6] = f"(lib.LeafList.Cons 0 (Tactus.Box.mk {args[6]}))"
+    return _join_mk(args)
+
+
+def poison_deep_drop(ctx):
+    """F4 missing-entry kill: drop the prop_deeps entries the derivation
+    WOULD mark (their deep mentions a residue name) — the reference
+    derives 0 for a genuinely-poisoned prop, refWp HOISTS goals
+    production WRAPPED; the verdict must flip. Pins that the side table
+    (not just the name list) is load-bearing, and that a missing entry
+    cannot silent-pass. Entry targets are computed the same way the
+    reference derives them (residue ids from the ctx's own
+    residue_names), so a fixture regen re-aims automatically."""
+    args = _split_mk_args(ctx)
+    resids = re.findall(r"lib\.LeafList\.Cons (\d+)", args[6])
+    assert resids, "poison_deep_drop: no residues in ctx"
+    s = args[7]
+    key = "(lib.PropDeepList.Cons "
+    out, i, n_dropped = [], 0, 0
+    while True:
+        j = s.find(key, i)
+        if j == -1:
+            out.append(s[i:])
+            break
+        m = re.match(r"(\d+) ", s[j + len(key):])
+        assert m, f"malformed prop_deeps entry at {j}"
+        d0 = j + len(key) + m.end()
+        assert s[d0] == "(", f"prop_deeps deep not a paren term at {d0}"
+        d1 = match_paren(s, d0) + 1
+        deep = s[d0:d1]
+        e1 = match_paren(s, j) + 1
+        if any(re.search(rf"\(lib\.RawExp\.Var {r}\b", deep) for r in resids):
+            # Drop the entry: replace it with its own tail (the last
+            # arg, a Tactus.Box.mk-wrapped PropDeepList).
+            entry_inner = s[j + len(key):e1 - 1]  # "ID DEEP (Tactus.Box.mk TAIL)"
+            tail_open = s.index("(Tactus.Box.mk ", d1)
+            tail = s[tail_open + len("(Tactus.Box.mk "):match_paren(s, tail_open)]
+            out.append(s[i:j])
+            out.append(tail)
+            n_dropped += 1
+        else:
+            out.append(s[i:e1])
+        i = e1
+    assert n_dropped > 0, "poison_deep_drop: no residue-mentioning deeps found"
+    args[7] = "".join(out)
+    return _join_mk(args)
 
 
 def expected_typ_drop(sst):
@@ -487,7 +542,13 @@ CLASSES = [
     ("head_exec",  "deref_drop",  "drop the .deref auto-coercion (G2)",               drop_deref,      "goals", "close"),
     ("mk_point",   "wrong_field", "emit a wrong struct field accessor (G3)",          wrong_field,     "goals", "close"),
     ("add_capped", "wrong_width", "wrong HasType overflow bound width 2^64->2^32 (G6)", wrong_width,   "goals", "close"),
-    ("add_capped", "poison_flip", "zero ALL wrap-gate poison marks (P1 trusted-predicate channel)", poison_drop, "sst", "close"),
+    # bootstrap-80 stage 2 (F4): the poison mark is DERIVED reference-side
+    # now — the kills re-point at the derivation INPUTS (the ctx's
+    # residue_names / prop_deeps), both directions + the missing-entry
+    # case. The old zero-the-bits kill is retired: era-1 bits are unread.
+    ("add_capped", "poison_residue_drop", "zero the residue_names table (F4 poison derivation, miss direction)", poison_residue_drop, "ctx", "close"),
+    ("add_capped", "poison_residue_spurious", "cons a deep-occurring name onto residue_names (F4 poison derivation, spurious direction)", poison_residue_spurious, "ctx", "close"),
+    ("add_capped", "poison_deep_drop", "drop the residue-mentioning prop_deeps entries (F4 missing-entry kill)", poison_deep_drop, "ctx", "close"),
     # b77 arm-structure kills (card §Follow-ups): pin the NEW IfCtor /
     # AssertQueryTactus arms. The four IfCtor kills are ALSO the interim
     # N2-detector cross-check pin (serializer header contract, second
@@ -589,9 +650,12 @@ def main():
         if side == "goals":
             L.append(f"@[reducible] def {cls}_goals_mut : lib.GoalList := {mut_fn(goals)}")
             kill = cmp(f"{cls}_sst", f"{cls}_goals_mut")
-        else:  # sst-side mutation: the reference's own input is perturbed
+        elif side == "sst":  # sst-side mutation: the reference's own input is perturbed
             L.append(f"@[reducible] def {cls}_sst_mut : lib.StmData := {mut_fn(sst)}")
             kill = cmp(f"{cls}_sst_mut", f"{cls}_goals")
+        else:  # ctx-side mutation: the derivation input is perturbed (F4)
+            L.append(f"@[reducible] def {cls}_ctx_mut : lib.FnCtxData := {mut_fn(ctx)}")
+            kill = f"lib.goals_eq (lib.ref_wp {cls}_ctx_mut {cls}_sst) {cls}_goals"
         L.append(f"-- baseline: the unperturbed deep bridge closes.")
         L.append(f"example : {cmp(f'{cls}_sst', f'{cls}_goals')} = 1 := by decide")
         L.append(f"-- kill: the single-edit mutation FLIPS the bridge.")
