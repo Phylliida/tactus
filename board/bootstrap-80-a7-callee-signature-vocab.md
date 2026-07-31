@@ -452,6 +452,10 @@ no-tgt-gate constraint.
   vocabulary; regeneration needs the tgt-slice emit, deferred under
   the no-tgt-gates constraint. Re-emit with the new binary when tgt
   work resumes.
+- **e2e: 829/2** — the 2 = the documented pre-existing examples
+  pair (flat_combine, tutorial_fifo), identical to the b79 baseline.
+  F5's new bound hyps are purely additive context: zero user proofs
+  broke corpus-wide.
 - **D discipline:** no new StmData arms; FrameList untouched;
   `wp_stm_sound` untouched (the vocab growth is leaf-rendering +
   Call-arg data). The soundness claim covers exactly what it covered
