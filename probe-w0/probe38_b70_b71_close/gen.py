@@ -62,7 +62,7 @@ def extract_def(text, name):
 
 def drop_ret_bound_fhyp(sst):
     """Remove the FIRST FHyp of the Call post frame — the ret-bound
-    hypothesis — splicing its tail up. `FBind b t (Box (FHyp n p 0
+    hypothesis — splicing its tail up. `FBind b t (Box (FHyp n p
     (Box tail)))` -> `FBind b t (Box tail)`."""
     i = sst.find("lib.StmData.Call")
     assert i != -1, "no Call node in use_clamped SST"
@@ -85,9 +85,9 @@ def swap_post_fhyps(sst):
     """Swap the (name, prop) pairs of the two adjacent post-frame FHyps
     (ret-bound <-> ens)."""
     mut = re.sub(
-        r"lib\.FrameList\.FHyp (\d+) (\d+) 0 \(Tactus\.Box\.mk "
-        r"\(lib\.FrameList\.FHyp (\d+) (\d+) 0 ",
-        r"lib.FrameList.FHyp \3 \4 0 (Tactus.Box.mk (lib.FrameList.FHyp \1 \2 0 ",
+        r"lib\.FrameList\.FHyp (\d+) (\d+) \(Tactus\.Box\.mk "
+        r"\(lib\.FrameList\.FHyp (\d+) (\d+) ",
+        r"lib.FrameList.FHyp \3 \4 (Tactus.Box.mk (lib.FrameList.FHyp \1 \2 ",
         sst, count=1)
     assert mut != sst, "no adjacent FHyp pair (∀-path post frame) found"
     return mut

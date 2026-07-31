@@ -5,6 +5,6 @@ set_option linter.unusedVariables false
 set_option maxHeartbeats 800000
 set_option autoImplicit false
 -- tactus-closer: user
-theorem _tactus_postcondition_u_obligs_nil_at_lib_4568_13_1 (he : lib.ExprData → (Int → Int) → Prop) :
-    /- @rust:tactus-core/lib.rs:4568:13 -/ ∀ (st : Int → Int), lib.obligs_safe he lib.RawExpList.Nil st = True := by
+theorem _tactus_postcondition_u_obligs_nil_at_lib_4554_13_1 (he : lib.ExprData → (Int → Int) → Prop) :
+    /- @rust:tactus-core/lib.rs:4554:13 -/ ∀ (st : Int → Int), lib.obligs_safe he lib.RawExpList.Nil st = True := by
   first | tactus_auto | (intros <;> rfl)

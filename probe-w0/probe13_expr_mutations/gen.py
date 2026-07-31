@@ -269,8 +269,8 @@ def expected_typ_drop(sst):
 def _ifctor_args(sst):
     """Locate the (single) `lib.StmData.IfCtor` node and return the spans of
     its positional args: (pos_binders, [6 scalar spans], thn, els). Layout
-    per tactus-core: pos_binders, eq_name, eq_prop, eq_poison, neg_name,
-    neg_prop, neg_poison, thn, els."""
+    per tactus-core (F4 era 2): pos_binders, eq_name, eq_prop, neg_name,
+    neg_prop, thn, els."""
     key = "lib.StmData.IfCtor "
     j = sst.find(key)
     assert j != -1, "ifctor: no `lib.StmData.IfCtor` node — fixture lost its A5 fork"
@@ -278,7 +278,7 @@ def _ifctor_args(sst):
     i = j + len(key)
     binders = take_sexpr(sst, i)
     scalars, i = [], binders[1]
-    for _ in range(6):
+    for _ in range(4):
         sp = take_sexpr(sst, i)
         assert sst[sp[0]:sp[1]].isdigit(), f"ifctor: expected scalar, got {sst[sp[0]:sp[1]]!r}"
         scalars.append(sp)
@@ -322,7 +322,7 @@ def ifctor_neg_drop(sst):
     negative tests never upgrade) to the 999999 sentinel. refWp's
     else-goal telescope diverges from production's `All neg_name ¬cond`."""
     _, scalars, _, _ = _ifctor_args(sst)
-    s, e = scalars[4]  # neg_prop
+    s, e = scalars[2]  # neg_prop
     assert sst[s:e] != "999999", "ifctor_neg_drop: neg_prop already sentinel?"
     return sst[:s] + "999999" + sst[e:]
 
@@ -340,8 +340,8 @@ def ifctor_arm_swap(sst):
 
 def aqt_hyp_drop(sst):
     """A3 kill (SST-side): drop the AssertQueryTactus AssertFact hyp —
-    rewrite the bare-P leaf scalar (2nd-from-last arg: obligation, hyp_name,
-    bare_P, poison) to 0. The continuation goals lose the proven-inline
+    rewrite the bare-P leaf scalar (last arg: obligation, hyp_name,
+    bare_P) to 0. The continuation goals lose the proven-inline
     fact: refWp emits `All hyp_name 0` where production goals carry the
     real bare-P leaf. (The following Assume still carries the real leaf, so
     the kill isolates the AQT arm's own hyp push.)"""
@@ -406,14 +406,14 @@ def mut_post_binder_drop(sst):
 def mut_bound_hyp_drop(sst):
     """Drop the mut-post type-bound hyp (FHyp#1 — the
     `type_bound_predicate` mirror channel; u64 subject so it exists)."""
-    return _drop_frame_node(sst, "FHyp", 3, 1)
+    return _drop_frame_node(sst, "FHyp", 2, 1)
 
 
 def mut_ens_hyp_drop(sst):
     """Drop the instantiated-ensures hyp (FHyp#2) — distinct from b70's
     ∀-path frame kills (probe38): those covered a no-mut call's frames;
     this pins the hyp inside a MUT post assembly."""
-    return _drop_frame_node(sst, "FHyp", 3, 2)
+    return _drop_frame_node(sst, "FHyp", 2, 2)
 
 
 def mut_rebind_drop(sst):
@@ -442,12 +442,13 @@ def mut_gensym_rename(sst):
 
 def _loop_args(sst):
     """Locate the (single) `lib.StmData.Loop` node and return its positional
-    arg spans: (6 boxed lists, 12 scalars, decrease_oblig, setup, body).
-    Layout per tactus-core (b79): inv_hyps, inv_obligs, inv_obligs_exit,
-    inv_obligs_break, binders, binder_bounds, then cond_name, cond_ann,
-    neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann,
-    cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name,
-    d_old_eq_prop, then decrease_oblig (RawExp), setup, body."""
+    arg spans: (6 boxed lists, 11 scalars, decrease_oblig, setup, body).
+    Layout per tactus-core (b79; F4 era 2 dropped cond_poison): inv_hyps,
+    inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds,
+    then cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann,
+    break_guard_ann, break_use_ann, d_old_name, d_old_ty, d_old_val,
+    d_old_eq_name, d_old_eq_prop, then decrease_oblig (RawExp), setup,
+    body."""
     key = "lib.StmData.Loop "
     j = sst.find(key)
     assert j != -1, "loop: no `lib.StmData.Loop` node — subject lost its loop"
@@ -460,7 +461,7 @@ def _loop_args(sst):
         lists.append(sp)
         i = sp[1]
     scalars = []
-    for _ in range(12):
+    for _ in range(11):
         sp = take_sexpr(sst, i)
         assert sst[sp[0]:sp[1]].isdigit(), f"loop: expected scalar, got {sst[sp[0]:sp[1]]!r}"
         scalars.append(sp)

@@ -2,5 +2,5 @@ import TactusDefs_lib_exec
 set_option linter.unusedVariables false
 set_option maxHeartbeats 800000
 set_option autoImplicit false
-@[reducible] noncomputable def _tactus_postcondition_u_ce_wrap_mode_at_lib_5114_13_1_stmt : Prop :=
-  ∀ (pp : lib.LeafList) (f : lib.FrameList) (ob : lib.RawExp), /- @rust:tactus-core/lib.rs:5114:13 -/ lib.gate_wrap pp f = 1 → lib.close_e pp f ob = lib.close_e_wrap_lead f ob
+@[reducible] noncomputable def _tactus_postcondition_u_ce_wrap_mode_at_lib_5099_13_1_stmt : Prop :=
+  ∀ (pp : lib.LeafList) (f : lib.FrameList) (ob : lib.RawExp), /- @rust:tactus-core/lib.rs:5099:13 -/ lib.gate_wrap pp f = 1 → lib.close_e pp f ob = lib.close_e_wrap_lead f ob
