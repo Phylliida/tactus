@@ -542,6 +542,16 @@ pub enum ExprData {
     // Multi-arg application `f a b c` (W6 `App` was single-arg). Args in a
     // dedicated `ExprList` (the second mutual cycle `ExprData ↔ ExprList`).
     AppN(u64, Box<ExprList>),
+    // A7 (bootstrap-80 F3): the `Tactus.Ref.mk e` / `Tactus.Box.mk e`
+    // WRAPPER constructions production's `coerce_lexpr` inserts when a
+    // bare-typed value flows into a wrapper-typed slot (vec_push7's
+    // `view (Tactus.Ref.mk v)`). First-class nodes, NOT `App` with an
+    // interned fn-name leaf: the reference DERIVES these (reconcile_arg)
+    // and cannot mint the per-cert interned id. Production's transcriber
+    // (`lexpr_to_exprdata`) maps the same apps here, so the two sides
+    // agree id-free.
+    RefMk(Box<ExprData>),
+    BoxMk(Box<ExprData>),
     // Quantifier nodes `∀/∃ (bid : bty), body`. `GoalData::All` is goal-level
     // only; a spec-fn body quantifier needs its own expression node.
     Forall(u64, TypData, Box<ExprData>),
@@ -614,9 +624,16 @@ pub enum RawArmList {
 }
 
 // W7: the raw multi-arg argument list, mirroring `ExprList`.
+// A7 (bootstrap-80 F3): each element pairs the arg with the callee's
+// EXPECTED param typ (instantiated at the call site's typ args,
+// transcribed from the same fn_map production's `fn_param_typs`
+// consults; the serializer's fallback for an unknown signature is the
+// arg's own typ, mirroring production's `into_slot(&a.typ)`). This is
+// what lets `render_exp` DERIVE the per-arg slot coercions
+// (`reconcile_arg`) reference-side instead of trusting a mark.
 pub enum RawList {
     Nil,
-    Cons(Box<RawExp>, Box<RawList>),
+    Cons(Box<RawExp>, TypData, Box<RawList>),
 }
 
 // ── W7 def-header layer: the DEFINITIONS the obligations are stated in
@@ -969,6 +986,8 @@ pub open spec fn expr_size(e: ExprData) -> nat
         ExprData::AppN(_fn, args) => 1 + exprlist_size(*args),
         ExprData::Forall(_bid, _bty, body) => 1 + expr_size(*body),
         ExprData::Exists(_bid, _bty, body) => 1 + expr_size(*body),
+        ExprData::RefMk(t) => 1 + expr_size(*t),
+        ExprData::BoxMk(t) => 1 + expr_size(*t),
     }
 }
 
@@ -1133,6 +1152,49 @@ pub open spec fn deref_if(b: nat, e: ExprData) -> ExprData {
     if b == 1 { ExprData::FieldProj(Box::new(e), deref_field()) } else { e }
 }
 
+// A7 (bootstrap-80 F3/A1): the per-arg slot reconciliation — the TypData
+// fragment of production's `coerce_lexpr` two-phase decision
+// (`expr_shared.rs:1101`), DERIVED reference-side from the (actual,
+// expected) typ pair the call node carries. Phase 1 (numeric sort
+// bridge, both types bare): Int↔Nat → the `Int.toNat`/`Int.ofNat` cast.
+// Phase 2 (wrapper reconciliation, depth ≤ 1): wrapper → bare peels
+// (`.deref`), bare → wrapper wraps (`RefMk`/`BoxMk`), Ref↔Box at equal
+// depth peels+rewraps, equal tags pass through (the vec_read view case:
+// `View.view`'s param IS the ref type, so NO deref — the G2 bug).
+// Non-recursive; kernel reduces under `decide`. Written as a TAG
+// if-chain, NOT a nested match — the one-line Lean emission flattens a
+// nested match's arms into the outer arm scope (the inner `_` swallows
+// the remaining outer constructors → "redundant alternative"); the
+// tag-comparison idiom is the house style for exactly this reason (cf.
+// `deref_type`'s factoring note).
+//
+// Named blind spots (bridge-diverge LOUD, never silent-pass; card A1):
+// a sort bridge UNDER a wrapper (TypData pointees are opaque leaf ids,
+// so the reference cannot see the pointee's sort — production peels,
+// bridges, rewraps) and MutRef-vs-Ref at equal depth (both erase to
+// `TyRef`). Multi-layer wraps cannot arise (TypData is depth-bounded).
+pub open spec fn reconcile_arg(actual: TypData, expected: TypData, e: ExprData) -> ExprData {
+    let ta = td_tag(actual);
+    let te = td_tag(expected);
+    // Phase 1 — bare numeric sort bridge (both directions).
+    if ta == 0 && te == 1 { ExprData::Cast(CastKind::IntToNat, Box::new(e)) }
+    else if ta == 1 && te == 0 { ExprData::Cast(CastKind::NatToInt, Box::new(e)) }
+    // Phase 2 — wrapper reconciliation.
+    else if ta == 4 && te == 4 { e }                          // Ref → Ref: passthrough (vec_read)
+    else if ta == 5 && te == 5 { e }                          // Box → Box: passthrough
+    else if ta == 4 && te == 5 {
+        ExprData::BoxMk(Box::new(ExprData::FieldProj(Box::new(e), deref_field())))
+    }                                                          // Ref → Box: peel + rewrap
+    else if ta == 5 && te == 4 {
+        ExprData::RefMk(Box::new(ExprData::FieldProj(Box::new(e), deref_field())))
+    }                                                          // Box → Ref: peel + rewrap
+    else if ta == 4 || ta == 5 { ExprData::FieldProj(Box::new(e), deref_field()) }
+    // wrapper → bare: peel (the G2 auto-deref, now driven by the pair)
+    else if te == 4 { ExprData::RefMk(Box::new(e)) }           // bare → Ref: wrap (vec_push7)
+    else if te == 5 { ExprData::BoxMk(Box::new(e)) }           // bare → Box: wrap
+    else { e }
+}
+
 // G6: 2^n as an int — the upper bound of the unsigned-overflow refinement
 // `0 ≤ e ∧ e < 2^n`. An INDEPENDENT re-derivation of production's
 // `two_pow_str` (a divergence in either surfaces as a bridge mismatch rather
@@ -1212,18 +1274,17 @@ pub open spec fn render_exp(re: RawExp) -> ExprData
             let r2 = coerce_if(needs_nat_coercion(type_of(*r), ty), r1);
             ExprData::BinOp(op, Box::new(l2), Box::new(r2))
         },
-        // call-arg coercion: nat-coercion at the expected param type (the
-        // Friction-2 site) THEN the G2 ref-deref (a `&T` arg → `.deref`). The
-        // two are mutually exclusive in practice — a `TyRef` arg reads
-        // needs_nat_coercion = 0 — but composed uniformly. When the raw arg is
-        // an explicit `Deref` node (the W6a probe's Case C) it already presents
-        // its pointee type, so needs_ref_deref = 0 and there is no double-deref.
-        RawExp::Call(fnid, _ret, arg, argty) => {
-            let a1 = render_exp(*arg);
-            let a2 = coerce_if(needs_nat_coercion(type_of(*arg), argty), a1);
-            let a3 = deref_if(needs_ref_deref(type_of(*arg)), a2);
-            ExprData::App(fnid, Box::new(a3))
-        },
+        // A7 (bootstrap-80 F3): per-arg slot reconciliation via
+        // `reconcile_arg` — the carried `argty` is now the callee's
+        // EXPECTED param typ (re-sourced from the arg's own typ; the
+        // serializer mirrors production's `fn_param_typs`). This subsumes
+        // the G2 special case (deref iff the pair is (TyRef, pointee))
+        // and adds the mk-wrap grow + both sort-bridge directions. The
+        // old two-step (nat-coerce then needs_ref_deref on the ACTUAL
+        // typ alone) mis-derived `v.deref` where production writes bare
+        // `v` whenever the callee's param is itself ref-typed (vec_read).
+        RawExp::Call(fnid, _ret, arg, argty) =>
+            ExprData::App(fnid, Box::new(reconcile_arg(type_of(*arg), argty, render_exp(*arg)))),
         // G3: field projection. `fid` already matches production's accessor id.
         RawExp::Field(fid, _fty, base) =>
             ExprData::FieldProj(Box::new(render_exp(*base)), fid),
@@ -1259,8 +1320,10 @@ pub open spec fn render_exp(re: RawExp) -> ExprData
         // like an Ite branch (the carried result type `ty` flows into render_arms).
         RawExp::MatchR(scrut, arms, ty) =>
             ExprData::Match(Box::new(render_exp(*scrut)), Box::new(render_arms(*arms, ty))),
-        // W7: multi-arg app. Args rendered straight; per-arg expected-type
-        // coercion is deferred to W7c (no fixture body is multi-arg — §7 Q3).
+        // W7: multi-arg app. A7 (bootstrap-80 F3): each arg renders
+        // through `reconcile_arg` at its carried EXPECTED param typ
+        // (the RawList pair slot) — this was the "deferred to W7c"
+        // per-arg coercion gap (the `Int.ofNat` on `Seq.index` args).
         RawExp::CallN(fnid, _ret, args) =>
             ExprData::AppN(fnid, Box::new(render_list(*args))),
         // W7: quantifiers pass the binder id + type through; body renders recursively.
@@ -1290,13 +1353,20 @@ pub open spec fn render_arms(a: RawArmList, ty: TypData) -> ArmList
 }
 
 // W7: render the multi-arg argument list, mutually recursive with `render_exp`.
+// A7: each element pairs the arg with its EXPECTED param typ — the arg
+// renders recursively, then `reconcile_arg` derives the slot coercion
+// from the (actual, expected) pair (production's per-arg `into_slot`).
 #[verifier::structural_decreases]
 pub open spec fn render_list(l: RawList) -> ExprList
     decreases l
 {
     match l {
         RawList::Nil => ExprList::Nil,
-        RawList::Cons(h, t) => ExprList::Cons(Box::new(render_exp(*h)), Box::new(render_list(*t))),
+        RawList::Cons(h, expected, t) =>
+            ExprList::Cons(
+                Box::new(reconcile_arg(type_of(*h), expected, render_exp(*h))),
+                Box::new(render_list(*t)),
+            ),
     }
 }
 
@@ -1346,6 +1416,9 @@ pub open spec fn ed_tag(e: ExprData) -> nat {
         ExprData::AppN(_, _) => 12,
         ExprData::Forall(_, _, _) => 13,
         ExprData::Exists(_, _, _) => 14,
+        // A7 wrapper constructions.
+        ExprData::RefMk(_) => 15,
+        ExprData::BoxMk(_) => 16,
     }
 }
 pub open spec fn ed_atom_id(e: ExprData) -> u64 { match e { ExprData::Atom(x) => x, _ => 0 } }
@@ -1382,6 +1455,9 @@ pub open spec fn ed_forall_body(e: ExprData) -> ExprData { match e { ExprData::F
 pub open spec fn ed_exists_bid(e: ExprData) -> u64 { match e { ExprData::Exists(x, _, _) => x, _ => 0 } }
 pub open spec fn ed_exists_bty(e: ExprData) -> TypData { match e { ExprData::Exists(_, t, _) => t, _ => TypData::TyInt } }
 pub open spec fn ed_exists_body(e: ExprData) -> ExprData { match e { ExprData::Exists(_, _, b) => *b, _ => ExprData::Atom(0) } }
+// A7: RefMk/BoxMk projections.
+pub open spec fn ed_refmk_e(e: ExprData) -> ExprData { match e { ExprData::RefMk(t) => *t, _ => ExprData::Atom(0) } }
+pub open spec fn ed_boxmk_e(e: ExprData) -> ExprData { match e { ExprData::BoxMk(t) => *t, _ => ExprData::Atom(0) } }
 // ArmList projections (read `arms_eq`'s 2nd arg): head ctor/binds/body + tail.
 pub open spec fn al_is_nil(a: ArmList) -> nat { match a { ArmList::Nil => 1, _ => 0 } }
 pub open spec fn al_hd_ctor(a: ArmList) -> u64 { match a { ArmList::Cons(c, _, _, _) => c, _ => 0 } }
@@ -1482,6 +1558,11 @@ pub open spec fn expr_eq(a: ExprData, b: ExprData) -> nat
                     if typ_eq(bty, ed_exists_bty(b)) == 1 { expr_eq(*body, ed_exists_body(b)) } else { 0 }
                 } else { 0 }
             } else { 0 },
+        // A7: wrapper constructions — structural on the inner.
+        ExprData::RefMk(t) =>
+            if ed_tag(b) == 15 { expr_eq(*t, ed_refmk_e(b)) } else { 0 },
+        ExprData::BoxMk(t) =>
+            if ed_tag(b) == 16 { expr_eq(*t, ed_boxmk_e(b)) } else { 0 },
     }
 }
 
@@ -1953,11 +2034,12 @@ proof fn defs_expr_vocab_kernel_computes()
                     Box::new(ExprData::Lit(0)),          // BUG: Leaf => 0, not 1
                     Box::new(ArmList::Nil))))
         ) == 0,
-        // ── AppN — `g a b` (synthetic; §7 Q3 flat arg list) ──
+        // ── AppN — `g a b` (synthetic; §7 Q3 flat arg list; A7: per-arg
+        //    expected typs carried — Nat/Nat here, so passthrough) ──
         expr_eq(
             render_exp(RawExp::CallN(24, TypData::TyNat,
-                Box::new(RawList::Cons(Box::new(RawExp::Var(9, TypData::TyNat)),
-                    Box::new(RawList::Cons(Box::new(RawExp::Var(10, TypData::TyNat)),
+                Box::new(RawList::Cons(Box::new(RawExp::Var(9, TypData::TyNat)), TypData::TyNat,
+                    Box::new(RawList::Cons(Box::new(RawExp::Var(10, TypData::TyNat)), TypData::TyNat,
                         Box::new(RawList::Nil))))))),
             ExprData::AppN(24, Box::new(ExprList::Cons(Box::new(ExprData::Atom(9)),
                 Box::new(ExprList::Cons(Box::new(ExprData::Atom(10)), Box::new(ExprList::Nil))))))
@@ -1965,8 +2047,8 @@ proof fn defs_expr_vocab_kernel_computes()
         // kill: args swapped.
         expr_eq(
             render_exp(RawExp::CallN(24, TypData::TyNat,
-                Box::new(RawList::Cons(Box::new(RawExp::Var(9, TypData::TyNat)),
-                    Box::new(RawList::Cons(Box::new(RawExp::Var(10, TypData::TyNat)),
+                Box::new(RawList::Cons(Box::new(RawExp::Var(9, TypData::TyNat)), TypData::TyNat,
+                    Box::new(RawList::Cons(Box::new(RawExp::Var(10, TypData::TyNat)), TypData::TyNat,
                         Box::new(RawList::Nil))))))),
             ExprData::AppN(24, Box::new(ExprList::Cons(Box::new(ExprData::Atom(10)),  // BUG: swapped
                 Box::new(ExprList::Cons(Box::new(ExprData::Atom(9)), Box::new(ExprList::Nil))))))
@@ -1987,6 +2069,86 @@ proof fn defs_expr_vocab_kernel_computes()
             ExprData::Forall(15, TypData::TyInt,          // BUG: binder Nat→Int
                 Box::new(ExprData::BinOp(0, Box::new(ExprData::Atom(15)), Box::new(ExprData::Atom(15)))))
         ) == 0
+by { decide }
+
+// A7 (bootstrap-80 F3): in-crate kernel-computation guard for
+// `reconcile_arg` — the per-arg slot reconciliation derived from the
+// (actual, expected) pair. The three live divergence shapes from the
+// frozen step-0 evidence, each correct-closes to 1 + a kill flips to 0.
+proof fn a7_reconcile_kernel_computes()
+    ensures
+        // vec_read View case: arg `v : TyRef(14)`, `View.view`'s param IS
+        // ref-typed (expected TyRef(14)) → PASSTHROUGH (the G2 bug was
+        // deriving `v.deref` here). Kill = the old mis-derivation.
+        expr_eq(
+            render_exp(RawExp::Call(12, TypData::TyNamed(13),
+                Box::new(RawExp::Var(0, TypData::TyRef(14))),
+                TypData::TyRef(14))),
+            ExprData::App(12, Box::new(ExprData::Atom(0)))
+        ) == 1,
+        expr_eq(
+            render_exp(RawExp::Call(12, TypData::TyNamed(13),
+                Box::new(RawExp::Var(0, TypData::TyRef(14))),
+                TypData::TyRef(14))),
+            ExprData::App(12, Box::new(ExprData::FieldProj(Box::new(ExprData::Atom(0)), 0)))  // BUG: spurious .deref
+        ) == 0,
+        // vec_push7 View case: arg `v : TyNamed(12)` (the &mut final value
+        // at the POINTEE), `View.view`'s param is ref-typed → the
+        // `Tactus.Ref.mk v` WRAP (first-class node, no interned id).
+        // Kill = wrap dropped.
+        expr_eq(
+            render_exp(RawExp::Call(11, TypData::TyNamed(10),
+                Box::new(RawExp::Var(0, TypData::TyNamed(12))),
+                TypData::TyRef(12))),
+            ExprData::App(11, Box::new(ExprData::RefMk(Box::new(ExprData::Atom(0)))))
+        ) == 1,
+        expr_eq(
+            render_exp(RawExp::Call(11, TypData::TyNamed(10),
+                Box::new(RawExp::Var(0, TypData::TyNamed(12))),
+                TypData::TyRef(12))),
+            ExprData::App(11, Box::new(ExprData::Atom(0)))  // BUG: RefMk dropped
+        ) == 0,
+        // Seq.index case: CallN whose 2nd arg is Nat under an Int param →
+        // the `Int.ofNat` cast, DERIVED per-arg (the "deferred to W7c"
+        // gap); 1st arg (Nat under Nat) passes through. Kill = cast
+        // dropped.
+        expr_eq(
+            render_exp(RawExp::CallN(15, TypData::TyInt,
+                Box::new(RawList::Cons(Box::new(RawExp::Var(9, TypData::TyNat)), TypData::TyNat,
+                    Box::new(RawList::Cons(Box::new(RawExp::Var(10, TypData::TyNat)), TypData::TyInt,
+                        Box::new(RawList::Nil))))))),
+            ExprData::AppN(15, Box::new(ExprList::Cons(Box::new(ExprData::Atom(9)),
+                Box::new(ExprList::Cons(
+                    Box::new(ExprData::Cast(CastKind::NatToInt, Box::new(ExprData::Atom(10)))),
+                    Box::new(ExprList::Nil))))))
+        ) == 1,
+        expr_eq(
+            render_exp(RawExp::CallN(15, TypData::TyInt,
+                Box::new(RawList::Cons(Box::new(RawExp::Var(9, TypData::TyNat)), TypData::TyNat,
+                    Box::new(RawList::Cons(Box::new(RawExp::Var(10, TypData::TyNat)), TypData::TyInt,
+                        Box::new(RawList::Nil))))))),
+            ExprData::AppN(15, Box::new(ExprList::Cons(Box::new(ExprData::Atom(9)),
+                Box::new(ExprList::Cons(Box::new(ExprData::Atom(10)),  // BUG: ofNat dropped
+                    Box::new(ExprList::Nil))))))
+        ) == 0,
+        // Ref↔Box at equal depth: peel + rewrap (production's kind-mismatch
+        // arm); reverse Int→Nat direction (toNat).
+        expr_eq(
+            render_exp(RawExp::Call(23, TypData::TyNat,
+                Box::new(RawExp::Var(7, TypData::TyBox(100))),
+                TypData::TyRef(100))),
+            ExprData::App(23, Box::new(ExprData::RefMk(
+                Box::new(ExprData::FieldProj(Box::new(ExprData::Atom(7)), 0)))))
+        ) == 1,
+        expr_eq(
+            render_exp(RawExp::Call(20, TypData::TyNat,
+                Box::new(RawExp::Var(1, TypData::TyInt)),
+                TypData::TyNat)),
+            ExprData::App(20, Box::new(ExprData::Cast(CastKind::IntToNat, Box::new(ExprData::Atom(1)))))
+        ) == 1,
+        // RefMk/BoxMk tag separation (Ref ≠ Box).
+        expr_eq(ExprData::RefMk(Box::new(ExprData::Atom(0))),
+                ExprData::BoxMk(Box::new(ExprData::Atom(0)))) == 0
 by { decide }
 
 // W7: in-crate kernel-computation guard for the DEF-HEADER layer — pins
