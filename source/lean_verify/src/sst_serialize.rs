@@ -1480,24 +1480,30 @@ impl<'a> Serializer<'a> {
             }
             // Single-argument spec-fn application (`lib.tri (…)`). The fn id
             // interns the callee name text (atom-id bucket); ret ty = the
-            // call node's typ; arg ty = the argument node's typ.
+            // call node's typ; the 4th slot = the callee's EXPECTED param
+            // typ (A7 — see `expected_arg_typ`).
             //
             // W7 (bootstrap-34): multi-arg (`args.len() >= 2`) widens to
             // `RawExp::CallN(fn, ret, RawList[args])` — the flat-arg spine
-            // `render_exp` maps to `ExprData::AppN` (lib.rs L944). No per-arg
-            // `TypData`: the step-2a SST dump proved Verus MATERIALIZES every
-            // call-arg coercion as a `Clip` INSIDE the arg (its own `.typ`
-            // already carries the coerced type), so the single-arg arm's
-            // `arg_ty`/coerce machinery is a structural no-op per element and
-            // the plain `render_list` renders every producible shape faithfully
-            // (STEP2A-DUMP.md). `len == 0` (a genuine no-dummy nullary call)
-            // stays census-rejected as before.
-            ExpX::Call(CallFun::Fun(fun, _), _typs, args) => {
+            // `render_exp` maps to `ExprData::AppN` (lib.rs L944).
+            // A7 (bootstrap-80 F3): each RawList element pairs the arg with
+            // its expected param typ. The W7-era claim that Verus
+            // materializes EVERY call-arg coercion as a `Clip` inside the
+            // arg is falsified by vec_read (`Int.ofNat i` on the
+            // `Seq.index` arg appears in production with NO Clip in the
+            // SST — production inserts it at render time from the callee
+            // signature), which is exactly why the expected typs must be
+            // carried. `len == 0` (a genuine no-dummy nullary call) stays
+            // census-rejected as before.
+            ExpX::Call(CallFun::Fun(fun, _), typs, args) => {
                 let fn_id = self.call_fun_id(fun);
                 let ret = self.typ_data(&e.typ)?;
                 if args.len() == 1 {
                     let arg = &args[0];
-                    let arg_ty = self.typ_data(&arg.typ)?;
+                    // A7 (bootstrap-80 F3): the 4th slot is the callee's
+                    // EXPECTED param typ (was: the arg's own typ) — what
+                    // `reconcile_arg` reconciles against reference-side.
+                    let arg_ty = self.expected_arg_typ(fun, typs, 0, arg)?;
                     let arg_s = self.raw_exp(arg)?;
                     Ok(format!(
                         "({}.RawExp.Call {} {} {} {})",
@@ -1509,10 +1515,16 @@ impl<'a> Serializer<'a> {
                     ))
                 } else if args.len() >= 2 {
                     let mut arg_list = format!("{}.RawList.Nil", NS);
-                    for arg in args.iter().rev() {
+                    for (i, arg) in args.iter().enumerate().rev() {
+                        let expected = self.expected_arg_typ(fun, typs, i, arg)?;
                         let a = self.raw_exp(arg)?;
-                        arg_list =
-                            format!("({}.RawList.Cons {} {})", NS, box_raw(&a), box_raw(&arg_list));
+                        arg_list = format!(
+                            "({}.RawList.Cons {} {} {})",
+                            NS,
+                            box_raw(&a),
+                            paren(&expected),
+                            box_raw(&arg_list)
+                        );
                     }
                     Ok(format!(
                         "({}.RawExp.CallN {} {} {})",
@@ -1668,6 +1680,57 @@ impl<'a> Serializer<'a> {
         self.text_leaf(name.as_str())
     }
 
+    /// A7 (bootstrap-80 F3): the callee's param typ at position `idx`,
+    /// instantiated with the call's typ args — read through production's
+    /// OWN `fn_param_typs` logic (`expr_shared::fn_param_typs_of`, single
+    /// source) over the SAME fn_map the render ctx consults, then mirrored
+    /// to `TypData`. This is DATA transcription (the same VIR the
+    /// production renderer reads), not a decision: `reconcile_arg` derives
+    /// the coercion reference-side from the (actual, expected) pair.
+    /// Fallbacks, both mirroring production's own behavior:
+    ///   * unknown signature → the arg's own typ (production's
+    ///     `into_slot(&a.typ)` fallback = passthrough);
+    ///   * a param typ the mirror cannot transcribe (`typ_data` failure =
+    ///     an inner-type `coerce_lexpr` also passes through) → the arg's
+    ///     own typ.
+    fn expected_arg_typ(
+        &mut self,
+        fun: &vir::ast::Fun,
+        typs: &[vir::ast::Typ],
+        idx: usize,
+        arg: &vir::sst::Exp,
+    ) -> Sr<String> {
+        let expected = crate::expr_shared::fn_param_typs_of(&self.fn_map, fun, typs)
+            .and_then(|ts| ts.get(idx).cloned());
+        match expected {
+            Some(t) => match self.typ_data(&t) {
+                Ok(td) => Ok(td),
+                Err(_) => self.typ_data(&arg.typ),
+            },
+            None => self.typ_data(&arg.typ),
+        }
+    }
+
+    /// VIR-surface sibling of [`Self::expected_arg_typ`] for the def-body
+    /// transcriber (`raw_vir_exp`): same lookup, VIR arg node.
+    fn expected_arg_typ_vir(
+        &mut self,
+        fun: &vir::ast::Fun,
+        typs: &[vir::ast::Typ],
+        idx: usize,
+        arg: &vir::ast::Expr,
+    ) -> Sr<String> {
+        let expected = crate::expr_shared::fn_param_typs_of(&self.fn_map, fun, typs)
+            .and_then(|ts| ts.get(idx).cloned());
+        match expected {
+            Some(t) => match self.typ_data(&t) {
+                Ok(td) => Ok(td),
+                Err(_) => self.typ_data(&arg.typ),
+            },
+            None => self.typ_data(&arg.typ),
+        }
+    }
+
     // ── W7c-ref (bootstrap-29): VIR `ExprX` → RawExp (the DEF-BODY reference) ─
     //
     // Spec-fn *bodies* live on the VIR `vir::ast::Expr` surface, NOT the SST
@@ -1762,12 +1825,14 @@ impl<'a> Serializer<'a> {
             // flat, no-per-arg-`TypData` spine, co-designed so `def_eq` agrees
             // with the production `AppN` by construction. `len == 0` stays
             // census-rejected.
-            ExprX::Call(CallTarget::Fun(_, fun, _typs, ..), args, _post) => {
+            ExprX::Call(CallTarget::Fun(_, fun, typs, ..), args, _post) => {
                 let fn_id = self.call_fun_id(fun);
                 let ret = self.typ_data(&e.typ)?;
                 if args.len() == 1 {
                     let arg = &args[0];
-                    let arg_ty = self.typ_data(&arg.typ)?;
+                    // A7 (bootstrap-80 F3): 4th slot = the callee's
+                    // EXPECTED param typ (same as the SST arm).
+                    let arg_ty = self.expected_arg_typ_vir(fun, typs, 0, arg)?;
                     let arg_s = self.raw_vir_exp(arg)?;
                     Ok(format!(
                         "({}.RawExp.Call {} {} {} {})",
@@ -1779,10 +1844,16 @@ impl<'a> Serializer<'a> {
                     ))
                 } else if args.len() >= 2 {
                     let mut arg_list = format!("{}.RawList.Nil", NS);
-                    for arg in args.iter().rev() {
+                    for (i, arg) in args.iter().enumerate().rev() {
+                        let expected = self.expected_arg_typ_vir(fun, typs, i, arg)?;
                         let a = self.raw_vir_exp(arg)?;
-                        arg_list =
-                            format!("({}.RawList.Cons {} {})", NS, box_raw(&a), box_raw(&arg_list));
+                        arg_list = format!(
+                            "({}.RawList.Cons {} {} {})",
+                            NS,
+                            box_raw(&a),
+                            paren(&expected),
+                            box_raw(&arg_list)
+                        );
                     }
                     Ok(format!(
                         "({}.RawExp.CallN {} {} {})",
@@ -2250,6 +2321,24 @@ impl<'a> Serializer<'a> {
                     NS,
                     box_ed(&sub)
                 ))
+            }
+            // A7 (bootstrap-80 F3): the `Tactus.Ref.mk e` / `Tactus.Box.mk e`
+            // wrapper constructions `coerce_lexpr` inserts — first-class
+            // nodes, NOT an `App` on an interned fn-name leaf: the
+            // reference DERIVES these via `reconcile_arg` and cannot mint
+            // the per-cert interned id. Head may carry a typ-arg layer
+            // (same peeling as the generic App arms).
+            ExprNode::App { head, args }
+                if args.len() == 1 && app_head_fn_name(head) == Some("Tactus.Ref.mk") =>
+            {
+                let sub = self.lexpr_to_exprdata(&args[0])?;
+                Ok(format!("({}.ExprData.RefMk {})", NS, box_ed(&sub)))
+            }
+            ExprNode::App { head, args }
+                if args.len() == 1 && app_head_fn_name(head) == Some("Tactus.Box.mk") =>
+            {
+                let sub = self.lexpr_to_exprdata(&args[0])?;
+                Ok(format!("({}.ExprData.BoxMk {})", NS, box_ed(&sub)))
             }
             // Single-value-arg spec-fn application (`lib.tri x`). The head is a
             // bare `Var(name)` (nullary-generic callee, e.g. `tri`) or a

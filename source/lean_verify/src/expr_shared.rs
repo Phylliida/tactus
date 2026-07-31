@@ -360,24 +360,7 @@ impl<'a> RenderCtx<'a> {
     }
 
     pub fn fn_param_typs(&self, fun: &Fun, typ_args: &[Typ]) -> Option<Vec<Typ>> {
-        let fn_map = self.fn_map?;
-        let func = fn_map.get(fun)?;
-        if !typ_args.is_empty() && typ_args.len() == func.typ_params.len() {
-            let typ_substs: HashMap<Ident, Typ> = func
-                .typ_params
-                .iter()
-                .cloned()
-                .zip(typ_args.iter().cloned())
-                .collect();
-            Some(
-                func.params
-                    .iter()
-                    .map(|p| vir::sst_util::subst_typ(&typ_substs, &p.x.typ))
-                    .collect(),
-            )
-        } else {
-            Some(func.params.iter().map(|p| p.x.typ.clone()).collect())
-        }
+        self.fn_map.and_then(|m| fn_param_typs_of(m, fun, typ_args))
     }
 
     /// Sibling of [`Self::fn_param_typs`] for the RESULT side: the
@@ -1139,6 +1122,30 @@ pub(crate) fn coerce_lexpr(value: LExpr, from_typ: &Typ, to_typ: &Typ) -> LExpr 
     let wrap_slice = &to_wraps[..to_wraps.len() - suffix_len];
     let peeled = apply_deref_chain(value, peel_n);
     apply_wrap_chain(peeled, wrap_slice)
+}
+
+/// The [`RenderCtx::fn_param_typs`] logic as a free function over the
+/// map, so the cert serializer (A7, bootstrap-80) reads the SAME
+/// instantiated param typs production's per-arg `into_slot` coercion
+/// consults — one source for the typ-arg substitution discipline.
+pub fn fn_param_typs_of(fn_map: &RenderFnMap, fun: &Fun, typ_args: &[Typ]) -> Option<Vec<Typ>> {
+    let func = fn_map.get(fun)?;
+    if !typ_args.is_empty() && typ_args.len() == func.typ_params.len() {
+        let typ_substs: HashMap<Ident, Typ> = func
+            .typ_params
+            .iter()
+            .cloned()
+            .zip(typ_args.iter().cloned())
+            .collect();
+        Some(
+            func.params
+                .iter()
+                .map(|p| vir::sst_util::subst_typ(&typ_substs, &p.x.typ))
+                .collect(),
+        )
+    } else {
+        Some(func.params.iter().map(|p| p.x.typ.clone()).collect())
+    }
 }
 
 /// Lean accessor string for the `n`th element of an `arity`-tuple.
