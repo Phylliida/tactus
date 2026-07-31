@@ -25,7 +25,13 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CERT_DIR="$ROOT/bootstrap-fixture/out/lib/cert"
 CORE_OUT="$ROOT/tactus-core/out/lib"
-PRELUDE="${TACTUS_PRELUDE:-$HOME/.cache/tactus/prelude-e81fbf9a86375c12}"
+# All prelude caches (slim-prelude work mints new hashes; the collapsed
+# bare TactusDefs ships inside the prelude — glob them all, probe9-style.
+# The previously pinned single `prelude-e81f…` dir predates the prelude
+# split and lacks the bare TactusDefs — "unknown module prefix
+# 'TactusDefs'" — i.e. this probe was STALE-RED, not red on substance).
+PRELUDES="$(ls -d "$HOME"/.cache/tactus/prelude-* 2>/dev/null | tr '\n' ':')"
+PRELUDE="${TACTUS_PRELUDE:-${PRELUDES%:}}"
 LEAN_BIN="${LEAN:-$(command -v lean)}"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 

@@ -217,6 +217,8 @@ def eval (E : SymEnv) (e : lib.ExprData) (st : St) : Int :=
   | lib.ExprData.Not x => if eval E x.deref st ≠ 0 then 0 else 1       -- Bool negation as value
   | lib.ExprData.Ite c t e => if eval E c.deref st ≠ 0 then eval E t.deref st else eval E e.deref st
   | lib.ExprData.AppN f args => E.fnN f (evalList E args.deref st)     -- N-ARY grounding
+  | lib.ExprData.RefMk x => eval E x.deref st                     -- A7: wrapper ctor is value-transparent
+  | lib.ExprData.BoxMk x => eval E x.deref st                     -- A7: same
   | lib.ExprData.Match s arms => evalArms E (eval E s.deref st) arms.deref st  -- faithful: decode tag, walk arms
   | lib.ExprData.Forall _ _ _ => 0                                     -- quantifier in value position: sentinel
   | lib.ExprData.Exists _ _ _ => 0
@@ -274,6 +276,8 @@ def edenote (E : SymEnv) (e : lib.ExprData) (st : St) : Prop :=
   -- W5f v2 body fragment (faithful):
   | lib.ExprData.Ite c t e => if eval E c.deref st ≠ 0 then edenote E t.deref st else edenote E e.deref st
   | lib.ExprData.AppN _ _ => eval E e st ≠ 0                           -- Bool-returning N-ary call: truthiness
+  | lib.ExprData.RefMk _ => eval E e st ≠ 0                            -- A7: wrapper ctor (value-transparent)
+  | lib.ExprData.BoxMk _ => eval E e st ≠ 0                            -- A7: same
   | lib.ExprData.Forall x _ b => ∀ n : Int, edenote E b.deref (upd st x n)   -- genuine ∀ (over Int; sound over-approx)
   | lib.ExprData.Exists x _ b => ∃ n : Int, edenote E b.deref (upd st x n)   -- genuine ∃
   | lib.ExprData.Match s arms => edenoteArms E (eval E s.deref st) arms.deref st  -- faithful: decode tag, walk arms
@@ -575,9 +579,9 @@ theorem adequacy_leaf_appn_grounded (E : SymEnv) (mId nId fId ltId : Int)
       (lib.RawExp.BinOp ltId lib.TypData.TyBool
         (Tactus.Box.mk (lib.RawExp.CallN fId lib.TypData.TyInt
           (Tactus.Box.mk (lib.RawList.Cons
-            (Tactus.Box.mk (lib.RawExp.Var mId lib.TypData.TyInt))
+            (Tactus.Box.mk (lib.RawExp.Var mId lib.TypData.TyInt)) lib.TypData.TyInt
             (Tactus.Box.mk (lib.RawList.Cons
-              (Tactus.Box.mk (lib.RawExp.Var nId lib.TypData.TyInt))
+              (Tactus.Box.mk (lib.RawExp.Var nId lib.TypData.TyInt)) lib.TypData.TyInt
               (Tactus.Box.mk lib.RawList.Nil)))))))
         (Tactus.Box.mk (lib.RawExp.Lit 100 lib.TypData.TyInt)))) st
       ↔ (h [E.av mId st, E.av nId st] < 100) := by
@@ -585,9 +589,9 @@ theorem adequacy_leaf_appn_grounded (E : SymEnv) (mId nId fId ltId : Int)
       (lib.RawExp.BinOp ltId lib.TypData.TyBool
         (Tactus.Box.mk (lib.RawExp.CallN fId lib.TypData.TyInt
           (Tactus.Box.mk (lib.RawList.Cons
-            (Tactus.Box.mk (lib.RawExp.Var mId lib.TypData.TyInt))
+            (Tactus.Box.mk (lib.RawExp.Var mId lib.TypData.TyInt)) lib.TypData.TyInt
             (Tactus.Box.mk (lib.RawList.Cons
-              (Tactus.Box.mk (lib.RawExp.Var nId lib.TypData.TyInt))
+              (Tactus.Box.mk (lib.RawExp.Var nId lib.TypData.TyInt)) lib.TypData.TyInt
               (Tactus.Box.mk lib.RawList.Nil)))))))
         (Tactus.Box.mk (lib.RawExp.Lit 100 lib.TypData.TyInt)))
       = lib.ExprData.BinOp ltId
