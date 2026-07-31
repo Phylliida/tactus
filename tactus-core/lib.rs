@@ -135,6 +135,24 @@ pub enum ParamBoundList {
     Bound(u64, u64, Box<ParamBoundList>),
 }
 
+// ── F4 (bootstrap-80 stage 2): the poison-derivation side table ─────
+// (prop leaf id, deep `RawExp` transcription, tail) — one entry per
+// poison-CHECKED prop (FHyp props, FLetH/RetLetH eq props, cond props,
+// IfCtor eq/neg props; the serializer registers an entry at every
+// `hyp_poison` call site and asserts totality at emission). Hyp props
+// stay opaque leaf ids in GOALS (byte-neutrality); this table exists so
+// refWp can DERIVE the wrap-gate poison mark (`poisoned_props`) instead
+// of trusting a serializer-computed bit (endgame P1 — the mark was the
+// one trusted semantic predicate on the cert path; the N2 IsVariant
+// detector is the remaining one, scoped out of F4). The transcription is
+// the dumb faithful copy (the same `raw_exp` SST path as obligation
+// slots) — the mention projection happens reference-side, never
+// serializer-side.
+pub enum PropDeepList {
+    Nil,
+    Cons(u64, Box<RawExp>, Box<PropDeepList>),
+}
+
 // ── `&mut`-param fn-entry preamble entries (bootstrap-78 S2) ────────
 // One entry per `&mut` param (and per `BorrowMut` local, production's
 // #107 synthetic mut_ref class), in production's declaration order:
@@ -752,9 +770,11 @@ pub enum FrameList {
     /// POISON (bootstrap-74 slice 2): 1 marks a prop whose text mentions
     /// a residue-let (`FLetR`) name — production's `hoist_all` bail
     /// check (`lexpr_mentions_var` over the rendered types) then returns
-    /// None and the WHOLE goal wraps. The model's leaves are opaque ids,
-    /// so the serializer computes the mark textually; the wrap gate is
-    /// `has_plain_flet(f) == 1 || has_poisoned_hyp(f) == 1`.
+    /// None and the WHOLE goal wraps. F4 (bootstrap-80 stage 2): the
+    /// mark is now DERIVED reference-side (`poisoned_props` over the
+    /// `FnCtxData.prop_deeps` side table, read via `has_poisoned_hyp`'s
+    /// membership check); this slot is the serializer's era-1 copy,
+    /// UNREAD by the gate (deleted in era 2).
     FHyp(u64, u64, u64, Box<FrameList>),
     /// (binder id, value leaf, tail) — a let-binding in the spine.
     /// Post-N1 (bootstrap-74): a PLAIN FLet marks a NON-hoistable let
@@ -818,6 +838,16 @@ pub struct FnCtxData {
     // binders; the preamble lets are the first OblCtx frames).
     pub mut_params: MutParamList,
     pub enss: LeafList,
+    // F4 (bootstrap-80 stage 2): the poison-derivation inputs.
+    // `residue_names` = interned NAME ids of the residue (FLetR / Bool)
+    // lets, in walk order. GLOBAL and monotonic, mirroring production's
+    // `residue_names` vec — production's branch state save excludes it,
+    // so a frame-prefix derivation would NOT be faithful (b80 card,
+    // design-review addendum). `prop_deeps` = the side table above.
+    // `ref_wp` derives the poison set ONCE (`poisoned_props`) and the
+    // wrap gate / FLetH collapse read it as a membership check.
+    pub residue_names: LeafList,
+    pub prop_deeps: PropDeepList,
     // R1 (bootstrap-77): the fn-level closer class — 1 = default
     // (`tactus_auto`), 0 = user. AMENDED post-landing (proof_block_fn
     // evidence, b77 card): this is the ATTR bit ONLY — a fn-level
@@ -2388,22 +2418,121 @@ pub open spec fn has_plain_flet(f: FrameList) -> nat
     }
 }
 
-// The N1 wrap gate, second half (bootstrap-74 slice 2): any POISONED
-// hyp — a prop whose text mentions a residue-let name, marked by the
-// serializer — forces whole-goal wrap (production's `hoist_all` bail
-// check on binder types mentioning residue names). Same nat idiom.
+// F4 (bootstrap-80 stage 2): the poison derivation. `leaf_mem` is the
+// `binder_has_id` idiom for the LeafList world (nat-valued, never bool —
+// the finding-5 decide idiom).
 #[verifier::structural_decreases]
-pub open spec fn has_poisoned_hyp(f: FrameList) -> nat
+pub open spec fn leaf_mem(l: LeafList, x: u64) -> nat
+    decreases l
+{
+    match l {
+        LeafList::Nil => 0,
+        LeafList::Cons(h, t) => if h == x { 1 } else { leaf_mem(*t, x) },
+    }
+}
+
+// Does the deep transcription mention any residue name? Dumb textual
+// scan over `Var` atoms — binders (Let/ForallR/ExistsR) do NOT shadow,
+// exactly mirroring production's `lexpr_mentions_var` (residue names are
+// gensym-unique fn-level lets, so no well-formed prop re-binds one).
+// Structural (each call on a subterm) so the kernel reduces it under
+// `decide`; mutually recursive with the arm/arg-list twins exactly like
+// `render_exp`/`render_arms`/`render_list`.
+#[verifier::structural_decreases]
+pub open spec fn raw_exp_mentions(rs: LeafList, e: RawExp) -> nat
+    decreases e
+{
+    match e {
+        RawExp::Var(id, _ty) => leaf_mem(rs, id),
+        RawExp::Lit(_v, _ty) => 0,
+        RawExp::LitBool(_b) => 0,
+        RawExp::Clip(_t, a) => raw_exp_mentions(rs, *a),
+        RawExp::BinOp(_op, _ty, l, r) =>
+            if raw_exp_mentions(rs, *l) == 1 { 1 } else { raw_exp_mentions(rs, *r) },
+        RawExp::Call(_f, _ret, a, _aty) => raw_exp_mentions(rs, *a),
+        RawExp::Field(_fid, _fty, a) => raw_exp_mentions(rs, *a),
+        RawExp::HasType(_n, a) => raw_exp_mentions(rs, *a),
+        RawExp::Deref(a) => raw_exp_mentions(rs, *a),
+        RawExp::Let(_x, v, b) =>
+            if raw_exp_mentions(rs, *v) == 1 { 1 } else { raw_exp_mentions(rs, *b) },
+        RawExp::Not(a) => raw_exp_mentions(rs, *a),
+        RawExp::Span(_l, a) => raw_exp_mentions(rs, *a),
+        RawExp::Ite(_ty, c, t, e2) =>
+            if raw_exp_mentions(rs, *c) == 1 { 1 }
+            else if raw_exp_mentions(rs, *t) == 1 { 1 }
+            else { raw_exp_mentions(rs, *e2) },
+        RawExp::MatchR(s, arms, _ty) =>
+            if raw_exp_mentions(rs, *s) == 1 { 1 } else { raw_arms_mentions(rs, *arms) },
+        RawExp::CallN(_f, _ret, args) => raw_list_mentions(rs, *args),
+        RawExp::ForallR(_b, _bty, body) => raw_exp_mentions(rs, *body),
+        RawExp::ExistsR(_b, _bty, body) => raw_exp_mentions(rs, *body),
+    }
+}
+
+#[verifier::structural_decreases]
+pub open spec fn raw_arms_mentions(rs: LeafList, a: RawArmList) -> nat
+    decreases a
+{
+    match a {
+        RawArmList::Nil => 0,
+        RawArmList::Cons(_c, _bs, body, tl) =>
+            if raw_exp_mentions(rs, *body) == 1 { 1 } else { raw_arms_mentions(rs, *tl) },
+    }
+}
+
+#[verifier::structural_decreases]
+pub open spec fn raw_list_mentions(rs: LeafList, l: RawList) -> nat
+    decreases l
+{
+    match l {
+        RawList::Nil => 0,
+        RawList::Cons(h, _expected, t) =>
+            if raw_exp_mentions(rs, *h) == 1 { 1 } else { raw_list_mentions(rs, *t) },
+    }
+}
+
+// The derived poison set: the prop ids whose deep transcription mentions
+// a residue name. Computed ONCE at `ref_wp` and threaded as the single
+// poison source — the wrap gate (`has_poisoned_hyp`) and the FLetH/RetLetH
+// collapse are membership checks against it. A prop id with NO table
+// entry derives 0 (not a member): loud-by-bridge in the divergence
+// direction (production wrapped on a real mention, we hoist → the goal
+// shapes diverge), correct-by-luck in the other; totality loudness rests
+// on the serializer's emission-time assertion (b80 card, review addendum).
+#[verifier::structural_decreases]
+pub open spec fn poisoned_props(rs: LeafList, ds: PropDeepList) -> LeafList
+    decreases ds
+{
+    match ds {
+        PropDeepList::Nil => LeafList::Nil,
+        PropDeepList::Cons(id, deep, t) =>
+            if raw_exp_mentions(rs, *deep) == 1 {
+                LeafList::Cons(id, Box::new(poisoned_props(rs, *t)))
+            } else {
+                poisoned_props(rs, *t)
+            },
+    }
+}
+
+// The N1 wrap gate, second half (bootstrap-74 slice 2): any POISONED
+// hyp — a prop whose text mentions a residue-let name — forces
+// whole-goal wrap (production's `hoist_all` bail check on binder types
+// mentioning residue names). F4 (bootstrap-80 stage 2): the mark is
+// DERIVED — `pp` is the `poisoned_props` set computed once at `ref_wp`;
+// the FHyp bit slot is unread here (era 1; deleted era 2). Same nat
+// idiom.
+#[verifier::structural_decreases]
+pub open spec fn has_poisoned_hyp(pp: LeafList, f: FrameList) -> nat
     decreases f
 {
     match f {
         FrameList::FNil => 0,
-        FrameList::FBind(_x, _ty, t) => has_poisoned_hyp(*t),
-        FrameList::FHyp(_n, _h, p, t) => if p == 1 { 1 } else { has_poisoned_hyp(*t) },
-        FrameList::FLet(_x, _v, t) => has_poisoned_hyp(*t),
-        FrameList::FLetH(_x, _ty, _v, _en, _ep, t) => has_poisoned_hyp(*t),
-        FrameList::FLetR(_x, _v, t) => has_poisoned_hyp(*t),
-        FrameList::FUserCloser(t) => has_poisoned_hyp(*t),
+        FrameList::FBind(_x, _ty, t) => has_poisoned_hyp(pp, *t),
+        FrameList::FHyp(_n, h, _p, t) => if leaf_mem(pp, h) == 1 { 1 } else { has_poisoned_hyp(pp, *t) },
+        FrameList::FLet(_x, _v, t) => has_poisoned_hyp(pp, *t),
+        FrameList::FLetH(_x, _ty, _v, _en, _ep, t) => has_poisoned_hyp(pp, *t),
+        FrameList::FLetR(_x, _v, t) => has_poisoned_hyp(pp, *t),
+        FrameList::FUserCloser(t) => has_poisoned_hyp(pp, *t),
     }
 }
 
@@ -2430,8 +2559,8 @@ pub open spec fn has_user_closer(f: FrameList) -> nat
 // any frame forces it — a plain FLet (typ-less/poison-collapsed let), a
 // poisoned hyp, or a non-default-closer marker (R1). Mirrors
 // `hoist_all` returning None / `emit_split`'s `is_default` guard.
-pub open spec fn gate_wrap(f: FrameList) -> nat {
-    if has_plain_flet(f) == 1 || has_poisoned_hyp(f) == 1 || has_user_closer(f) == 1 { 1 } else { 0 }
+pub open spec fn gate_wrap(pp: LeafList, f: FrameList) -> nat {
+    if has_plain_flet(f) == 1 || has_poisoned_hyp(pp, f) == 1 || has_user_closer(f) == 1 { 1 } else { 0 }
 }
 
 // Wrap-mode rendering (production's goal-position wrap — the pre-N1
@@ -2529,8 +2658,8 @@ pub open spec fn close_e_hoist(f: FrameList, ob: RawExp) -> GoalData {
 // The gated dispatcher — the ONE rendering entry point (all callers
 // unchanged). Mode is decided ONCE over the whole frame list, exactly
 // as production inspects all frames before hoisting (§hoist_all).
-pub open spec fn close_e(f: FrameList, ob: RawExp) -> GoalData {
-    if gate_wrap(f) == 1 { close_e_wrap_lead(f, ob) } else { close_e_hoist(f, ob) }
+pub open spec fn close_e(pp: LeafList, f: FrameList, ob: RawExp) -> GoalData {
+    if gate_wrap(pp, f) == 1 { close_e_wrap_lead(f, ob) } else { close_e_hoist(f, ob) }
 }
 
 // W6d.1b: the bare-atom obligation. An obligation leaf that carries no deep
@@ -2553,12 +2682,12 @@ pub open spec fn atom_ob(id: u64) -> RawExp { RawExp::Var(id, TypData::TyBool) }
 // `close_each_binderprop` over the `inv_hyps` prop slots were both removed
 // when their obligations deepened.)
 #[verifier::structural_decreases]
-pub open spec fn close_each_e(f: FrameList, l: RawExpList) -> GoalList
+pub open spec fn close_each_e(pp: LeafList, f: FrameList, l: RawExpList) -> GoalList
     decreases l
 {
     match l {
         RawExpList::Nil => GoalList::Nil,
-        RawExpList::Cons(h, t) => GoalList::Cons(Box::new(close_e(f, *h)), Box::new(close_each_e(f, *t))),
+        RawExpList::Cons(h, t) => GoalList::Cons(Box::new(close_e(pp, f, *h)), Box::new(close_each_e(pp, f, *t))),
     }
 }
 
@@ -2920,15 +3049,24 @@ pub open spec fn ctor_pos_frame(b: BinderList, en: u64, ep: u64, epo: u64) -> Fr
 // (DESIGN §2.2. `If` join frames are NOT merged at stage A — but a
 // DIVERGING then-branch with a Skip else does forward `¬cond`, §2.4.1.)
 #[verifier::structural_decreases]
-pub open spec fn frame_after(f: FrameList, s: StmData) -> FrameList
+pub open spec fn frame_after(pp: LeafList, f: FrameList, s: StmData) -> FrameList
     decreases s
 {
     match s {
         StmData::Assert(_o, hn, h, hp) => frame_append(f, FrameList::FHyp(hn, h, hp, Box::new(FrameList::FNil))),
         StmData::Assume(hn, e, hp) => frame_append(f, FrameList::FHyp(hn, e, hp, Box::new(FrameList::FNil))),
         StmData::Assign(x, rhs) => frame_append(f, FrameList::FLet(x, rhs, Box::new(FrameList::FNil))),
+        // F4: the poison collapse is DERIVED — a hoistable let whose eq
+        // prop mentions a residue name collapses LOSSLESSLY to a plain
+        // FLet (production's hoist_all bail), which forces whole-goal
+        // wrap via `has_plain_flet`. The serializer emits AssignH
+        // whenever the hoist payload exists (era 1); refWp decides.
         StmData::AssignH(x, ty, v, en, ep) =>
-            frame_append(f, FrameList::FLetH(x, ty, v, en, ep, Box::new(FrameList::FNil))),
+            if leaf_mem(pp, ep) == 1 {
+                frame_append(f, FrameList::FLet(x, v, Box::new(FrameList::FNil)))
+            } else {
+                frame_append(f, FrameList::FLetH(x, ty, v, en, ep, Box::new(FrameList::FNil)))
+            },
         StmData::AssignR(x, v) => frame_append(f, FrameList::FLetR(x, v, Box::new(FrameList::FNil))),
         // Pass-through: append the serializer-transcribed post-call frame
         // verbatim (the ∀-path or #128 ret-eq shape both live in `post`).
@@ -2974,11 +3112,11 @@ pub open spec fn frame_after(f: FrameList, s: StmData) -> FrameList
                 loop_use_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, neg_cond_ann, cond_poison)
             } else {
                 frame_append(
-                    frame_after(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup),
+                    frame_after(pp, loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup),
                     FrameList::FHyp(cond_name, break_use_ann, cond_poison, Box::new(FrameList::FNil)))
             },
         StmData::Skip => f,
-        StmData::Seq(a, b) => frame_after(frame_after(f, *a), *b),
+        StmData::Seq(a, b) => frame_after(pp, frame_after(pp, f, *a), *b),
     }
 }
 
@@ -2991,54 +3129,62 @@ pub open spec fn frame_after(f: FrameList, s: StmData) -> FrameList
 // spec fn — NOT a `match` nested inside `wp_stm`'s `Ret` arm — because
 // the tactus Lean backend flattens an inner match past the enclosing
 // arm's siblings (the decide-checker note above; #redundant-alternative).
-pub open spec fn ret_frame(f: FrameList, rb: RetBind) -> FrameList {
+pub open spec fn ret_frame(pp: LeafList, f: FrameList, rb: RetBind) -> FrameList {
     match rb {
         RetBind::RetNone => f,
         RetBind::RetLet(name, val) =>
             frame_append(f, FrameList::FLet(name, val, Box::new(FrameList::FNil))),
+        // F4: same derived poison collapse as the `AssignH` arm of
+        // `frame_after` — a poisoned ret-let eq prop collapses the
+        // hoist payload to a plain FLet (lossless; wrap-forced either
+        // way).
         RetBind::RetLetH(name, ty, val, en, ep) =>
-            frame_append(f, FrameList::FLetH(name, ty, val, en, ep, Box::new(FrameList::FNil))),
+            if leaf_mem(pp, ep) == 1 {
+                frame_append(f, FrameList::FLet(name, val, Box::new(FrameList::FNil)))
+            } else {
+                frame_append(f, FrameList::FLetH(name, ty, val, en, ep, Box::new(FrameList::FNil)))
+            },
     }
 }
 
 // wpStm: the goals of `s` given the frame that precedes it.
 #[verifier::structural_decreases]
-pub open spec fn wp_stm(f: FrameList, s: StmData) -> GoalList
+pub open spec fn wp_stm(pp: LeafList, f: FrameList, s: StmData) -> GoalList
     decreases s
 {
     match s {
         StmData::Assert(o, _hn, _h, _hp) =>
-            GoalList::Cons(Box::new(close_e(f, o)), Box::new(GoalList::Nil)),
+            GoalList::Cons(Box::new(close_e(pp, f, o)), Box::new(GoalList::Nil)),
         StmData::Assume(_hn, _e, _hp) => GoalList::Nil,
         StmData::Assign(_x, _rhs) => GoalList::Nil,
         StmData::AssignH(_x, _ty, _v, _en, _ep) => GoalList::Nil,
         StmData::AssignR(_x, _v) => GoalList::Nil,
-        StmData::Call { reqs, post: _ } => close_each_e(f, *reqs),
-        StmData::DeadEnd(b) => wp_stm(f, *b),
+        StmData::Call { reqs, post: _ } => close_each_e(pp, f, *reqs),
+        StmData::DeadEnd(b) => wp_stm(pp, f, *b),
         StmData::AssertQueryNl(b, tq) =>
             goals_append(
-                wp_stm(strip_hyps(f), *b),
+                wp_stm(pp, strip_hyps(f), *b),
                 GoalList::Cons(
-                    Box::new(close_e(frame_after(strip_hyps(f), *b), tq)),
+                    Box::new(close_e(pp, frame_after(pp, strip_hyps(f), *b), tq)),
                     Box::new(GoalList::Nil))),
         // The assert-by theorem: ONE goal for the annotated P, closed in
         // WRAP mode unconditionally (`emit_with_closer` never hoists) —
         // the appended FUserCloser trips the gate even in a default fn.
         StmData::AssertQueryTactus(o, _hn, _h, _hp) =>
             GoalList::Cons(
-                Box::new(close_e(frame_append(f, FrameList::FUserCloser(Box::new(FrameList::FNil))), o)),
+                Box::new(close_e(pp, frame_append(f, FrameList::FUserCloser(Box::new(FrameList::FNil))), o)),
                 Box::new(GoalList::Nil)),
-        StmData::Ret(es, rb) => close_each_e(ret_frame(f, rb), *es),
+        StmData::Ret(es, rb) => close_each_e(pp, ret_frame(pp, f, rb), *es),
         StmData::If(c, cn, nc, ncn, cp, t, e) =>
             goals_append(
-                wp_stm(frame_append(f, FrameList::FHyp(cn, c, cp, Box::new(FrameList::FNil))), *t),
-                wp_stm(frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e)),
+                wp_stm(pp, frame_append(f, FrameList::FHyp(cn, c, cp, Box::new(FrameList::FNil))), *t),
+                wp_stm(pp, frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e)),
         // The N2 fork: then-branch under the ctor frames (field binders +
         // equation hyp), else-branch under the plain ¬cond hyp.
         StmData::IfCtor { pos_binders, eq_name, eq_prop, eq_poison, neg_name, neg_prop, neg_poison, thn, els } =>
             goals_append(
-                wp_stm(frame_append(f, ctor_pos_frame(*pos_binders, eq_name, eq_prop, eq_poison)), *thn),
-                wp_stm(frame_append(f, FrameList::FHyp(neg_name, neg_prop, neg_poison, Box::new(FrameList::FNil))), *els)),
+                wp_stm(pp, frame_append(f, ctor_pos_frame(*pos_binders, eq_name, eq_prop, eq_poison)), *thn),
+                wp_stm(pp, frame_append(f, FrameList::FHyp(neg_name, neg_prop, neg_poison, Box::new(FrameList::FNil))), *els)),
         StmData::Loop { inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann: _, neg_neg_cond_ann, break_guard_ann, break_use_ann: _, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body } => {
             if is_skip(*setup) == 1 {
             // Maintain telescope (finding-3 + bootstrap-16, uniform
@@ -3050,20 +3196,20 @@ pub open spec fn wp_stm(f: FrameList, s: StmData) -> GoalList
             // `u64`s); the OBLIGATION role reads the parallel deep
             // `inv_obligs` (W6d.1b-iii).
             let mframe = loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop);
-            let body_goals = wp_stm(mframe, *body);
-            let endf = frame_after(mframe, *body);
+            let body_goals = wp_stm(pp, mframe, *body);
+            let endf = frame_after(pp, mframe, *body);
             // Walker-synthesised body-end obligations (DESIGN §5 Q3): one DEEP
             // goal per invariant re-closed (`close_each_e` over `inv_obligs` →
             // `LeafE(render_exp(ob))`), then the DEEP decrease obligation
             // (`close_e`).
-            let maintain_reclose = close_each_e(endf, *inv_obligs_exit);
+            let maintain_reclose = close_each_e(pp, endf, *inv_obligs_exit);
             let decrease_goal =
-                GoalList::Cons(Box::new(close_e(endf, decrease_oblig)), Box::new(GoalList::Nil));
+                GoalList::Cons(Box::new(close_e(pp, endf, decrease_oblig)), Box::new(GoalList::Nil));
             // Emission order = init ++ body ++ maintain-reclose ++ decrease
             // (matches production's per-clause theorem order). Init closes each
             // deep invariant obligation under the ACTUAL pre-loop frame `f` (the
             // modified-local lets still hold their initial values there).
-            let init = close_each_e(f, *inv_obligs);
+            let init = close_each_e(pp, f, *inv_obligs);
             goals_append(init,
                 goals_append(body_goals,
                     goals_append(maintain_reclose, decrease_goal)))
@@ -3082,23 +3228,23 @@ pub open spec fn wp_stm(f: FrameList, s: StmData) -> GoalList
             // replay (under the bare base, after the decrease goal).
             let base = loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds);
             let mframe0 = frame_append(base, d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop));
-            let setup_end = frame_after(mframe0, *setup);
+            let setup_end = frame_after(pp, mframe0, *setup);
             let exit_frame = frame_append(setup_end, FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil)));
             let guard_frame = frame_append(setup_end, FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil)));
-            let endf = frame_after(guard_frame, *body);
-            let init = close_each_e(f, *inv_obligs);
-            let setup_goals = wp_stm(mframe0, *setup);
-            let exit_reclose = close_each_e(exit_frame, *inv_obligs_break);
-            let body_goals = wp_stm(guard_frame, *body);
-            let maintain_reclose = close_each_e(endf, *inv_obligs_exit);
-            let decrease_goal = GoalList::Cons(Box::new(close_e(endf, decrease_oblig)), Box::new(GoalList::Nil));
-            let replay_goals = wp_stm(base, *setup);
+            let endf = frame_after(pp, guard_frame, *body);
+            let init = close_each_e(pp, f, *inv_obligs);
+            let setup_goals = wp_stm(pp, mframe0, *setup);
+            let exit_reclose = close_each_e(pp, exit_frame, *inv_obligs_break);
+            let body_goals = wp_stm(pp, guard_frame, *body);
+            let maintain_reclose = close_each_e(pp, endf, *inv_obligs_exit);
+            let decrease_goal = GoalList::Cons(Box::new(close_e(pp, endf, decrease_oblig)), Box::new(GoalList::Nil));
+            let replay_goals = wp_stm(pp, base, *setup);
             goals_append(init, goals_append(setup_goals, goals_append(exit_reclose, goals_append(body_goals, goals_append(maintain_reclose, goals_append(decrease_goal, replay_goals))))))
             }
         },
         StmData::Skip => GoalList::Nil,
         StmData::Seq(a, b) =>
-            goals_append(wp_stm(f, *a), wp_stm(frame_after(f, *a), *b)),
+            goals_append(wp_stm(pp, f, *a), wp_stm(pp, frame_after(pp, f, *a), *b)),
     }
 }
 
@@ -3140,9 +3286,12 @@ pub open spec fn seed_frame(c: FnCtxData) -> FrameList {
 
 // refWp: the certificate LHS. Seed the frame, then walk the body. The
 // serializer emits an explicit `Ret` leaf list (all fixtures end in Ret),
-// so refWp does not synthesize a fall-through Ret (§5.2).
+// so refWp does not synthesize a fall-through Ret (§5.2). F4: the poison
+// set is derived ONCE here from the ctx side tables and threaded as the
+// single poison source (`pp`) through the walk, the gate, and the
+// FLetH/RetLetH collapse.
 pub open spec fn ref_wp(c: FnCtxData, s: StmData) -> GoalList {
-    wp_stm(seed_frame(c), s)
+    wp_stm(poisoned_props(c.residue_names, c.prop_deeps), seed_frame(c), s)
 }
 
 // Structural equality for the `decide` bridge (DESIGN §2.3). STRICT:
@@ -3294,16 +3443,16 @@ by { decide }
 // `Leaf 9` (a production `LeafE` can never silently match a reference `Leaf`).
 proof fn probe_close_e()
     ensures
-        goal_size(close_e(FrameList::FNil, atom_ob(9))) == 1,
-        goal_size(close_e(FrameList::FBind(0, 1, Box::new(FrameList::FNil)), atom_ob(9))) == 2,
-        goal_eq(close_e(FrameList::FNil, atom_ob(9)), GoalData::LeafE(ExprData::Atom(9))) == 1,
-        goal_eq(close_e(FrameList::FNil, atom_ob(9)), GoalData::Leaf(9)) == 0
+        goal_size(close_e(LeafList::Nil, FrameList::FNil, atom_ob(9))) == 1,
+        goal_size(close_e(LeafList::Nil, FrameList::FBind(0, 1, Box::new(FrameList::FNil)), atom_ob(9))) == 2,
+        goal_eq(close_e(LeafList::Nil, FrameList::FNil, atom_ob(9)), GoalData::LeafE(ExprData::Atom(9))) == 1,
+        goal_eq(close_e(LeafList::Nil, FrameList::FNil, atom_ob(9)), GoalData::Leaf(9)) == 0
 by { decide }
 
 proof fn probe_wp_stm()
     ensures
-        goal_count(wp_stm(FrameList::FNil, StmData::Assert(atom_ob(9), 0, 9, 0))) == 1,
-        goal_count(wp_stm(FrameList::FNil, StmData::Skip)) == 0
+        goal_count(wp_stm(LeafList::Nil, FrameList::FNil, StmData::Assert(atom_ob(9), 0, 9, 0))) == 1,
+        goal_count(wp_stm(LeafList::Nil, FrameList::FNil, StmData::Skip)) == 0
 by { decide }
 
 proof fn probe_ref_wp()
@@ -3315,6 +3464,8 @@ proof fn probe_ref_wp()
             reqs: BinderList::Nil,
             mut_params: MutParamList::Nil,
             enss: LeafList::Nil,
+            residue_names: LeafList::Nil,
+            prop_deeps: PropDeepList::Nil,
             closer_default: 1,
         }, StmData::Assert(atom_ob(9), 0, 9, 0))) == 1
 by { decide }
@@ -3337,6 +3488,8 @@ proof fn ref_wp_seed_and_assert()
                     reqs: BinderList::Nil,
                     mut_params: MutParamList::Nil,
                     enss: LeafList::Nil,
+                    residue_names: LeafList::Nil,
+                    prop_deeps: PropDeepList::Nil,
                     closer_default: 1,
                 },
                 StmData::Assert(atom_ob(9), 0, 9, 0),
@@ -3355,6 +3508,8 @@ proof fn ref_wp_seed_and_assert()
                 reqs: BinderList::Nil,
                 mut_params: MutParamList::Nil,
                 enss: LeafList::Cons(5, Box::new(LeafList::Cons(6, Box::new(LeafList::Nil)))),
+                residue_names: LeafList::Nil,
+                prop_deeps: PropDeepList::Nil,
                 closer_default: 1,
             },
             StmData::Ret(Box::new(RawExpList::Cons(Box::new(atom_ob(5)), Box::new(RawExpList::Cons(Box::new(atom_ob(6)), Box::new(RawExpList::Nil))))),
@@ -3377,13 +3532,15 @@ pub open spec fn s2_mut_ctx() -> FnCtxData {
         reqs: BinderList::Cons(3, 2, Box::new(BinderList::Nil)),
         mut_params: MutParamList::Cons(0, 4, 5, Box::new(MutParamList::Nil)),
         enss: LeafList::Nil,
+        residue_names: LeafList::Nil,
+        prop_deeps: PropDeepList::Nil,
         closer_default: 1,
     }
 }
 
 proof fn ref_wp_mut_preamble_wrap()
     ensures
-        gate_wrap(seed_frame(s2_mut_ctx())) == 1,
+        gate_wrap(LeafList::Nil, seed_frame(s2_mut_ctx())) == 1,
         goals_eq(
             ref_wp(s2_mut_ctx(), StmData::Assert(atom_ob(9), 0, 9, 0)),
             GoalList::Cons(
@@ -3415,6 +3572,8 @@ proof fn ref_wp_seq_threads_frame()
                     reqs: BinderList::Nil,
                     mut_params: MutParamList::Nil,
                     enss: LeafList::Nil,
+                    residue_names: LeafList::Nil,
+                    prop_deeps: PropDeepList::Nil,
                     closer_default: 1,
                 },
                 StmData::Seq(Box::new(StmData::Assert(atom_ob(9), 0, 9, 0)), Box::new(StmData::Assert(atom_ob(10), 0, 10, 0))),
@@ -3451,6 +3610,8 @@ proof fn ref_wp_add_capped_seed_spine()
                     reqs: BinderList::Cons(8, 7, Box::new(BinderList::Cons(10, 9, Box::new(BinderList::Nil)))),
                     mut_params: MutParamList::Nil,
                     enss: LeafList::Cons(11, Box::new(LeafList::Nil)),
+                    residue_names: LeafList::Nil,
+                    prop_deeps: PropDeepList::Nil,
                     closer_default: 1,
                 },
                 StmData::Assert(atom_ob(15), 0, 14, 0),
@@ -3477,7 +3638,7 @@ by { decide }
 proof fn ref_wp_ret_return_binding()
     ensures
         goals_eq(
-            wp_stm(
+            wp_stm(LeafList::Nil, 
                 FrameList::FLet(16, 23, Box::new(FrameList::FNil)),
                 StmData::Ret(Box::new(RawExpList::Cons(Box::new(atom_ob(12)), Box::new(RawExpList::Nil))),
                     RetBind::RetLet(13, 16)),
@@ -3488,7 +3649,7 @@ proof fn ref_wp_ret_return_binding()
                 Box::new(GoalList::Nil)),
         ) == 1,
         goals_eq(
-            wp_stm(
+            wp_stm(LeafList::Nil, 
                 FrameList::FLet(16, 23, Box::new(FrameList::FNil)),
                 StmData::Ret(Box::new(RawExpList::Cons(Box::new(atom_ob(12)), Box::new(RawExpList::Nil))),
                     RetBind::RetNone),
@@ -3531,6 +3692,8 @@ proof fn ref_wp_sum_to_loop()
                     reqs: BinderList::Cons(5, 4, Box::new(BinderList::Nil)),
                     mut_params: MutParamList::Nil,
                     enss: LeafList::Cons(6, Box::new(LeafList::Nil)),
+                    residue_names: LeafList::Nil,
+                    prop_deeps: PropDeepList::Nil,
                     closer_default: 1,
                 },
                 // Pre-loop assigns HOIST as binder pairs (real sum_to:
@@ -3639,7 +3802,7 @@ proof fn ref_wp_nested_loop_nonleading()
         // hyps anonymous `Imp` — the pre-slice-2 "non-leading" SHAPE,
         // now produced by the gate, not a loop-local switch.
         goal_eq(
-            close_e(
+            close_e(LeafList::Nil, 
                 loop_maintain_frame(
                     FrameList::FBind(0, 1, Box::new(FrameList::FLet(20, 21, Box::new(FrameList::FNil)))),
                     BinderList::Cons(13, 25, Box::new(BinderList::Cons(15, 26,
@@ -3659,7 +3822,7 @@ proof fn ref_wp_nested_loop_nonleading()
         // FLetH binder pair `All(31, 1) ∘ All(41, 42)`. Only the front
         // frame differs — the branch is the GLOBAL gate, not the loop.
         goal_eq(
-            close_e(
+            close_e(LeafList::Nil, 
                 loop_maintain_frame(
                     FrameList::FBind(0, 1, Box::new(FrameList::FNil)),
                     BinderList::Cons(13, 25, Box::new(BinderList::Cons(15, 26,
@@ -3676,7 +3839,7 @@ proof fn ref_wp_nested_loop_nonleading()
         ) == 1,
         // WRAP-forced use telescope (¬cond, no d_old).
         goal_eq(
-            close_e(
+            close_e(LeafList::Nil, 
                 loop_use_frame(
                     FrameList::FBind(0, 1, Box::new(FrameList::FLet(20, 21, Box::new(FrameList::FNil)))),
                     BinderList::Cons(13, 25, Box::new(BinderList::Cons(15, 26,
@@ -3721,7 +3884,7 @@ proof fn ref_wp_if_fallthrough_divergence()
     ensures
         // DIVERGING then (`Ret` inside) + Skip else ⇒ continuation sees ¬cond.
         goals_eq(
-            wp_stm(
+            wp_stm(LeafList::Nil, 
                 FrameList::FHyp(0, 34, 0, Box::new(FrameList::FNil)),
                 StmData::Seq(
                     Box::new(StmData::If(36, 0, 37, 0, 0,
@@ -3746,7 +3909,7 @@ proof fn ref_wp_if_fallthrough_divergence()
         // NON-diverging then (Skip) + Skip else ⇒ NO ¬cond forwarded: the
         // continuation assert closes under the bare pre-if frame `[34]`.
         goals_eq(
-            wp_stm(
+            wp_stm(LeafList::Nil, 
                 FrameList::FHyp(0, 34, 0, Box::new(FrameList::FNil)),
                 StmData::Seq(
                     Box::new(StmData::If(36, 0, 37, 0, 0,
@@ -3785,7 +3948,7 @@ by { decide }
 // stops reproducing the join from the desugared SST, this decide flips.
 // Mutation-kill: refWp's goal 0 (then-branch postcond) binds `let tmp__3 := 0`
 // (val leaf 11 from the cloned then-branch); a goal 0 expecting `:= 99` fails.
-pub open spec fn cd19_ctx() -> FnCtxData { FnCtxData { typ_params: BinderList::Nil, params: BinderList::Cons(0, 1, Box::new(BinderList::Nil)), param_bounds: ParamBoundList::Bound(3, 2, Box::new(ParamBoundList::Nil)), reqs: BinderList::Nil, mut_params: MutParamList::Nil, enss: LeafList::Cons(4, Box::new(LeafList::Nil)), closer_default: 1 } }
+pub open spec fn cd19_ctx() -> FnCtxData { FnCtxData { typ_params: BinderList::Nil, params: BinderList::Cons(0, 1, Box::new(BinderList::Nil)), param_bounds: ParamBoundList::Bound(3, 2, Box::new(ParamBoundList::Nil)), reqs: BinderList::Nil, mut_params: MutParamList::Nil, enss: LeafList::Cons(4, Box::new(LeafList::Nil)), residue_names: LeafList::Nil, prop_deeps: PropDeepList::Nil, closer_default: 1 } }
 pub open spec fn cd19_sst() -> StmData { StmData::Seq(Box::new(StmData::Assign(7, 0)), Box::new(StmData::If(8, 0, 9, 0, 0, Box::new(StmData::Seq(Box::new(StmData::Assign(10, 11)), Box::new(StmData::Ret(Box::new(RawExpList::Cons(Box::new(atom_ob(5)), Box::new(RawExpList::Nil))), RetBind::RetLet(6, 10))))), Box::new(StmData::Seq(Box::new(StmData::Seq(Box::new(StmData::Seq(Box::new(StmData::Assert(atom_ob(13), 0, 12, 0)), Box::new(StmData::Seq(Box::new(StmData::Assume(0, 12, 0)), Box::new(StmData::Seq(Box::new(StmData::Assign(14, 15)), Box::new(StmData::Seq(Box::new(StmData::Assert(atom_ob(17), 0, 16, 0)), Box::new(StmData::Call { reqs: Box::new(RawExpList::Nil), post: Box::new(FrameList::FHyp(0, 20, 0, Box::new(FrameList::FLet(18, 19, Box::new(FrameList::FNil))))) }))))))))), Box::new(StmData::Assign(10, 18)))), Box::new(StmData::Ret(Box::new(RawExpList::Cons(Box::new(atom_ob(5)), Box::new(RawExpList::Nil))), RetBind::RetLet(6, 10)))))))) }
 pub open spec fn cd19_goals() -> GoalList { GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(8, Box::new(GoalData::Let(10, 11, Box::new(GoalData::Let(6, 10, Box::new(GoalData::LeafE(ExprData::Atom(5))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(9, Box::new(GoalData::LeafE(ExprData::Atom(13))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(9, Box::new(GoalData::Imp(12, Box::new(GoalData::Imp(12, Box::new(GoalData::Let(14, 15, Box::new(GoalData::LeafE(ExprData::Atom(17))))))))))))))))), Box::new(GoalList::Cons(Box::new(GoalData::All(0, 1, Box::new(GoalData::All(3, 2, Box::new(GoalData::Let(7, 0, Box::new(GoalData::Imp(9, Box::new(GoalData::Imp(12, Box::new(GoalData::Imp(12, Box::new(GoalData::Let(14, 15, Box::new(GoalData::Imp(16, Box::new(GoalData::Imp(20, Box::new(GoalData::Let(18, 19, Box::new(GoalData::Let(10, 18, Box::new(GoalData::Let(6, 10, Box::new(GoalData::LeafE(ExprData::Atom(5))))))))))))))))))))))))))), Box::new(GoalList::Nil)))))))) }
 
@@ -3831,7 +3994,7 @@ proof fn ref_wp_call_pass_through()
     ensures
         // RET-EQ post: no ∀; E_bound hyp then a `let a := 2*x`.
         goals_eq(
-            wp_stm(
+            wp_stm(LeafList::Nil, 
                 FrameList::FHyp(0, 100, 0, Box::new(FrameList::FNil)),
                 StmData::Seq(
                     Box::new(StmData::Call {
@@ -3851,7 +4014,7 @@ proof fn ref_wp_call_pass_through()
         ) == 1,
         // ∀-PATH post: quantify the result, then ret_bound → ens hyps.
         goals_eq(
-            wp_stm(
+            wp_stm(LeafList::Nil, 
                 FrameList::FHyp(0, 100, 0, Box::new(FrameList::FNil)),
                 StmData::Seq(
                     Box::new(StmData::Call {
@@ -3872,7 +4035,7 @@ proof fn ref_wp_call_pass_through()
         // Mutation-kill: the ret-eq goals with a WRONG let value (10 → 99)
         // must NOT match — the bridge is sensitive to the transcribed E.
         goals_eq(
-            wp_stm(
+            wp_stm(LeafList::Nil, 
                 FrameList::FHyp(0, 100, 0, Box::new(FrameList::FNil)),
                 StmData::Seq(
                     Box::new(StmData::Call {
@@ -4013,6 +4176,8 @@ proof fn amended_shapes_kernel_compute()
             reqs: BinderList::Nil,
             mut_params: MutParamList::Nil,
             enss: LeafList::Cons(300, Box::new(LeafList::Nil)),
+            residue_names: LeafList::Nil,
+            prop_deeps: PropDeepList::Nil,
             closer_default: 1,
         }) == 2
 by {
@@ -4195,8 +4360,8 @@ pub open spec fn close_sem_e_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle, f: 
     close_sem_e_tel(hp, he, lv, f, f, st, o)
 }
 
-pub open spec fn close_sem_e(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, o: RawExp) -> bool {
-    if gate_wrap(f) == 1 { close_sem_e_wrap_lead(hp, he, lv, f, st, o) } else { close_sem_e_hoist(hp, he, lv, f, st, o) }
+pub open spec fn close_sem_e(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, o: RawExp) -> bool {
+    if gate_wrap(pp, f) == 1 { close_sem_e_wrap_lead(hp, he, lv, f, st, o) } else { close_sem_e_hoist(hp, he, lv, f, st, o) }
 }
 
 /// Frame-telescope interpretation, continuation = "every obligation in
@@ -4277,8 +4442,8 @@ pub open spec fn close_sem_obligs_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle
     close_sem_obligs_tel(hp, he, lv, f, f, st, l)
 }
 
-pub open spec fn close_sem_obligs(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, l: RawExpList) -> bool {
-    if gate_wrap(f) == 1 { close_sem_obligs_wrap_lead(hp, he, lv, f, st, l) } else { close_sem_obligs_hoist(hp, he, lv, f, st, l) }
+pub open spec fn close_sem_obligs(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, st: St, l: RawExpList) -> bool {
+    if gate_wrap(pp, f) == 1 { close_sem_obligs_wrap_lead(hp, he, lv, f, st, l) } else { close_sem_obligs_hoist(hp, he, lv, f, st, l) }
 }
 
 /// Operational safety — FRAME-CARRYING (the W5c lift, probe24): mirrors
@@ -4289,40 +4454,40 @@ pub open spec fn close_sem_obligs(hp: HpOracle, he: HeOracle, lv: LvOracle, f: F
 /// (no fragment predicate). Non-circular: the leaf arms require the
 /// ACTUAL obligation (`he(render_exp(o))`), never `true`.
 #[verifier::structural_decreases]
-pub open spec fn exec_safe_f(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, s: StmData, st: St) -> bool
+pub open spec fn exec_safe_f(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, s: StmData, st: St) -> bool
     decreases s
 {
     match s {
-        StmData::Assert(o, _hn, _h, _hp) => close_sem_e(hp, he, lv, f, st, o),
+        StmData::Assert(o, _hn, _h, _hp) => close_sem_e(pp, hp, he, lv, f, st, o),
         StmData::Assume(_hn, _e, _hp) => true,
         StmData::Assign(_x, _rhs) => true,
         StmData::AssignH(_x, _ty, _v, _en, _ep) => true,
         StmData::AssignR(_x, _v) => true,
-        StmData::Call { reqs, post: _ } => close_sem_obligs(hp, he, lv, f, st, *reqs),
-        StmData::DeadEnd(b) => exec_safe_f(hp, he, lv, f, *b, st),
+        StmData::Call { reqs, post: _ } => close_sem_obligs(pp, hp, he, lv, f, st, *reqs),
+        StmData::DeadEnd(b) => exec_safe_f(pp, hp, he, lv, f, *b, st),
         StmData::AssertQueryNl(b, tq) =>
-            exec_safe_f(hp, he, lv, strip_hyps(f), *b, st)
-                && close_sem_e(hp, he, lv, frame_after(strip_hyps(f), *b), st, tq),
+            exec_safe_f(pp, hp, he, lv, strip_hyps(f), *b, st)
+                && close_sem_e(pp, hp, he, lv, frame_after(pp, strip_hyps(f), *b), st, tq),
         // Assert-analogue: the inline-proven P is an obligation (closed
         // under the wrap-forced frame — the marker is semantically
         // transparent, so the meaning matches Assert's).
         StmData::AssertQueryTactus(o, _hn, _h, _hp) =>
-            close_sem_e(hp, he, lv, frame_append(f, FrameList::FUserCloser(Box::new(FrameList::FNil))), st, o),
-        StmData::Ret(es, rb) => close_sem_obligs(hp, he, lv, ret_frame(f, rb), st, *es),
+            close_sem_e(pp, hp, he, lv, frame_append(f, FrameList::FUserCloser(Box::new(FrameList::FNil))), st, o),
+        StmData::Ret(es, rb) => close_sem_obligs(pp, hp, he, lv, ret_frame(pp, f, rb), st, *es),
         StmData::If(c, cn, nc, ncn, cp, t, e) =>
-            exec_safe_f(hp, he, lv, frame_append(f, FrameList::FHyp(cn, c, cp, Box::new(FrameList::FNil))), *t, st)
-                && exec_safe_f(hp, he, lv, frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e, st),
+            exec_safe_f(pp, hp, he, lv, frame_append(f, FrameList::FHyp(cn, c, cp, Box::new(FrameList::FNil))), *t, st)
+                && exec_safe_f(pp, hp, he, lv, frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e, st),
         StmData::IfCtor { pos_binders, eq_name, eq_prop, eq_poison, neg_name, neg_prop, neg_poison, thn, els } =>
-            exec_safe_f(hp, he, lv, frame_append(f, ctor_pos_frame(*pos_binders, eq_name, eq_prop, eq_poison)), *thn, st)
-                && exec_safe_f(hp, he, lv, frame_append(f, FrameList::FHyp(neg_name, neg_prop, neg_poison, Box::new(FrameList::FNil))), *els, st),
+            exec_safe_f(pp, hp, he, lv, frame_append(f, ctor_pos_frame(*pos_binders, eq_name, eq_prop, eq_poison)), *thn, st)
+                && exec_safe_f(pp, hp, he, lv, frame_append(f, FrameList::FHyp(neg_name, neg_prop, neg_poison, Box::new(FrameList::FNil))), *els, st),
         StmData::Loop { inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann: _, neg_neg_cond_ann, break_guard_ann, break_use_ann: _, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body } => {
             if is_skip(*setup) == 1 {
             let mframe = loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop);
-            let endf = frame_after(mframe, *body);
-            close_sem_obligs(hp, he, lv, f, st, *inv_obligs)
-                && exec_safe_f(hp, he, lv, mframe, *body, st)
-                && close_sem_obligs(hp, he, lv, endf, st, *inv_obligs_exit)
-                && close_sem_e(hp, he, lv, endf, st, decrease_oblig)
+            let endf = frame_after(pp, mframe, *body);
+            close_sem_obligs(pp, hp, he, lv, f, st, *inv_obligs)
+                && exec_safe_f(pp, hp, he, lv, mframe, *body, st)
+                && close_sem_obligs(pp, hp, he, lv, endf, st, *inv_obligs_exit)
+                && close_sem_e(pp, hp, he, lv, endf, st, decrease_oblig)
             } else {
             // Break-form (bootstrap-79): the semantic analog of the
             // three-family goal list — init under the pre-loop frame,
@@ -4332,23 +4497,23 @@ pub open spec fn exec_safe_f(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameL
             // under the bare base.
             let base = loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds);
             let mframe0 = frame_append(base, d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop));
-            let setup_end = frame_after(mframe0, *setup);
+            let setup_end = frame_after(pp, mframe0, *setup);
             let exit_frame = frame_append(setup_end, FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil)));
             let guard_frame = frame_append(setup_end, FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil)));
-            let endf = frame_after(guard_frame, *body);
-            close_sem_obligs(hp, he, lv, f, st, *inv_obligs)
-                && exec_safe_f(hp, he, lv, mframe0, *setup, st)
-                && close_sem_obligs(hp, he, lv, exit_frame, st, *inv_obligs_break)
-                && exec_safe_f(hp, he, lv, guard_frame, *body, st)
-                && close_sem_obligs(hp, he, lv, endf, st, *inv_obligs_exit)
-                && close_sem_e(hp, he, lv, endf, st, decrease_oblig)
-                && exec_safe_f(hp, he, lv, base, *setup, st)
+            let endf = frame_after(pp, guard_frame, *body);
+            close_sem_obligs(pp, hp, he, lv, f, st, *inv_obligs)
+                && exec_safe_f(pp, hp, he, lv, mframe0, *setup, st)
+                && close_sem_obligs(pp, hp, he, lv, exit_frame, st, *inv_obligs_break)
+                && exec_safe_f(pp, hp, he, lv, guard_frame, *body, st)
+                && close_sem_obligs(pp, hp, he, lv, endf, st, *inv_obligs_exit)
+                && close_sem_e(pp, hp, he, lv, endf, st, decrease_oblig)
+                && exec_safe_f(pp, hp, he, lv, base, *setup, st)
             }
         },
         StmData::Skip => true,
         StmData::Seq(a, b) =>
-            exec_safe_f(hp, he, lv, f, *a, st)
-                && exec_safe_f(hp, he, lv, frame_after(f, *a), *b, st),
+            exec_safe_f(pp, hp, he, lv, f, *a, st)
+                && exec_safe_f(pp, hp, he, lv, frame_after(pp, f, *a), *b, st),
     }
 }
 
@@ -4400,21 +4565,21 @@ pub proof fn u_obligs_cons(he: HeOracle, h: Box<RawExp>, t: Box<RawExpList>)
         == (he(render_exp(*h), st) && obligs_safe(he, *t, st))
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_cse_nil(hp: HpOracle, he: HeOracle, lv: LvOracle, o: RawExp)
-    ensures forall|st: St| #[trigger] close_sem_e(hp, he, lv, FrameList::FNil, st, o)
+pub proof fn u_cse_nil(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, o: RawExp)
+    ensures forall|st: St| #[trigger] close_sem_e(pp, hp, he, lv, FrameList::FNil, st, o)
         == he(render_exp(o), st)
 {}
 // Post-N1: per-MODE one-step semantic unfolds (dispatcher-level cons
 // unfolds are false across mode boundaries — see the close_e pin note).
 // Dispatch pins first.
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all [lib.close_sem_e])")]
-pub proof fn u_cse_wrap_mode(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp)
-    ensures gate_wrap(f) == 1 ==> forall|st: St| #[trigger] close_sem_e(hp, he, lv, f, st, o)
+pub proof fn u_cse_wrap_mode(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp)
+    ensures gate_wrap(pp, f) == 1 ==> forall|st: St| #[trigger] close_sem_e(pp, hp, he, lv, f, st, o)
         == close_sem_e_wrap_lead(hp, he, lv, f, st, o)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all [lib.close_sem_e])")]
-pub proof fn u_cse_hoist_mode(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp)
-    ensures gate_wrap(f) != 1 ==> forall|st: St| #[trigger] close_sem_e(hp, he, lv, f, st, o)
+pub proof fn u_cse_hoist_mode(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp)
+    ensures gate_wrap(pp, f) != 1 ==> forall|st: St| #[trigger] close_sem_e(pp, hp, he, lv, f, st, o)
         == close_sem_e_hoist(hp, he, lv, f, st, o)
 {}
 
@@ -4573,19 +4738,19 @@ pub proof fn u_cser_ucl(hp: HpOracle, he: HeOracle, lv: LvOracle, t: Box<FrameLi
         == close_sem_e_res(hp, he, lv, *t, st, o)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_cso_nil(hp: HpOracle, he: HeOracle, lv: LvOracle, l: RawExpList)
-    ensures forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, FrameList::FNil, st, l)
+pub proof fn u_cso_nil(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, l: RawExpList)
+    ensures forall|st: St| #[trigger] close_sem_obligs(pp, hp, he, lv, FrameList::FNil, st, l)
         == obligs_safe(he, l, st)
 {}
 // Post-N1 dispatch + per-mode cso pins (same shape as the cse family).
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all [lib.close_sem_obligs])")]
-pub proof fn u_cso_wrap_mode(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, l: RawExpList)
-    ensures gate_wrap(f) == 1 ==> forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, f, st, l)
+pub proof fn u_cso_wrap_mode(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, l: RawExpList)
+    ensures gate_wrap(pp, f) == 1 ==> forall|st: St| #[trigger] close_sem_obligs(pp, hp, he, lv, f, st, l)
         == close_sem_obligs_wrap_lead(hp, he, lv, f, st, l)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all [lib.close_sem_obligs])")]
-pub proof fn u_cso_hoist_mode(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, l: RawExpList)
-    ensures gate_wrap(f) != 1 ==> forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, f, st, l)
+pub proof fn u_cso_hoist_mode(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, l: RawExpList)
+    ensures gate_wrap(pp, f) != 1 ==> forall|st: St| #[trigger] close_sem_obligs(pp, hp, he, lv, f, st, l)
         == close_sem_obligs_hoist(hp, he, lv, f, st, l)
 {}
 
@@ -4740,118 +4905,118 @@ pub proof fn u_csor_ucl(hp: HpOracle, he: HeOracle, lv: LvOracle, t: Box<FrameLi
         == close_sem_obligs_res(hp, he, lv, *t, st, l)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_esf_assert(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp, hn: u64, h: u64, hpz: u64)
-    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Assert(o, hn, h, hpz), st)
-        == close_sem_e(hp, he, lv, f, st, o)
+pub proof fn u_esf_assert(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp, hn: u64, h: u64, hpz: u64)
+    ensures forall|st: St| #[trigger] exec_safe_f(pp, hp, he, lv, f, StmData::Assert(o, hn, h, hpz), st)
+        == close_sem_e(pp, hp, he, lv, f, st, o)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_esf_assume(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, hn: u64, e: u64, hpz: u64)
-    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Assume(hn, e, hpz), st) == true
+pub proof fn u_esf_assume(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, hn: u64, e: u64, hpz: u64)
+    ensures forall|st: St| #[trigger] exec_safe_f(pp, hp, he, lv, f, StmData::Assume(hn, e, hpz), st) == true
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_esf_assign(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, x: u64, rhs: u64)
-    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Assign(x, rhs), st) == true
+pub proof fn u_esf_assign(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, x: u64, rhs: u64)
+    ensures forall|st: St| #[trigger] exec_safe_f(pp, hp, he, lv, f, StmData::Assign(x, rhs), st) == true
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_esf_assignh(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, x: u64, ty: u64, v: u64, en: u64, ep: u64)
-    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::AssignH(x, ty, v, en, ep), st) == true
+pub proof fn u_esf_assignh(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, x: u64, ty: u64, v: u64, en: u64, ep: u64)
+    ensures forall|st: St| #[trigger] exec_safe_f(pp, hp, he, lv, f, StmData::AssignH(x, ty, v, en, ep), st) == true
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_esf_assignr(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, x: u64, v: u64)
-    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::AssignR(x, v), st) == true
+pub proof fn u_esf_assignr(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, x: u64, v: u64)
+    ensures forall|st: St| #[trigger] exec_safe_f(pp, hp, he, lv, f, StmData::AssignR(x, v), st) == true
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_esf_call(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, reqs: Box<RawExpList>, post: Box<FrameList>)
-    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Call { reqs, post }, st)
-        == close_sem_obligs(hp, he, lv, f, st, *reqs)
+pub proof fn u_esf_call(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, reqs: Box<RawExpList>, post: Box<FrameList>)
+    ensures forall|st: St| #[trigger] exec_safe_f(pp, hp, he, lv, f, StmData::Call { reqs, post }, st)
+        == close_sem_obligs(pp, hp, he, lv, f, st, *reqs)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_esf_deadend(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, b: Box<StmData>)
-    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::DeadEnd(b), st)
-        == exec_safe_f(hp, he, lv, f, *b, st)
+pub proof fn u_esf_deadend(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, b: Box<StmData>)
+    ensures forall|st: St| #[trigger] exec_safe_f(pp, hp, he, lv, f, StmData::DeadEnd(b), st)
+        == exec_safe_f(pp, hp, he, lv, f, *b, st)
 {}
-pub proof fn u_esf_aqnl(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, b: Box<StmData>, tq: RawExp)
-    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::AssertQueryNl(b, tq), st)
-        == (exec_safe_f(hp, he, lv, strip_hyps(f), *b, st)
-            && close_sem_e(hp, he, lv, frame_after(strip_hyps(f), *b), st, tq))
-{}
-#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_esf_aqt(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp, hn: u64, h: u64, hpz: u64)
-    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::AssertQueryTactus(o, hn, h, hpz), st)
-        == close_sem_e(hp, he, lv, frame_append(f, FrameList::FUserCloser(Box::new(FrameList::FNil))), st, o)
+pub proof fn u_esf_aqnl(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, b: Box<StmData>, tq: RawExp)
+    ensures forall|st: St| #[trigger] exec_safe_f(pp, hp, he, lv, f, StmData::AssertQueryNl(b, tq), st)
+        == (exec_safe_f(pp, hp, he, lv, strip_hyps(f), *b, st)
+            && close_sem_e(pp, hp, he, lv, frame_after(pp, strip_hyps(f), *b), st, tq))
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_esf_ifctor(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, pos_binders: Box<BinderList>, eq_name: u64, eq_prop: u64, eq_poison: u64, neg_name: u64, neg_prop: u64, neg_poison: u64, thn: Box<StmData>, els: Box<StmData>)
-    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::IfCtor { pos_binders, eq_name, eq_prop, eq_poison, neg_name, neg_prop, neg_poison, thn, els }, st)
-        == (exec_safe_f(hp, he, lv, frame_append(f, ctor_pos_frame(*pos_binders, eq_name, eq_prop, eq_poison)), *thn, st)
-            && exec_safe_f(hp, he, lv, frame_append(f, FrameList::FHyp(neg_name, neg_prop, neg_poison, Box::new(FrameList::FNil))), *els, st))
+pub proof fn u_esf_aqt(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp, hn: u64, h: u64, hpz: u64)
+    ensures forall|st: St| #[trigger] exec_safe_f(pp, hp, he, lv, f, StmData::AssertQueryTactus(o, hn, h, hpz), st)
+        == close_sem_e(pp, hp, he, lv, frame_append(f, FrameList::FUserCloser(Box::new(FrameList::FNil))), st, o)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_esf_ret(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, es: Box<RawExpList>, rb: RetBind)
-    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Ret(es, rb), st)
-        == close_sem_obligs(hp, he, lv, ret_frame(f, rb), st, *es)
+pub proof fn u_esf_ifctor(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, pos_binders: Box<BinderList>, eq_name: u64, eq_prop: u64, eq_poison: u64, neg_name: u64, neg_prop: u64, neg_poison: u64, thn: Box<StmData>, els: Box<StmData>)
+    ensures forall|st: St| #[trigger] exec_safe_f(pp, hp, he, lv, f, StmData::IfCtor { pos_binders, eq_name, eq_prop, eq_poison, neg_name, neg_prop, neg_poison, thn, els }, st)
+        == (exec_safe_f(pp, hp, he, lv, frame_append(f, ctor_pos_frame(*pos_binders, eq_name, eq_prop, eq_poison)), *thn, st)
+            && exec_safe_f(pp, hp, he, lv, frame_append(f, FrameList::FHyp(neg_name, neg_prop, neg_poison, Box::new(FrameList::FNil))), *els, st))
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_esf_if(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, c: u64, cn: u64, nc: u64, ncn: u64, cp: u64, t: Box<StmData>, e: Box<StmData>)
-    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::If(c, cn, nc, ncn, cp, t, e), st)
-        == (exec_safe_f(hp, he, lv, frame_append(f, FrameList::FHyp(cn, c, cp, Box::new(FrameList::FNil))), *t, st)
-            && exec_safe_f(hp, he, lv, frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e, st))
+pub proof fn u_esf_ret(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, es: Box<RawExpList>, rb: RetBind)
+    ensures forall|st: St| #[trigger] exec_safe_f(pp, hp, he, lv, f, StmData::Ret(es, rb), st)
+        == close_sem_obligs(pp, hp, he, lv, ret_frame(pp, f, rb), st, *es)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_esf_loop(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList,
+pub proof fn u_esf_if(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, c: u64, cn: u64, nc: u64, ncn: u64, cp: u64, t: Box<StmData>, e: Box<StmData>)
+    ensures forall|st: St| #[trigger] exec_safe_f(pp, hp, he, lv, f, StmData::If(c, cn, nc, ncn, cp, t, e), st)
+        == (exec_safe_f(pp, hp, he, lv, frame_append(f, FrameList::FHyp(cn, c, cp, Box::new(FrameList::FNil))), *t, st)
+            && exec_safe_f(pp, hp, he, lv, frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e, st))
+{}
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
+pub proof fn u_esf_loop(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList,
     inv_hyps: Box<BinderList>, inv_obligs: Box<RawExpList>, inv_obligs_exit: Box<RawExpList>,
     inv_obligs_break: Box<RawExpList>, binders: Box<BinderList>,
     binder_bounds: Box<ParamBoundList>, cond_name: u64, cond_ann: u64, neg_cond_ann: u64,
     neg_neg_cond_ann: u64, break_guard_ann: u64, break_use_ann: u64,
     cond_poison: u64, d_old_name: u64, d_old_ty: u64, d_old_val: u64, d_old_eq_name: u64,
     d_old_eq_prop: u64, decrease_oblig: RawExp, setup: Box<StmData>, body: Box<StmData>)
-    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Loop {
+    ensures forall|st: St| #[trigger] exec_safe_f(pp, hp, he, lv, f, StmData::Loop {
             inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann,
             neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name,
             d_old_eq_prop, decrease_oblig, setup, body,
         }, st)
         == (if is_skip(*setup) == 1 {
-            close_sem_obligs(hp, he, lv, f, st, *inv_obligs)
-            && exec_safe_f(hp, he, lv,
+            close_sem_obligs(pp, hp, he, lv, f, st, *inv_obligs)
+            && exec_safe_f(pp, hp, he, lv,
                 loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop),
                 *body, st)
-            && close_sem_obligs(hp, he, lv,
-                frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body),
+            && close_sem_obligs(pp, hp, he, lv,
+                frame_after(pp, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body),
                 st, *inv_obligs_exit)
-            && close_sem_e(hp, he, lv,
-                frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body),
+            && close_sem_e(pp, hp, he, lv,
+                frame_after(pp, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body),
                 st, decrease_oblig)
         } else {
-            close_sem_obligs(hp, he, lv, f, st, *inv_obligs)
-            && exec_safe_f(hp, he, lv,
+            close_sem_obligs(pp, hp, he, lv, f, st, *inv_obligs)
+            && exec_safe_f(pp, hp, he, lv,
                 frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)),
                 *setup, st)
-            && close_sem_obligs(hp, he, lv,
-                frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil))),
+            && close_sem_obligs(pp, hp, he, lv,
+                frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil))),
                 st, *inv_obligs_break)
-            && exec_safe_f(hp, he, lv,
-                frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))),
+            && exec_safe_f(pp, hp, he, lv,
+                frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))),
                 *body, st)
-            && close_sem_obligs(hp, he, lv,
-                frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
+            && close_sem_obligs(pp, hp, he, lv,
+                frame_after(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
                 st, *inv_obligs_exit)
-            && close_sem_e(hp, he, lv,
-                frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
+            && close_sem_e(pp, hp, he, lv,
+                frame_after(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
                 st, decrease_oblig)
-            && exec_safe_f(hp, he, lv,
+            && exec_safe_f(pp, hp, he, lv,
                 loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds),
                 *setup, st)
         })
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_esf_skip(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList)
-    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Skip, st) == true
+pub proof fn u_esf_skip(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList)
+    ensures forall|st: St| #[trigger] exec_safe_f(pp, hp, he, lv, f, StmData::Skip, st) == true
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_esf_seq(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, a: Box<StmData>, b: Box<StmData>)
-    ensures forall|st: St| #[trigger] exec_safe_f(hp, he, lv, f, StmData::Seq(a, b), st)
-        == (exec_safe_f(hp, he, lv, f, *a, st)
-            && exec_safe_f(hp, he, lv, frame_after(f, *a), *b, st))
+pub proof fn u_esf_seq(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, a: Box<StmData>, b: Box<StmData>)
+    ensures forall|st: St| #[trigger] exec_safe_f(pp, hp, he, lv, f, StmData::Seq(a, b), st)
+        == (exec_safe_f(pp, hp, he, lv, f, *a, st)
+            && exec_safe_f(pp, hp, he, lv, frame_after(pp, f, *a), *b, st))
 {}
 
 // ── W5 data-side one-step unfolds (bootstrap-62): the reference fns the
@@ -4887,26 +5052,26 @@ pub proof fn u_gate_ucl(t: Box<FrameList>)
 {}
 
 // Poison-gate one-step pins.
-pub proof fn u_gatep_nil()
-    ensures has_poisoned_hyp(FrameList::FNil) == 0
+pub proof fn u_gatep_nil(pp: LeafList, )
+    ensures has_poisoned_hyp(pp, FrameList::FNil) == 0
 {}
-pub proof fn u_gatep_bind(x: u64, ty: u64, t: Box<FrameList>)
-    ensures has_poisoned_hyp(FrameList::FBind(x, ty, t)) == has_poisoned_hyp(*t)
+pub proof fn u_gatep_bind(pp: LeafList, x: u64, ty: u64, t: Box<FrameList>)
+    ensures has_poisoned_hyp(pp, FrameList::FBind(x, ty, t)) == has_poisoned_hyp(pp, *t)
 {}
-pub proof fn u_gatep_hyp(n: u64, h: u64, p: u64, t: Box<FrameList>)
-    ensures has_poisoned_hyp(FrameList::FHyp(n, h, p, t)) == (if p == 1 { 1 } else { has_poisoned_hyp(*t) })
+pub proof fn u_gatep_hyp(pp: LeafList, n: u64, h: u64, p: u64, t: Box<FrameList>)
+    ensures has_poisoned_hyp(pp, FrameList::FHyp(n, h, p, t)) == (if leaf_mem(pp, h) == 1 { 1 } else { has_poisoned_hyp(pp, *t) })
 {}
-pub proof fn u_gatep_let(x: u64, v: u64, t: Box<FrameList>)
-    ensures has_poisoned_hyp(FrameList::FLet(x, v, t)) == has_poisoned_hyp(*t)
+pub proof fn u_gatep_let(pp: LeafList, x: u64, v: u64, t: Box<FrameList>)
+    ensures has_poisoned_hyp(pp, FrameList::FLet(x, v, t)) == has_poisoned_hyp(pp, *t)
 {}
-pub proof fn u_gatep_leth(x: u64, ty: u64, v: u64, en: u64, ep: u64, t: Box<FrameList>)
-    ensures has_poisoned_hyp(FrameList::FLetH(x, ty, v, en, ep, t)) == has_poisoned_hyp(*t)
+pub proof fn u_gatep_leth(pp: LeafList, x: u64, ty: u64, v: u64, en: u64, ep: u64, t: Box<FrameList>)
+    ensures has_poisoned_hyp(pp, FrameList::FLetH(x, ty, v, en, ep, t)) == has_poisoned_hyp(pp, *t)
 {}
-pub proof fn u_gatep_letr(x: u64, v: u64, t: Box<FrameList>)
-    ensures has_poisoned_hyp(FrameList::FLetR(x, v, t)) == has_poisoned_hyp(*t)
+pub proof fn u_gatep_letr(pp: LeafList, x: u64, v: u64, t: Box<FrameList>)
+    ensures has_poisoned_hyp(pp, FrameList::FLetR(x, v, t)) == has_poisoned_hyp(pp, *t)
 {}
-pub proof fn u_gatep_ucl(t: Box<FrameList>)
-    ensures has_poisoned_hyp(FrameList::FUserCloser(t)) == has_poisoned_hyp(*t)
+pub proof fn u_gatep_ucl(pp: LeafList, t: Box<FrameList>)
+    ensures has_poisoned_hyp(pp, FrameList::FUserCloser(t)) == has_poisoned_hyp(pp, *t)
 {}
 
 // User-closer-gate one-step pins (R1, bootstrap-77).
@@ -4937,11 +5102,11 @@ pub proof fn u_gateu_ucl(t: Box<FrameList>)
 // requires-carrying pins called under an `if` emit branch-guarded
 // precondition VCs the Link discharge spine cannot yet compose —
 // implication-form pins keep every caller straight-line.
-pub proof fn u_ce_wrap_mode(f: FrameList, ob: RawExp)
-    ensures gate_wrap(f) == 1 ==> close_e(f, ob) == close_e_wrap_lead(f, ob)
+pub proof fn u_ce_wrap_mode(pp: LeafList, f: FrameList, ob: RawExp)
+    ensures gate_wrap(pp, f) == 1 ==> close_e(pp, f, ob) == close_e_wrap_lead(f, ob)
 {}
-pub proof fn u_ce_hoist_mode(f: FrameList, ob: RawExp)
-    ensures gate_wrap(f) != 1 ==> close_e(f, ob) == close_e_hoist(f, ob)
+pub proof fn u_ce_hoist_mode(pp: LeafList, f: FrameList, ob: RawExp)
+    ensures gate_wrap(pp, f) != 1 ==> close_e(pp, f, ob) == close_e_hoist(f, ob)
 {}
 
 // close_e_wrap one-step unfolds.
@@ -5040,12 +5205,12 @@ pub proof fn u_cer_leth(x: u64, ty: u64, v: u64, en: u64, ep: u64, t: Box<FrameL
 pub proof fn u_cer_ucl(t: Box<FrameList>, g: GoalData)
     ensures residue_fold_e(FrameList::FUserCloser(t), g) == residue_fold_e(*t, g)
 {}
-pub proof fn u_cce_nil(f: FrameList)
-    ensures close_each_e(f, RawExpList::Nil) == GoalList::Nil
+pub proof fn u_cce_nil(pp: LeafList, f: FrameList)
+    ensures close_each_e(pp, f, RawExpList::Nil) == GoalList::Nil
 {}
-pub proof fn u_cce_cons(f: FrameList, h: Box<RawExp>, t: Box<RawExpList>)
-    ensures close_each_e(f, RawExpList::Cons(h, t))
-        == GoalList::Cons(Box::new(close_e(f, *h)), Box::new(close_each_e(f, *t)))
+pub proof fn u_cce_cons(pp: LeafList, f: FrameList, h: Box<RawExp>, t: Box<RawExpList>)
+    ensures close_each_e(pp, f, RawExpList::Cons(h, t))
+        == GoalList::Cons(Box::new(close_e(pp, f, *h)), Box::new(close_each_e(pp, f, *t)))
 {}
 pub proof fn u_gapp_nil(b: GoalList)
     ensures goals_append(GoalList::Nil, b) == b
@@ -5054,101 +5219,101 @@ pub proof fn u_gapp_cons(h: Box<GoalData>, t: Box<GoalList>, b: GoalList)
     ensures goals_append(GoalList::Cons(h, t), b)
         == GoalList::Cons(h, Box::new(goals_append(*t, b)))
 {}
-pub proof fn u_wp_assert(f: FrameList, o: RawExp, hn: u64, h: u64, hpz: u64)
-    ensures wp_stm(f, StmData::Assert(o, hn, h, hpz))
-        == GoalList::Cons(Box::new(close_e(f, o)), Box::new(GoalList::Nil))
+pub proof fn u_wp_assert(pp: LeafList, f: FrameList, o: RawExp, hn: u64, h: u64, hpz: u64)
+    ensures wp_stm(pp, f, StmData::Assert(o, hn, h, hpz))
+        == GoalList::Cons(Box::new(close_e(pp, f, o)), Box::new(GoalList::Nil))
 {}
-pub proof fn u_wp_assume(f: FrameList, hn: u64, e: u64, hpz: u64)
-    ensures wp_stm(f, StmData::Assume(hn, e, hpz)) == GoalList::Nil
+pub proof fn u_wp_assume(pp: LeafList, f: FrameList, hn: u64, e: u64, hpz: u64)
+    ensures wp_stm(pp, f, StmData::Assume(hn, e, hpz)) == GoalList::Nil
 {}
-pub proof fn u_wp_assign(f: FrameList, x: u64, rhs: u64)
-    ensures wp_stm(f, StmData::Assign(x, rhs)) == GoalList::Nil
+pub proof fn u_wp_assign(pp: LeafList, f: FrameList, x: u64, rhs: u64)
+    ensures wp_stm(pp, f, StmData::Assign(x, rhs)) == GoalList::Nil
 {}
-pub proof fn u_wp_assignh(f: FrameList, x: u64, ty: u64, v: u64, en: u64, ep: u64)
-    ensures wp_stm(f, StmData::AssignH(x, ty, v, en, ep)) == GoalList::Nil
+pub proof fn u_wp_assignh(pp: LeafList, f: FrameList, x: u64, ty: u64, v: u64, en: u64, ep: u64)
+    ensures wp_stm(pp, f, StmData::AssignH(x, ty, v, en, ep)) == GoalList::Nil
 {}
-pub proof fn u_wp_assignr(f: FrameList, x: u64, v: u64)
-    ensures wp_stm(f, StmData::AssignR(x, v)) == GoalList::Nil
+pub proof fn u_wp_assignr(pp: LeafList, f: FrameList, x: u64, v: u64)
+    ensures wp_stm(pp, f, StmData::AssignR(x, v)) == GoalList::Nil
 {}
-pub proof fn u_wp_call(f: FrameList, reqs: Box<RawExpList>, post: Box<FrameList>)
-    ensures wp_stm(f, StmData::Call { reqs, post }) == close_each_e(f, *reqs)
+pub proof fn u_wp_call(pp: LeafList, f: FrameList, reqs: Box<RawExpList>, post: Box<FrameList>)
+    ensures wp_stm(pp, f, StmData::Call { reqs, post }) == close_each_e(pp, f, *reqs)
 {}
-pub proof fn u_wp_deadend(f: FrameList, b: Box<StmData>)
-    ensures wp_stm(f, StmData::DeadEnd(b)) == wp_stm(f, *b)
+pub proof fn u_wp_deadend(pp: LeafList, f: FrameList, b: Box<StmData>)
+    ensures wp_stm(pp, f, StmData::DeadEnd(b)) == wp_stm(pp, f, *b)
 {}
-pub proof fn u_wp_aqnl(f: FrameList, b: Box<StmData>, tq: RawExp)
-    ensures wp_stm(f, StmData::AssertQueryNl(b, tq))
+pub proof fn u_wp_aqnl(pp: LeafList, f: FrameList, b: Box<StmData>, tq: RawExp)
+    ensures wp_stm(pp, f, StmData::AssertQueryNl(b, tq))
         == goals_append(
-            wp_stm(strip_hyps(f), *b),
+            wp_stm(pp, strip_hyps(f), *b),
             GoalList::Cons(
-                Box::new(close_e(frame_after(strip_hyps(f), *b), tq)),
+                Box::new(close_e(pp, frame_after(pp, strip_hyps(f), *b), tq)),
                 Box::new(GoalList::Nil)))
 {}
-pub proof fn u_wp_aqt(f: FrameList, o: RawExp, hn: u64, h: u64, hpz: u64)
-    ensures wp_stm(f, StmData::AssertQueryTactus(o, hn, h, hpz))
+pub proof fn u_wp_aqt(pp: LeafList, f: FrameList, o: RawExp, hn: u64, h: u64, hpz: u64)
+    ensures wp_stm(pp, f, StmData::AssertQueryTactus(o, hn, h, hpz))
         == GoalList::Cons(
-            Box::new(close_e(frame_append(f, FrameList::FUserCloser(Box::new(FrameList::FNil))), o)),
+            Box::new(close_e(pp, frame_append(f, FrameList::FUserCloser(Box::new(FrameList::FNil))), o)),
             Box::new(GoalList::Nil))
 {}
-pub proof fn u_wp_ifctor(f: FrameList, pos_binders: Box<BinderList>, eq_name: u64, eq_prop: u64, eq_poison: u64, neg_name: u64, neg_prop: u64, neg_poison: u64, thn: Box<StmData>, els: Box<StmData>)
-    ensures wp_stm(f, StmData::IfCtor { pos_binders, eq_name, eq_prop, eq_poison, neg_name, neg_prop, neg_poison, thn, els })
+pub proof fn u_wp_ifctor(pp: LeafList, f: FrameList, pos_binders: Box<BinderList>, eq_name: u64, eq_prop: u64, eq_poison: u64, neg_name: u64, neg_prop: u64, neg_poison: u64, thn: Box<StmData>, els: Box<StmData>)
+    ensures wp_stm(pp, f, StmData::IfCtor { pos_binders, eq_name, eq_prop, eq_poison, neg_name, neg_prop, neg_poison, thn, els })
         == goals_append(
-            wp_stm(frame_append(f, ctor_pos_frame(*pos_binders, eq_name, eq_prop, eq_poison)), *thn),
-            wp_stm(frame_append(f, FrameList::FHyp(neg_name, neg_prop, neg_poison, Box::new(FrameList::FNil))), *els))
+            wp_stm(pp, frame_append(f, ctor_pos_frame(*pos_binders, eq_name, eq_prop, eq_poison)), *thn),
+            wp_stm(pp, frame_append(f, FrameList::FHyp(neg_name, neg_prop, neg_poison, Box::new(FrameList::FNil))), *els))
 {}
-pub proof fn u_wp_ret(f: FrameList, es: Box<RawExpList>, rb: RetBind)
-    ensures wp_stm(f, StmData::Ret(es, rb)) == close_each_e(ret_frame(f, rb), *es)
+pub proof fn u_wp_ret(pp: LeafList, f: FrameList, es: Box<RawExpList>, rb: RetBind)
+    ensures wp_stm(pp, f, StmData::Ret(es, rb)) == close_each_e(pp, ret_frame(pp, f, rb), *es)
 {}
-pub proof fn u_wp_if(f: FrameList, c: u64, cn: u64, nc: u64, ncn: u64, cp: u64, t: Box<StmData>, e: Box<StmData>)
-    ensures wp_stm(f, StmData::If(c, cn, nc, ncn, cp, t, e))
+pub proof fn u_wp_if(pp: LeafList, f: FrameList, c: u64, cn: u64, nc: u64, ncn: u64, cp: u64, t: Box<StmData>, e: Box<StmData>)
+    ensures wp_stm(pp, f, StmData::If(c, cn, nc, ncn, cp, t, e))
         == goals_append(
-            wp_stm(frame_append(f, FrameList::FHyp(cn, c, cp, Box::new(FrameList::FNil))), *t),
-            wp_stm(frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e))
+            wp_stm(pp, frame_append(f, FrameList::FHyp(cn, c, cp, Box::new(FrameList::FNil))), *t),
+            wp_stm(pp, frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e))
 {}
-pub proof fn u_wp_loop(f: FrameList,
+pub proof fn u_wp_loop(pp: LeafList, f: FrameList,
     inv_hyps: Box<BinderList>, inv_obligs: Box<RawExpList>, inv_obligs_exit: Box<RawExpList>,
     inv_obligs_break: Box<RawExpList>, binders: Box<BinderList>,
     binder_bounds: Box<ParamBoundList>, cond_name: u64, cond_ann: u64, neg_cond_ann: u64,
     neg_neg_cond_ann: u64, break_guard_ann: u64, break_use_ann: u64,
     cond_poison: u64, d_old_name: u64, d_old_ty: u64, d_old_val: u64, d_old_eq_name: u64,
     d_old_eq_prop: u64, decrease_oblig: RawExp, setup: Box<StmData>, body: Box<StmData>)
-    ensures wp_stm(f, StmData::Loop {
+    ensures wp_stm(pp, f, StmData::Loop {
             inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann,
             neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name,
             d_old_eq_prop, decrease_oblig, setup, body,
         })
         == (if is_skip(*setup) == 1 {
-            goals_append(close_each_e(f, *inv_obligs),
+            goals_append(close_each_e(pp, f, *inv_obligs),
                 goals_append(
-                    wp_stm(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body),
+                    wp_stm(pp, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body),
                     goals_append(
-                        close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit),
+                        close_each_e(pp, frame_after(pp, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit),
                         GoalList::Cons(
-                            Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)),
+                            Box::new(close_e(pp, frame_after(pp, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)),
                             Box::new(GoalList::Nil)))))
         } else {
-            goals_append(close_each_e(f, *inv_obligs),
+            goals_append(close_each_e(pp, f, *inv_obligs),
                 goals_append(
-                    wp_stm(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup),
+                    wp_stm(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup),
                     goals_append(
-                        close_each_e(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil))), *inv_obligs_break),
+                        close_each_e(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil))), *inv_obligs_break),
                         goals_append(
-                            wp_stm(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
+                            wp_stm(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
                             goals_append(
-                                close_each_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
+                                close_each_e(pp, frame_after(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
                                 goals_append(
                                     GoalList::Cons(
-                                        Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)),
+                                        Box::new(close_e(pp, frame_after(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)),
                                         Box::new(GoalList::Nil)),
-                                    wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup)))))))
+                                    wp_stm(pp, loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup)))))))
         })
 {}
-pub proof fn u_wp_skip(f: FrameList)
-    ensures wp_stm(f, StmData::Skip) == GoalList::Nil
+pub proof fn u_wp_skip(pp: LeafList, f: FrameList)
+    ensures wp_stm(pp, f, StmData::Skip) == GoalList::Nil
 {}
-pub proof fn u_wp_seq(f: FrameList, a: Box<StmData>, b: Box<StmData>)
-    ensures wp_stm(f, StmData::Seq(a, b))
-        == goals_append(wp_stm(f, *a), wp_stm(frame_after(f, *a), *b))
+pub proof fn u_wp_seq(pp: LeafList, f: FrameList, a: Box<StmData>, b: Box<StmData>)
+    ensures wp_stm(pp, f, StmData::Seq(a, b))
+        == goals_append(wp_stm(pp, f, *a), wp_stm(pp, frame_after(pp, f, *a), *b))
 {}
 
 // ── W5 support lemma A (bootstrap-62, hand-Lean `holds_close_e`): a
@@ -5397,16 +5562,16 @@ pub proof fn holds_close_e_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle, f: Fr
 // The gated dispatcher — ORIGINAL statement, so every downstream caller
 // (wp_stm_sound, holds_all_close_each_e) is untouched. Mode decided once
 // over the whole frame list, mirroring production's hoist_all.
-#[verifier::tactus_tactic("first | tactus_auto | (intros <;> by_cases _hgate : lib.gate_wrap f = 1 <;> simp_all)")]
-pub proof fn holds_close_e(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp)
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> by_cases _hgate : lib.gate_wrap pp f = 1 <;> simp_all)")]
+pub proof fn holds_close_e(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, o: RawExp)
     ensures forall|st: St|
-        #[trigger] holds(hp, he, lv, close_e(f, o), st) == close_sem_e(hp, he, lv, f, st, o)
+        #[trigger] holds(hp, he, lv, close_e(pp, f, o), st) == close_sem_e(pp, hp, he, lv, f, st, o)
 {
-    u_ce_wrap_mode(f, o);
-    u_cse_wrap_mode(hp, he, lv, f, o);
+    u_ce_wrap_mode(pp, f, o);
+    u_cse_wrap_mode(pp, hp, he, lv, f, o);
     holds_close_e_wrap_lead(hp, he, lv, f, o);
-    u_ce_hoist_mode(f, o);
-    u_cse_hoist_mode(hp, he, lv, f, o);
+    u_ce_hoist_mode(pp, f, o);
+    u_cse_hoist_mode(pp, hp, he, lv, f, o);
     holds_close_e_hoist(hp, he, lv, f, o);
 }
 
@@ -5605,13 +5770,13 @@ pub proof fn cso_nil_true_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle, f: Fra
     cso_nil_true_tel(hp, he, lv, f, f);
 }
 
-#[verifier::tactus_tactic("first | tactus_auto | (intros <;> by_cases _hgate : lib.gate_wrap f = 1 <;> simp_all (config := { zetaDelta := true }))")]
-pub proof fn cso_nil_true(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList)
-    ensures forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, f, st, RawExpList::Nil) == true
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> by_cases _hgate : lib.gate_wrap pp f = 1 <;> simp_all (config := { zetaDelta := true }))")]
+pub proof fn cso_nil_true(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList)
+    ensures forall|st: St| #[trigger] close_sem_obligs(pp, hp, he, lv, f, st, RawExpList::Nil) == true
 {
-    u_cso_wrap_mode(hp, he, lv, f, RawExpList::Nil);
+    u_cso_wrap_mode(pp, hp, he, lv, f, RawExpList::Nil);
     cso_nil_true_wrap_lead(hp, he, lv, f);
-    u_cso_hoist_mode(hp, he, lv, f, RawExpList::Nil);
+    u_cso_hoist_mode(pp, hp, he, lv, f, RawExpList::Nil);
     cso_nil_true_hoist(hp, he, lv, f);
 }
 
@@ -5848,18 +6013,18 @@ pub proof fn cso_cons_split_hoist(hp: HpOracle, he: HeOracle, lv: LvOracle, f: F
     cso_cons_split_tel(hp, he, lv, f, f, h, t);
 }
 
-#[verifier::tactus_tactic("first | tactus_auto | (intros <;> by_cases _hgate : lib.gate_wrap f = 1 <;> simp_all (config := { zetaDelta := true }))")]
-pub proof fn cso_cons_split(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, h: Box<RawExp>, t: Box<RawExpList>)
-    ensures forall|st: St| #[trigger] close_sem_obligs(hp, he, lv, f, st, RawExpList::Cons(h, t))
-        == (close_sem_e(hp, he, lv, f, st, *h) && close_sem_obligs(hp, he, lv, f, st, *t))
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> by_cases _hgate : lib.gate_wrap pp f = 1 <;> simp_all (config := { zetaDelta := true }))")]
+pub proof fn cso_cons_split(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, h: Box<RawExp>, t: Box<RawExpList>)
+    ensures forall|st: St| #[trigger] close_sem_obligs(pp, hp, he, lv, f, st, RawExpList::Cons(h, t))
+        == (close_sem_e(pp, hp, he, lv, f, st, *h) && close_sem_obligs(pp, hp, he, lv, f, st, *t))
 {
-    u_cso_wrap_mode(hp, he, lv, f, RawExpList::Cons(h, t));
-    u_cse_wrap_mode(hp, he, lv, f, *h);
-    u_cso_wrap_mode(hp, he, lv, f, *t);
+    u_cso_wrap_mode(pp, hp, he, lv, f, RawExpList::Cons(h, t));
+    u_cse_wrap_mode(pp, hp, he, lv, f, *h);
+    u_cso_wrap_mode(pp, hp, he, lv, f, *t);
     cso_cons_split_wrap_lead(hp, he, lv, f, h, t);
-    u_cso_hoist_mode(hp, he, lv, f, RawExpList::Cons(h, t));
-    u_cse_hoist_mode(hp, he, lv, f, *h);
-    u_cso_hoist_mode(hp, he, lv, f, *t);
+    u_cso_hoist_mode(pp, hp, he, lv, f, RawExpList::Cons(h, t));
+    u_cse_hoist_mode(pp, hp, he, lv, f, *h);
+    u_cso_hoist_mode(pp, hp, he, lv, f, *t);
     cso_cons_split_hoist(hp, he, lv, f, h, t);
 }
 
@@ -5870,23 +6035,23 @@ pub proof fn cso_cons_split(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameLi
 //    induction crosses no binder). ──
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
 #[verifier::structural_decreases]
-pub proof fn holds_all_close_each_e(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, l: RawExpList, st: St)
-    ensures holds_all(hp, he, lv, close_each_e(f, l), st)
-        == close_sem_obligs(hp, he, lv, f, st, l)
+pub proof fn holds_all_close_each_e(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, l: RawExpList, st: St)
+    ensures holds_all(hp, he, lv, close_each_e(pp, f, l), st)
+        == close_sem_obligs(pp, hp, he, lv, f, st, l)
     decreases l
 {
     match l {
         RawExpList::Nil => {
-            u_cce_nil(f);
+            u_cce_nil(pp, f);
             u_holds_all_nil(hp, he, lv);
-            cso_nil_true(hp, he, lv, f);
+            cso_nil_true(pp, hp, he, lv, f);
         }
         RawExpList::Cons(h, t) => {
-            u_cce_cons(f, h, t);
-            u_holds_all_cons(hp, he, lv, Box::new(close_e(f, *h)), Box::new(close_each_e(f, *t)));
-            holds_close_e(hp, he, lv, f, *h);
-            cso_cons_split(hp, he, lv, f, h, t);
-            holds_all_close_each_e(hp, he, lv, f, *t, st);      // IH
+            u_cce_cons(pp, f, h, t);
+            u_holds_all_cons(hp, he, lv, Box::new(close_e(pp, f, *h)), Box::new(close_each_e(pp, f, *t)));
+            holds_close_e(pp, hp, he, lv, f, *h);
+            cso_cons_split(pp, hp, he, lv, f, h, t);
+            holds_all_close_each_e(pp, hp, he, lv, f, *t, st);      // IH
         }
     }
 }
@@ -5901,7 +6066,7 @@ pub proof fn holds_all_close_each_e(hp: HpOracle, he: HeOracle, lv: LvOracle, f:
 // match-bound fields positionally, so the arm's call sites are defeq.
 // ═════════════════════════════════════════════════════════════════════
 #[verifier::tactus_tactic("first | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc]) | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
-pub proof fn wp_stm_sound_loop_classical(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList,
+pub proof fn wp_stm_sound_loop_classical(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList,
     inv_hyps: Box<BinderList>, inv_obligs: Box<RawExpList>, inv_obligs_exit: Box<RawExpList>,
     inv_obligs_break: Box<RawExpList>, binders: Box<BinderList>,
     binder_bounds: Box<ParamBoundList>, cond_name: u64, cond_ann: u64, neg_cond_ann: u64,
@@ -5911,41 +6076,41 @@ pub proof fn wp_stm_sound_loop_classical(hp: HpOracle, he: HeOracle, lv: LvOracl
     requires
         is_skip(*setup) == 1,
         holds_all(hp, he, lv,
-            wp_stm(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), st)
-            == exec_safe_f(hp, he, lv, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body, st),
-    ensures holds_all(hp, he, lv, wp_stm(f, StmData::Loop {
+            wp_stm(pp, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), st)
+            == exec_safe_f(pp, hp, he, lv, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body, st),
+    ensures holds_all(hp, he, lv, wp_stm(pp, f, StmData::Loop {
             inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann,
             neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name,
             d_old_eq_prop, decrease_oblig, setup, body,
         }), st)
-        == exec_safe_f(hp, he, lv, f, StmData::Loop {
+        == exec_safe_f(pp, hp, he, lv, f, StmData::Loop {
             inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann,
             neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name,
             d_old_eq_prop, decrease_oblig, setup, body,
         }, st)
 {
-    u_wp_loop(f, inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body);
-    u_esf_loop(hp, he, lv, f, inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body);
+    u_wp_loop(pp, f, inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body);
+    u_esf_loop(pp, hp, he, lv, f, inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body);
     // the three ++ splits (init ++ (body ++ (reclose ++ decrease)))
-    holds_all_append(hp, he, lv, close_each_e(f, *inv_obligs),
-        goals_append(wp_stm(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body),
-            goals_append(close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit),
-                GoalList::Cons(Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)), Box::new(GoalList::Nil)))), st);
-    holds_all_append(hp, he, lv, wp_stm(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body),
-        goals_append(close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit),
-            GoalList::Cons(Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)), Box::new(GoalList::Nil))), st);
-    holds_all_append(hp, he, lv, close_each_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit),
-        GoalList::Cons(Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)), Box::new(GoalList::Nil)), st);
+    holds_all_append(hp, he, lv, close_each_e(pp, f, *inv_obligs),
+        goals_append(wp_stm(pp, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body),
+            goals_append(close_each_e(pp, frame_after(pp, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit),
+                GoalList::Cons(Box::new(close_e(pp, frame_after(pp, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)), Box::new(GoalList::Nil)))), st);
+    holds_all_append(hp, he, lv, wp_stm(pp, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body),
+        goals_append(close_each_e(pp, frame_after(pp, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit),
+            GoalList::Cons(Box::new(close_e(pp, frame_after(pp, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)), Box::new(GoalList::Nil))), st);
+    holds_all_append(hp, he, lv, close_each_e(pp, frame_after(pp, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit),
+        GoalList::Cons(Box::new(close_e(pp, frame_after(pp, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)), Box::new(GoalList::Nil)), st);
     // the four goal groups (body group = the IH fact in `requires`)
-    holds_all_close_each_e(hp, he, lv, f, *inv_obligs, st);          // init
-    holds_all_close_each_e(hp, he, lv, frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit, st);  // maintain-reclose
-    u_holds_all_cons(hp, he, lv, Box::new(close_e(frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)), Box::new(GoalList::Nil));
+    holds_all_close_each_e(pp, hp, he, lv, f, *inv_obligs, st);          // init
+    holds_all_close_each_e(pp, hp, he, lv, frame_after(pp, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), *inv_obligs_exit, st);  // maintain-reclose
+    u_holds_all_cons(hp, he, lv, Box::new(close_e(pp, frame_after(pp, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig)), Box::new(GoalList::Nil));
     u_holds_all_nil(hp, he, lv);
-    holds_close_e(hp, he, lv, frame_after(loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig);  // decrease
+    holds_close_e(pp, hp, he, lv, frame_after(pp, loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop), *body), decrease_oblig);  // decrease
 }
 
 #[verifier::tactus_tactic("first | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc]) | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
-pub proof fn wp_stm_sound_loop_bf(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList,
+pub proof fn wp_stm_sound_loop_bf(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList,
     inv_hyps: Box<BinderList>, inv_obligs: Box<RawExpList>, inv_obligs_exit: Box<RawExpList>,
     inv_obligs_break: Box<RawExpList>, binders: Box<BinderList>,
     binder_bounds: Box<ParamBoundList>, cond_name: u64, cond_ann: u64, neg_cond_ann: u64,
@@ -5955,87 +6120,87 @@ pub proof fn wp_stm_sound_loop_bf(hp: HpOracle, he: HeOracle, lv: LvOracle, f: F
     requires
         is_skip(*setup) != 1,
         holds_all(hp, he, lv,
-            wp_stm(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), st)
-            == exec_safe_f(hp, he, lv, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup, st),
+            wp_stm(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), st)
+            == exec_safe_f(pp, hp, he, lv, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup, st),
         holds_all(hp, he, lv,
-            wp_stm(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), st)
-            == exec_safe_f(hp, he, lv, frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body, st),
+            wp_stm(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), st)
+            == exec_safe_f(pp, hp, he, lv, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body, st),
         holds_all(hp, he, lv,
-            wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup), st)
-            == exec_safe_f(hp, he, lv, loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup, st),
-    ensures holds_all(hp, he, lv, wp_stm(f, StmData::Loop {
+            wp_stm(pp, loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup), st)
+            == exec_safe_f(pp, hp, he, lv, loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup, st),
+    ensures holds_all(hp, he, lv, wp_stm(pp, f, StmData::Loop {
             inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann,
             neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name,
             d_old_eq_prop, decrease_oblig, setup, body,
         }), st)
-        == exec_safe_f(hp, he, lv, f, StmData::Loop {
+        == exec_safe_f(pp, hp, he, lv, f, StmData::Loop {
             inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann,
             neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name,
             d_old_eq_prop, decrease_oblig, setup, body,
         }, st)
 {
-    u_wp_loop(f, inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body);
-    u_esf_loop(hp, he, lv, f, inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body);
+    u_wp_loop(pp, f, inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body);
+    u_esf_loop(pp, hp, he, lv, f, inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body);
     // the six ++ splits (init ++ setup ++ exit-reclose ++ body
     // ++ maintain-reclose ++ (decrease ++ replay))
-    holds_all_append(hp, he, lv, close_each_e(f, *inv_obligs),
+    holds_all_append(hp, he, lv, close_each_e(pp, f, *inv_obligs),
         goals_append(
-            wp_stm(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup),
+            wp_stm(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup),
             goals_append(
-                close_each_e(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil))), *inv_obligs_break),
+                close_each_e(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil))), *inv_obligs_break),
                 goals_append(
-                    wp_stm(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
+                    wp_stm(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
                     goals_append(
-                        close_each_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
+                        close_each_e(pp, frame_after(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
                         goals_append(
-                            GoalList::Cons(Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
-                            wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup)))))), st);
+                            GoalList::Cons(Box::new(close_e(pp, frame_after(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
+                            wp_stm(pp, loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup)))))), st);
     holds_all_append(hp, he, lv,
-        wp_stm(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup),
+        wp_stm(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup),
         goals_append(
-            close_each_e(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil))), *inv_obligs_break),
+            close_each_e(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil))), *inv_obligs_break),
             goals_append(
-                wp_stm(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
+                wp_stm(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
                 goals_append(
-                    close_each_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
+                    close_each_e(pp, frame_after(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
                     goals_append(
-                        GoalList::Cons(Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
-                        wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup))))), st);
+                        GoalList::Cons(Box::new(close_e(pp, frame_after(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
+                        wp_stm(pp, loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup))))), st);
     holds_all_append(hp, he, lv,
-        close_each_e(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil))), *inv_obligs_break),
+        close_each_e(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil))), *inv_obligs_break),
         goals_append(
-            wp_stm(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
+            wp_stm(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
             goals_append(
-                close_each_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
+                close_each_e(pp, frame_after(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
                 goals_append(
-                    GoalList::Cons(Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
-                    wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup)))), st);
+                    GoalList::Cons(Box::new(close_e(pp, frame_after(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
+                    wp_stm(pp, loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup)))), st);
     holds_all_append(hp, he, lv,
-        wp_stm(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
+        wp_stm(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
         goals_append(
-            close_each_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
+            close_each_e(pp, frame_after(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
             goals_append(
-                GoalList::Cons(Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
-                wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup))), st);
+                GoalList::Cons(Box::new(close_e(pp, frame_after(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
+                wp_stm(pp, loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup))), st);
     holds_all_append(hp, he, lv,
-        close_each_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
+        close_each_e(pp, frame_after(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), *inv_obligs_exit),
         goals_append(
-            GoalList::Cons(Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
-            wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup)), st);
+            GoalList::Cons(Box::new(close_e(pp, frame_after(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
+            wp_stm(pp, loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup)), st);
     holds_all_append(hp, he, lv,
-        GoalList::Cons(Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
-        wp_stm(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup), st);
+        GoalList::Cons(Box::new(close_e(pp, frame_after(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil)),
+        wp_stm(pp, loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), *setup), st);
     // the seven goal groups (the three wp_stm groups = the IH facts)
-    holds_all_close_each_e(hp, he, lv, f, *inv_obligs, st);          // init
-    holds_all_close_each_e(hp, he, lv,
-        frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil))),
+    holds_all_close_each_e(pp, hp, he, lv, f, *inv_obligs, st);          // init
+    holds_all_close_each_e(pp, hp, he, lv,
+        frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, break_guard_ann, cond_poison, Box::new(FrameList::FNil))),
         *inv_obligs_break, st);                                      // exit-reclose
-    holds_all_close_each_e(hp, he, lv,
-        frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
+    holds_all_close_each_e(pp, hp, he, lv,
+        frame_after(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body),
         *inv_obligs_exit, st);                                       // maintain-reclose
-    u_holds_all_cons(hp, he, lv, Box::new(close_e(frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil));
+    u_holds_all_cons(hp, he, lv, Box::new(close_e(pp, frame_after(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig)), Box::new(GoalList::Nil));
     u_holds_all_nil(hp, he, lv);
-    holds_close_e(hp, he, lv, frame_after(frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig);  // decrease
+    holds_close_e(pp, hp, he, lv, frame_after(pp, frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))), *body), decrease_oblig);  // decrease
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -6065,98 +6230,98 @@ pub proof fn wp_stm_sound_loop_bf(hp: HpOracle, he: HeOracle, lv: LvOracle, f: F
 #[verifier::tactus_tactic("first | (intros <;> cases s <;> omega) | (intros <;> (try constructor) <;> cases s <;> (try contradiction) <;> assumption) | (intros <;> cases s <;> simp_all (config := { zetaDelta := true }) [and_assoc] <;> omega) | tactus_auto | (intros <;> tactus_case_split (simp_all (config := { zetaDelta := true }) [and_assoc]))")]
 #[verifier::structural_decreases]
 #[verifier::heartbeats(1600000)]
-pub proof fn wp_stm_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, s: StmData, st: St)
-    ensures holds_all(hp, he, lv, wp_stm(f, s), st) == exec_safe_f(hp, he, lv, f, s, st)
+pub proof fn wp_stm_sound(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, s: StmData, st: St)
+    ensures holds_all(hp, he, lv, wp_stm(pp, f, s), st) == exec_safe_f(pp, hp, he, lv, f, s, st)
     decreases s
 {
     match s {
         StmData::Assert(o, hn, h, hpz) => {
-            u_wp_assert(f, o, hn, h, hpz);
-            u_holds_all_cons(hp, he, lv, Box::new(close_e(f, o)), Box::new(GoalList::Nil));
+            u_wp_assert(pp, f, o, hn, h, hpz);
+            u_holds_all_cons(hp, he, lv, Box::new(close_e(pp, f, o)), Box::new(GoalList::Nil));
             u_holds_all_nil(hp, he, lv);
-            holds_close_e(hp, he, lv, f, o);
-            u_esf_assert(hp, he, lv, f, o, hn, h, hpz);
+            holds_close_e(pp, hp, he, lv, f, o);
+            u_esf_assert(pp, hp, he, lv, f, o, hn, h, hpz);
         }
         StmData::Assume(hn, e, hpz) => {
-            u_wp_assume(f, hn, e, hpz);
+            u_wp_assume(pp, f, hn, e, hpz);
             u_holds_all_nil(hp, he, lv);
-            u_esf_assume(hp, he, lv, f, hn, e, hpz);
+            u_esf_assume(pp, hp, he, lv, f, hn, e, hpz);
         }
         StmData::Assign(x, rhs) => {
-            u_wp_assign(f, x, rhs);
+            u_wp_assign(pp, f, x, rhs);
             u_holds_all_nil(hp, he, lv);
-            u_esf_assign(hp, he, lv, f, x, rhs);
+            u_esf_assign(pp, hp, he, lv, f, x, rhs);
         }
         StmData::AssignH(x, ty, v, en, ep) => {
-            u_wp_assignh(f, x, ty, v, en, ep);
+            u_wp_assignh(pp, f, x, ty, v, en, ep);
             u_holds_all_nil(hp, he, lv);
-            u_esf_assignh(hp, he, lv, f, x, ty, v, en, ep);
+            u_esf_assignh(pp, hp, he, lv, f, x, ty, v, en, ep);
         }
         StmData::AssignR(x, v) => {
-            u_wp_assignr(f, x, v);
+            u_wp_assignr(pp, f, x, v);
             u_holds_all_nil(hp, he, lv);
-            u_esf_assignr(hp, he, lv, f, x, v);
+            u_esf_assignr(pp, hp, he, lv, f, x, v);
         }
         StmData::Call { reqs, post } => {
-            u_wp_call(f, reqs, post);
-            holds_all_close_each_e(hp, he, lv, f, *reqs, st);
-            u_esf_call(hp, he, lv, f, reqs, post);
+            u_wp_call(pp, f, reqs, post);
+            holds_all_close_each_e(pp, hp, he, lv, f, *reqs, st);
+            u_esf_call(pp, hp, he, lv, f, reqs, post);
         }
         StmData::DeadEnd(b) => {
-            u_wp_deadend(f, b);
-            u_esf_deadend(hp, he, lv, f, b);
-            wp_stm_sound(hp, he, lv, f, *b, st);                // IH
+            u_wp_deadend(pp, f, b);
+            u_esf_deadend(pp, hp, he, lv, f, b);
+            wp_stm_sound(pp, hp, he, lv, f, *b, st);                // IH
         }
         StmData::AssertQueryNl(b, tq) => {
-            u_wp_aqnl(f, b, tq);
-            u_esf_aqnl(hp, he, lv, f, b, tq);
-            wp_stm_sound(hp, he, lv, strip_hyps(f), *b, st);    // IH at the stripped frame
+            u_wp_aqnl(pp, f, b, tq);
+            u_esf_aqnl(pp, hp, he, lv, f, b, tq);
+            wp_stm_sound(pp, hp, he, lv, strip_hyps(f), *b, st);    // IH at the stripped frame
             // The appended degenerate-True goal closes under the
             // post-body frame (the query's own accumulated hyps).
             holds_all_append(hp, he, lv,
-                wp_stm(strip_hyps(f), *b),
+                wp_stm(pp, strip_hyps(f), *b),
                 GoalList::Cons(
-                    Box::new(close_e(frame_after(strip_hyps(f), *b), tq)),
+                    Box::new(close_e(pp, frame_after(pp, strip_hyps(f), *b), tq)),
                     Box::new(GoalList::Nil)),
                 st);
             u_holds_all_cons(hp, he, lv,
-                Box::new(close_e(frame_after(strip_hyps(f), *b), tq)),
+                Box::new(close_e(pp, frame_after(pp, strip_hyps(f), *b), tq)),
                 Box::new(GoalList::Nil));
             u_holds_all_nil(hp, he, lv);
-            holds_close_e(hp, he, lv, frame_after(strip_hyps(f), *b), tq);
+            holds_close_e(pp, hp, he, lv, frame_after(pp, strip_hyps(f), *b), tq);
         }
         StmData::AssertQueryTactus(o, hn, h, hpz) => {
-            u_wp_aqt(f, o, hn, h, hpz);
+            u_wp_aqt(pp, f, o, hn, h, hpz);
             u_holds_all_cons(hp, he, lv,
-                Box::new(close_e(frame_append(f, FrameList::FUserCloser(Box::new(FrameList::FNil))), o)),
+                Box::new(close_e(pp, frame_append(f, FrameList::FUserCloser(Box::new(FrameList::FNil))), o)),
                 Box::new(GoalList::Nil));
             u_holds_all_nil(hp, he, lv);
-            holds_close_e(hp, he, lv,
+            holds_close_e(pp, hp, he, lv,
                 frame_append(f, FrameList::FUserCloser(Box::new(FrameList::FNil))), o);
-            u_esf_aqt(hp, he, lv, f, o, hn, h, hpz);
+            u_esf_aqt(pp, hp, he, lv, f, o, hn, h, hpz);
         }
         StmData::Ret(es, rb) => {
-            u_wp_ret(f, es, rb);
-            holds_all_close_each_e(hp, he, lv, ret_frame(f, rb), *es, st);
-            u_esf_ret(hp, he, lv, f, es, rb);
+            u_wp_ret(pp, f, es, rb);
+            holds_all_close_each_e(pp, hp, he, lv, ret_frame(pp, f, rb), *es, st);
+            u_esf_ret(pp, hp, he, lv, f, es, rb);
         }
         StmData::If(c, cn, nc, ncn, cp, t, e) => {
-            u_wp_if(f, c, cn, nc, ncn, cp, t, e);
-            u_esf_if(hp, he, lv, f, c, cn, nc, ncn, cp, t, e);
+            u_wp_if(pp, f, c, cn, nc, ncn, cp, t, e);
+            u_esf_if(pp, hp, he, lv, f, c, cn, nc, ncn, cp, t, e);
             holds_all_append(hp, he, lv,
-                wp_stm(frame_append(f, FrameList::FHyp(cn, c, cp, Box::new(FrameList::FNil))), *t),
-                wp_stm(frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e), st);
-            wp_stm_sound(hp, he, lv, frame_append(f, FrameList::FHyp(cn, c, cp, Box::new(FrameList::FNil))), *t, st);   // IH
-            wp_stm_sound(hp, he, lv, frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e, st);  // IH
+                wp_stm(pp, frame_append(f, FrameList::FHyp(cn, c, cp, Box::new(FrameList::FNil))), *t),
+                wp_stm(pp, frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e), st);
+            wp_stm_sound(pp, hp, he, lv, frame_append(f, FrameList::FHyp(cn, c, cp, Box::new(FrameList::FNil))), *t, st);   // IH
+            wp_stm_sound(pp, hp, he, lv, frame_append(f, FrameList::FHyp(ncn, nc, cp, Box::new(FrameList::FNil))), *e, st);  // IH
         }
         StmData::IfCtor { pos_binders, eq_name, eq_prop, eq_poison, neg_name, neg_prop, neg_poison, thn, els } => {
-            u_wp_ifctor(f, pos_binders, eq_name, eq_prop, eq_poison, neg_name, neg_prop, neg_poison, thn, els);
-            u_esf_ifctor(hp, he, lv, f, pos_binders, eq_name, eq_prop, eq_poison, neg_name, neg_prop, neg_poison, thn, els);
+            u_wp_ifctor(pp, f, pos_binders, eq_name, eq_prop, eq_poison, neg_name, neg_prop, neg_poison, thn, els);
+            u_esf_ifctor(pp, hp, he, lv, f, pos_binders, eq_name, eq_prop, eq_poison, neg_name, neg_prop, neg_poison, thn, els);
             holds_all_append(hp, he, lv,
-                wp_stm(frame_append(f, ctor_pos_frame(*pos_binders, eq_name, eq_prop, eq_poison)), *thn),
-                wp_stm(frame_append(f, FrameList::FHyp(neg_name, neg_prop, neg_poison, Box::new(FrameList::FNil))), *els), st);
-            wp_stm_sound(hp, he, lv, frame_append(f, ctor_pos_frame(*pos_binders, eq_name, eq_prop, eq_poison)), *thn, st);   // IH
-            wp_stm_sound(hp, he, lv, frame_append(f, FrameList::FHyp(neg_name, neg_prop, neg_poison, Box::new(FrameList::FNil))), *els, st);  // IH
+                wp_stm(pp, frame_append(f, ctor_pos_frame(*pos_binders, eq_name, eq_prop, eq_poison)), *thn),
+                wp_stm(pp, frame_append(f, FrameList::FHyp(neg_name, neg_prop, neg_poison, Box::new(FrameList::FNil))), *els), st);
+            wp_stm_sound(pp, hp, he, lv, frame_append(f, ctor_pos_frame(*pos_binders, eq_name, eq_prop, eq_poison)), *thn, st);   // IH
+            wp_stm_sound(pp, hp, he, lv, frame_append(f, FrameList::FHyp(neg_name, neg_prop, neg_poison, Box::new(FrameList::FNil))), *els, st);  // IH
         }
         StmData::Loop { inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body } => {
             // NO `let mframe/endf` bindings and the IHs come FIRST: Rust lets
@@ -6173,42 +6338,42 @@ pub proof fn wp_stm_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList
             // Tactus backend: lemma-call posts are DROPPED from assert-by
             // blocks — the assert's VC sees only `True` — so the closer
             // had to re-prove the IH equalities from scratch. gate-4.)
-            wp_stm_sound(hp, he, lv,
+            wp_stm_sound(pp, hp, he, lv,
                 loop_maintain_frame(f, *inv_hyps, *binders, *binder_bounds, cond_name, cond_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop),
                 *body, st);                                                  // IH (classical body)
-            wp_stm_sound(hp, he, lv,
+            wp_stm_sound(pp, hp, he, lv,
                 frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)),
                 *setup, st);                                                 // IH (break-form setup, body run)
-            wp_stm_sound(hp, he, lv,
-                frame_append(frame_after(frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))),
+            wp_stm_sound(pp, hp, he, lv,
+                frame_append(frame_after(pp, frame_append(loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds), d_old_frame(d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop)), *setup), FrameList::FHyp(cond_name, neg_neg_cond_ann, cond_poison, Box::new(FrameList::FNil))),
                 *body, st);                                                  // IH (break-form body)
-            wp_stm_sound(hp, he, lv,
+            wp_stm_sound(pp, hp, he, lv,
                 loop_telescope_base(f, *inv_hyps, *binders, *binder_bounds),
                 *setup, st);                                                 // IH (break-form setup, exit replay)
             if is_skip(*setup) == 1 {
-                wp_stm_sound_loop_classical(hp, he, lv, f, inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body, st);
+                wp_stm_sound_loop_classical(pp, hp, he, lv, f, inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body, st);
             } else {
-                wp_stm_sound_loop_bf(hp, he, lv, f, inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body, st);
+                wp_stm_sound_loop_bf(pp, hp, he, lv, f, inv_hyps, inv_obligs, inv_obligs_exit, inv_obligs_break, binders, binder_bounds, cond_name, cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann, cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop, decrease_oblig, setup, body, st);
             }
         }
         StmData::Skip => {
-            u_wp_skip(f);
+            u_wp_skip(pp, f);
             u_holds_all_nil(hp, he, lv);
-            u_esf_skip(hp, he, lv, f);
+            u_esf_skip(pp, hp, he, lv, f);
         }
         StmData::Seq(a, b) => {
-            u_wp_seq(f, a, b);
-            u_esf_seq(hp, he, lv, f, a, b);
-            holds_all_append(hp, he, lv, wp_stm(f, *a), wp_stm(frame_after(f, *a), *b), st);
-            wp_stm_sound(hp, he, lv, f, *a, st);                             // IH
-            wp_stm_sound(hp, he, lv, frame_after(f, *a), *b, st);            // IH (shifted frame)
+            u_wp_seq(pp, f, a, b);
+            u_esf_seq(pp, hp, he, lv, f, a, b);
+            holds_all_append(hp, he, lv, wp_stm(pp, f, *a), wp_stm(pp, frame_after(pp, f, *a), *b), st);
+            wp_stm_sound(pp, hp, he, lv, f, *a, st);                             // IH
+            wp_stm_sound(pp, hp, he, lv, frame_after(pp, f, *a), *b, st);            // IH (shifted frame)
         }
     }
 }
 
 // ref_wp unfold + top-level soundness through the genuine seed_frame.
 pub proof fn u_ref_wp(c: FnCtxData, s: StmData)
-    ensures ref_wp(c, s) == wp_stm(seed_frame(c), s)
+    ensures ref_wp(c, s) == wp_stm(poisoned_props(c.residue_names, c.prop_deeps), seed_frame(c), s)
 {}
 
 /// THE LOOP-CLOSURE THEOREM (hand-Lean `ref_wp_sound`): the emitted
@@ -6217,25 +6382,25 @@ pub proof fn u_ref_wp(c: FnCtxData, s: StmData)
 /// triple consistent with the leaf typing (valuation-parametric).
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc])")]
 pub proof fn ref_wp_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, c: FnCtxData, s: StmData, st: St)
-    ensures holds_all(hp, he, lv, ref_wp(c, s), st) == exec_safe_f(hp, he, lv, seed_frame(c), s, st)
+    ensures holds_all(hp, he, lv, ref_wp(c, s), st) == exec_safe_f(poisoned_props(c.residue_names, c.prop_deeps), hp, he, lv, seed_frame(c), s, st)
 {
     u_ref_wp(c, s);
-    wp_stm_sound(hp, he, lv, seed_frame(c), s, st);
+    wp_stm_sound(poisoned_props(c.residue_names, c.prop_deeps), hp, he, lv, seed_frame(c), s, st);
 }
 
 // ── W5 frame-algebra one-step unfolds (bootstrap-65): the frame_after /
 //    frame_append arms the prophecy/closure corollaries reduce through.
 //    Data-only, probe32 empty shape. ──
 
-pub proof fn u_fa_assume(f: FrameList, e: u64)
-    ensures frame_after(f, StmData::Assume(0, e, 0))
+pub proof fn u_fa_assume(pp: LeafList, f: FrameList, e: u64)
+    ensures frame_after(pp, f, StmData::Assume(0, e, 0))
         == frame_append(f, FrameList::FHyp(0, e, 0, Box::new(FrameList::FNil)))
 {}
-pub proof fn u_fa_deadend(f: FrameList, b: Box<StmData>)
-    ensures frame_after(f, StmData::DeadEnd(b)) == f
+pub proof fn u_fa_deadend(pp: LeafList, f: FrameList, b: Box<StmData>)
+    ensures frame_after(pp, f, StmData::DeadEnd(b)) == f
 {}
-pub proof fn u_fa_seq(f: FrameList, a: Box<StmData>, b: Box<StmData>)
-    ensures frame_after(f, StmData::Seq(a, b)) == frame_after(frame_after(f, *a), *b)
+pub proof fn u_fa_seq(pp: LeafList, f: FrameList, a: Box<StmData>, b: Box<StmData>)
+    ensures frame_after(pp, f, StmData::Seq(a, b)) == frame_after(pp, frame_after(pp, f, *a), *b)
 {}
 pub proof fn u_fapp_fnil(g: FrameList)
     ensures frame_append(FrameList::FNil, g) == g
@@ -6267,9 +6432,15 @@ pub proof fn u_fapp_fhyp(n: u64, h: u64, p: u64, t: Box<FrameList>, g: FrameList
 /// goal itself); the semantic reading follows via holds_close_e. (In
 /// hoist mode the abstract holds-semantics reads hyp binders as ∀ —
 /// the dependent-product meaning lives in the adequacy layer, exactly
-/// as for the reqs binders.)
-pub proof fn prophecy_sound(xfut: u64, ty: u64, resolve: u64, h: u64, obl: RawExp)
-    ensures wp_stm(FrameList::FBind(xfut, ty, Box::new(FrameList::FNil)),
+/// as for the reqs binders.) (`lib.gate_wrap` in the simp set: the
+/// derived gate needs delta-unfolding to consume the
+/// `leaf_mem pp resolve = 0` side condition — F4.)
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc, lib.gate_wrap])")]
+pub proof fn prophecy_sound(pp: LeafList, xfut: u64, ty: u64, resolve: u64, h: u64, obl: RawExp)
+    // F4: the hoist-mode reading requires the resolve hyp UNPOISONED —
+    // derived now (a membership check on the poison set), not a bit.
+    requires leaf_mem(pp, resolve) == 0,
+    ensures wp_stm(pp, FrameList::FBind(xfut, ty, Box::new(FrameList::FNil)),
             StmData::Seq(
                 Box::new(StmData::Assume(0, resolve, 0)),
                 Box::new(StmData::Assert(obl, 0, h, 0))))
@@ -6281,20 +6452,23 @@ pub proof fn prophecy_sound(xfut: u64, ty: u64, resolve: u64, h: u64, obl: RawEx
 {
     let f = FrameList::FBind(xfut, ty, Box::new(FrameList::FNil));
     let fh = FrameList::FBind(xfut, ty, Box::new(FrameList::FHyp(0, resolve, 0, Box::new(FrameList::FNil))));
-    u_wp_seq(f, Box::new(StmData::Assume(0, resolve, 0)), Box::new(StmData::Assert(obl, 0, h, 0)));
-    u_wp_assume(f, 0, resolve, 0);
-    u_fa_assume(f, resolve);
+    u_wp_seq(pp, f, Box::new(StmData::Assume(0, resolve, 0)), Box::new(StmData::Assert(obl, 0, h, 0)));
+    u_wp_assume(pp, f, 0, resolve, 0);
+    u_fa_assume(pp, f, resolve);
     u_fapp_fbind(xfut, ty, Box::new(FrameList::FNil), FrameList::FHyp(0, resolve, 0, Box::new(FrameList::FNil)));
     u_fapp_fnil(FrameList::FHyp(0, resolve, 0, Box::new(FrameList::FNil)));
-    u_wp_assert(fh, obl, 0, h, 0);
-    u_gapp_nil(wp_stm(fh, StmData::Assert(obl, 0, h, 0)));
+    u_wp_assert(pp, fh, obl, 0, h, 0);
+    u_gapp_nil(wp_stm(pp, fh, StmData::Assert(obl, 0, h, 0)));
     u_gate_bind(xfut, ty, Box::new(FrameList::FHyp(0, resolve, 0, Box::new(FrameList::FNil))));
     u_gate_hyp(0, resolve, 0, Box::new(FrameList::FNil));
     u_gate_nil();
-    u_gatep_bind(xfut, ty, Box::new(FrameList::FHyp(0, resolve, 0, Box::new(FrameList::FNil))));
-    u_gatep_hyp(0, resolve, 0, Box::new(FrameList::FNil));
-    u_gatep_nil();
-    u_ce_hoist_mode(fh, obl);
+    u_gatep_bind(pp, xfut, ty, Box::new(FrameList::FHyp(0, resolve, 0, Box::new(FrameList::FNil))));
+    u_gatep_hyp(pp, 0, resolve, 0, Box::new(FrameList::FNil));
+    u_gatep_nil(pp, );
+    u_gateu_bind(xfut, ty, Box::new(FrameList::FHyp(0, resolve, 0, Box::new(FrameList::FNil))));
+    u_gateu_hyp(0, resolve, 0, Box::new(FrameList::FNil));
+    u_gateu_nil();
+    u_ce_hoist_mode(pp, fh, obl);
     u_ceh_unfold(fh, obl);
     u_cer_bind(xfut, ty, Box::new(FrameList::FHyp(0, resolve, 0, Box::new(FrameList::FNil))), GoalData::LeafE(render_exp(obl)));
     u_cer_hyp(0, resolve, 0, Box::new(FrameList::FNil), GoalData::LeafE(render_exp(obl)));
@@ -6309,8 +6483,8 @@ pub proof fn prophecy_sound(xfut: u64, ty: u64, resolve: u64, h: u64, obl: RawEx
 /// resolve binder — the pin never reaches an upstream obligation. The
 /// two reduced shapes DIFFERING (All(0, resolve, ·) present vs absent)
 /// is the proof that `frame_after` places the pin temporally correctly.
-pub proof fn prophecy_swapped_sound(xfut: u64, ty: u64, resolve: u64, h: u64, obl: RawExp)
-    ensures wp_stm(FrameList::FBind(xfut, ty, Box::new(FrameList::FNil)),
+pub proof fn prophecy_swapped_sound(pp: LeafList, xfut: u64, ty: u64, resolve: u64, h: u64, obl: RawExp)
+    ensures wp_stm(pp, FrameList::FBind(xfut, ty, Box::new(FrameList::FNil)),
             StmData::Seq(
                 Box::new(StmData::Assert(obl, 0, h, 0)),
                 Box::new(StmData::Assume(0, resolve, 0))))
@@ -6320,16 +6494,16 @@ pub proof fn prophecy_swapped_sound(xfut: u64, ty: u64, resolve: u64, h: u64, ob
             Box::new(GoalList::Nil))
 {
     let f = FrameList::FBind(xfut, ty, Box::new(FrameList::FNil));
-    u_wp_seq(f, Box::new(StmData::Assert(obl, 0, h, 0)), Box::new(StmData::Assume(0, resolve, 0)));
-    u_wp_assert(f, obl, 0, h, 0);
-    u_wp_assume(frame_after(f, StmData::Assert(obl, 0, h, 0)), 0, resolve, 0);
-    u_gapp_cons(Box::new(close_e(f, obl)), Box::new(GoalList::Nil), GoalList::Nil);
+    u_wp_seq(pp, f, Box::new(StmData::Assert(obl, 0, h, 0)), Box::new(StmData::Assume(0, resolve, 0)));
+    u_wp_assert(pp, f, obl, 0, h, 0);
+    u_wp_assume(pp, frame_after(pp, f, StmData::Assert(obl, 0, h, 0)), 0, resolve, 0);
+    u_gapp_cons(Box::new(close_e(pp, f, obl)), Box::new(GoalList::Nil), GoalList::Nil);
     u_gapp_nil(GoalList::Nil);
     u_gate_bind(xfut, ty, Box::new(FrameList::FNil));
     u_gate_nil();
-    u_gatep_bind(xfut, ty, Box::new(FrameList::FNil));
-    u_gatep_nil();
-    u_ce_hoist_mode(f, obl);
+    u_gatep_bind(pp, xfut, ty, Box::new(FrameList::FNil));
+    u_gatep_nil(pp, );
+    u_ce_hoist_mode(pp, f, obl);
     u_ceh_unfold(f, obl);
     u_cer_bind(xfut, ty, Box::new(FrameList::FNil), GoalData::LeafE(render_exp(obl)));
     u_cer_nil(GoalData::LeafE(render_exp(obl)));
@@ -6342,41 +6516,41 @@ pub proof fn prophecy_swapped_sound(xfut: u64, ty: u64, resolve: u64, h: u64, ob
 /// actual Verus lowering — reduces EXACTLY to the body obligation under
 /// the ENCLOSING frame: wrapper and Assume add nothing.
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc])")]
-pub proof fn closure_creation_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, body: Box<StmData>, ext: u64, st: St)
+pub proof fn closure_creation_sound(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, body: Box<StmData>, ext: u64, st: St)
     ensures holds_all(hp, he, lv,
-            wp_stm(f, StmData::Seq(
+            wp_stm(pp, f, StmData::Seq(
                 Box::new(StmData::DeadEnd(body)),
                 Box::new(StmData::Assume(0, ext, 0)))), st)
-        == exec_safe_f(hp, he, lv, f, *body, st)
+        == exec_safe_f(pp, hp, he, lv, f, *body, st)
 {
-    wp_stm_sound(hp, he, lv, f,
+    wp_stm_sound(pp, hp, he, lv, f,
         StmData::Seq(Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(0, ext, 0))), st);
-    u_esf_seq(hp, he, lv, f, Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(0, ext, 0)));
-    u_esf_deadend(hp, he, lv, f, body);
-    u_fa_deadend(f, body);
-    u_esf_assume(hp, he, lv, frame_after(f, StmData::DeadEnd(body)), 0, ext, 0);
+    u_esf_seq(pp, hp, he, lv, f, Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(0, ext, 0)));
+    u_esf_deadend(pp, hp, he, lv, f, body);
+    u_fa_deadend(pp, f, body);
+    u_esf_assume(pp, hp, he, lv, frame_after(pp, f, StmData::DeadEnd(body)), 0, ext, 0);
 }
 
 /// W5e ISOLATION (probe26 `closure_deadend_isolates`) — STRUCTURAL
 /// post-N1: the closure body's local assumption does NOT leak — the
 /// assert's goal carries NO binder for q.
-pub proof fn closure_deadend_isolates(q: u64, h: u64, obl: RawExp)
-    ensures wp_stm(FrameList::FNil, StmData::Seq(
+pub proof fn closure_deadend_isolates(pp: LeafList, q: u64, h: u64, obl: RawExp)
+    ensures wp_stm(pp, FrameList::FNil, StmData::Seq(
                 Box::new(StmData::DeadEnd(Box::new(StmData::Assume(0, q, 0)))),
                 Box::new(StmData::Assert(obl, 0, h, 0))))
         == GoalList::Cons(Box::new(GoalData::LeafE(render_exp(obl))), Box::new(GoalList::Nil))
 {
-    u_wp_seq(FrameList::FNil,
+    u_wp_seq(pp, FrameList::FNil,
         Box::new(StmData::DeadEnd(Box::new(StmData::Assume(0, q, 0)))),
         Box::new(StmData::Assert(obl, 0, h, 0)));
-    u_wp_deadend(FrameList::FNil, Box::new(StmData::Assume(0, q, 0)));
-    u_wp_assume(FrameList::FNil, 0, q, 0);
-    u_fa_deadend(FrameList::FNil, Box::new(StmData::Assume(0, q, 0)));
-    u_wp_assert(FrameList::FNil, obl, 0, h, 0);
-    u_gapp_nil(wp_stm(FrameList::FNil, StmData::Assert(obl, 0, h, 0)));
+    u_wp_deadend(pp, FrameList::FNil, Box::new(StmData::Assume(0, q, 0)));
+    u_wp_assume(pp, FrameList::FNil, 0, q, 0);
+    u_fa_deadend(pp, FrameList::FNil, Box::new(StmData::Assume(0, q, 0)));
+    u_wp_assert(pp, FrameList::FNil, obl, 0, h, 0);
+    u_gapp_nil(wp_stm(pp, FrameList::FNil, StmData::Assert(obl, 0, h, 0)));
     u_gate_nil();
-    u_gatep_nil();
-    u_ce_hoist_mode(FrameList::FNil, obl);
+    u_gatep_nil(pp, );
+    u_ce_hoist_mode(pp, FrameList::FNil, obl);
     u_ceh_unfold(FrameList::FNil, obl);
     u_cer_nil(GoalData::LeafE(render_exp(obl)));
     u_cet_nil(GoalData::LeafE(render_exp(obl)));
@@ -6385,9 +6559,13 @@ pub proof fn closure_deadend_isolates(q: u64, h: u64, obl: RawExp)
 /// W5e DISCRIMINATOR (probe26 `seq_assume_gates`) — STRUCTURAL: the
 /// BARE `Seq (Assume q) (Assert P)` (no DeadEnd) DOES bind q over the
 /// assert — the hoisted hyp binder All(0, q, ·) present here and absent
-/// above is the proof the DeadEnd quarantines.
-pub proof fn seq_assume_gates(q: u64, h: u64, obl: RawExp)
-    ensures wp_stm(FrameList::FNil, StmData::Seq(
+/// above is the proof the DeadEnd quarantines. (`lib.gate_wrap` in the
+/// simp set: consume the `leaf_mem pp q = 0` side condition — F4.)
+#[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc, lib.gate_wrap])")]
+pub proof fn seq_assume_gates(pp: LeafList, q: u64, h: u64, obl: RawExp)
+    // F4: hoist mode requires the assumed hyp unpoisoned (derived).
+    requires leaf_mem(pp, q) == 0,
+    ensures wp_stm(pp, FrameList::FNil, StmData::Seq(
                 Box::new(StmData::Assume(0, q, 0)),
                 Box::new(StmData::Assert(obl, 0, h, 0))))
         == GoalList::Cons(
@@ -6395,17 +6573,19 @@ pub proof fn seq_assume_gates(q: u64, h: u64, obl: RawExp)
             Box::new(GoalList::Nil))
 {
     let fh = FrameList::FHyp(0, q, 0, Box::new(FrameList::FNil));
-    u_wp_seq(FrameList::FNil, Box::new(StmData::Assume(0, q, 0)), Box::new(StmData::Assert(obl, 0, h, 0)));
-    u_wp_assume(FrameList::FNil, 0, q, 0);
-    u_fa_assume(FrameList::FNil, q);
+    u_wp_seq(pp, FrameList::FNil, Box::new(StmData::Assume(0, q, 0)), Box::new(StmData::Assert(obl, 0, h, 0)));
+    u_wp_assume(pp, FrameList::FNil, 0, q, 0);
+    u_fa_assume(pp, FrameList::FNil, q);
     u_fapp_fnil(fh);
-    u_wp_assert(fh, obl, 0, h, 0);
-    u_gapp_nil(wp_stm(fh, StmData::Assert(obl, 0, h, 0)));
+    u_wp_assert(pp, fh, obl, 0, h, 0);
+    u_gapp_nil(wp_stm(pp, fh, StmData::Assert(obl, 0, h, 0)));
     u_gate_hyp(0, q, 0, Box::new(FrameList::FNil));
     u_gate_nil();
-    u_gatep_hyp(0, q, 0, Box::new(FrameList::FNil));
-    u_gatep_nil();
-    u_ce_hoist_mode(fh, obl);
+    u_gatep_hyp(pp, 0, q, 0, Box::new(FrameList::FNil));
+    u_gatep_nil(pp, );
+    u_gateu_hyp(0, q, 0, Box::new(FrameList::FNil));
+    u_gateu_nil();
+    u_ce_hoist_mode(pp, fh, obl);
     u_ceh_unfold(fh, obl);
     u_cer_hyp(0, q, 0, Box::new(FrameList::FNil), GoalData::LeafE(render_exp(obl)));
     u_cer_nil(GoalData::LeafE(render_exp(obl)));
@@ -6424,37 +6604,39 @@ pub proof fn seq_assume_gates(q: u64, h: u64, obl: RawExp)
 /// for free, but this corollary applies the pin straight-line, so the
 /// closer must delta-unfold the gate to the u_gate*/u_gatep* facts.)
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc, lib.gate_wrap])")]
-pub proof fn closure_forwards_contract(hp: HpOracle, he: HeOracle, lv: LvOracle, body: Box<StmData>, ext: u64, h: u64, obl: RawExp, st: St)
+pub proof fn closure_forwards_contract(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, body: Box<StmData>, ext: u64, h: u64, obl: RawExp, st: St)
+    // F4: hoist mode requires the threaded hyp unpoisoned (derived).
+    requires leaf_mem(pp, ext) == 0,
     ensures holds_all(hp, he, lv,
-            wp_stm(FrameList::FNil, StmData::Seq(
+            wp_stm(pp, FrameList::FNil, StmData::Seq(
                 Box::new(StmData::Seq(
                     Box::new(StmData::DeadEnd(body)),
                     Box::new(StmData::Assume(0, ext, 0)))),
                 Box::new(StmData::Assert(obl, 0, h, 0)))), st)
-        == (exec_safe_f(hp, he, lv, FrameList::FNil, *body, st)
+        == (exec_safe_f(pp, hp, he, lv, FrameList::FNil, *body, st)
             && (forall|v: int| #[trigger] he(render_exp(obl), upd(st, 0, v))))
 {
-    wp_stm_sound(hp, he, lv, FrameList::FNil, StmData::Seq(
+    wp_stm_sound(pp, hp, he, lv, FrameList::FNil, StmData::Seq(
         Box::new(StmData::Seq(Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(0, ext, 0)))),
         Box::new(StmData::Assert(obl, 0, h, 0))), st);
-    u_esf_seq(hp, he, lv, FrameList::FNil,
+    u_esf_seq(pp, hp, he, lv, FrameList::FNil,
         Box::new(StmData::Seq(Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(0, ext, 0)))),
         Box::new(StmData::Assert(obl, 0, h, 0)));
-    u_esf_seq(hp, he, lv, FrameList::FNil, Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(0, ext, 0)));
-    u_esf_deadend(hp, he, lv, FrameList::FNil, body);
-    u_fa_deadend(FrameList::FNil, body);
-    u_esf_assume(hp, he, lv, frame_after(FrameList::FNil, StmData::DeadEnd(body)), 0, ext, 0);
-    u_fa_seq(FrameList::FNil, Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(0, ext, 0)));
-    u_fa_assume(frame_after(FrameList::FNil, StmData::DeadEnd(body)), ext);
+    u_esf_seq(pp, hp, he, lv, FrameList::FNil, Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(0, ext, 0)));
+    u_esf_deadend(pp, hp, he, lv, FrameList::FNil, body);
+    u_fa_deadend(pp, FrameList::FNil, body);
+    u_esf_assume(pp, hp, he, lv, frame_after(pp, FrameList::FNil, StmData::DeadEnd(body)), 0, ext, 0);
+    u_fa_seq(pp, FrameList::FNil, Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(0, ext, 0)));
+    u_fa_assume(pp, frame_after(pp, FrameList::FNil, StmData::DeadEnd(body)), ext);
     u_fapp_fnil(FrameList::FHyp(0, ext, 0, Box::new(FrameList::FNil)));
-    u_esf_assert(hp, he, lv, FrameList::FHyp(0, ext, 0, Box::new(FrameList::FNil)), obl, 0, h, 0);
+    u_esf_assert(pp, hp, he, lv, FrameList::FHyp(0, ext, 0, Box::new(FrameList::FNil)), obl, 0, h, 0);
     u_gate_hyp(0, ext, 0, Box::new(FrameList::FNil));
     u_gate_nil();
-    u_gatep_hyp(0, ext, 0, Box::new(FrameList::FNil));
-    u_gatep_nil();
+    u_gatep_hyp(pp, 0, ext, 0, Box::new(FrameList::FNil));
+    u_gatep_nil(pp, );
     u_gateu_hyp(0, ext, 0, Box::new(FrameList::FNil));
     u_gateu_nil();
-    u_cse_hoist_mode(hp, he, lv, FrameList::FHyp(0, ext, 0, Box::new(FrameList::FNil)), obl);
+    u_cse_hoist_mode(pp, hp, he, lv, FrameList::FHyp(0, ext, 0, Box::new(FrameList::FNil)), obl);
     u_cseh_unfold(hp, he, lv, FrameList::FHyp(0, ext, 0, Box::new(FrameList::FNil)), obl);
     u_cset_hyp(hp, he, lv, 0, ext, 0, Box::new(FrameList::FNil), FrameList::FHyp(0, ext, 0, Box::new(FrameList::FNil)), obl);
     u_cset_nil(hp, he, lv, FrameList::FHyp(0, ext, 0, Box::new(FrameList::FNil)), obl);
@@ -6468,13 +6650,13 @@ pub proof fn closure_forwards_contract(hp: HpOracle, he: HeOracle, lv: LvOracle,
 // (1) Assert under the empty frame: the emitted goal forces the deep
 //     obligation at the very state.
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc])")]
-pub proof fn wp_sound_bites_assert(hp: HpOracle, he: HeOracle, lv: LvOracle, o: RawExp, h: u64, st: St)
-    requires holds_all(hp, he, lv, wp_stm(FrameList::FNil, StmData::Assert(o, 0, h, 0)), st)
+pub proof fn wp_sound_bites_assert(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, o: RawExp, h: u64, st: St)
+    requires holds_all(hp, he, lv, wp_stm(pp, FrameList::FNil, StmData::Assert(o, 0, h, 0)), st)
     ensures he(render_exp(o), st)
 {
-    wp_stm_sound(hp, he, lv, FrameList::FNil, StmData::Assert(o, 0, h, 0), st);
-    u_esf_assert(hp, he, lv, FrameList::FNil, o, 0, h, 0);
-    u_cse_nil(hp, he, lv, o);
+    wp_stm_sound(pp, hp, he, lv, FrameList::FNil, StmData::Assert(o, 0, h, 0), st);
+    u_esf_assert(pp, hp, he, lv, FrameList::FNil, o, 0, h, 0);
+    u_cse_nil(pp, hp, he, lv, o);
 }
 
 // (2) Loop INIT (probe24 witness 1): the invariant obligation must hold
@@ -6484,12 +6666,12 @@ pub proof fn wp_sound_bites_assert(hp: HpOracle, he: HeOracle, lv: LvOracle, o: 
 //     == 1` in u_esf_loop's post is a CLOSED ite here (setup = Skip) —
 //     the equation lemmas reduce it where the default set stalls.
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc, lib.is_skip])")]
-pub proof fn wp_sound_bites_loop_init(hp: HpOracle, he: HeOracle, lv: LvOracle,
+pub proof fn wp_sound_bites_loop_init(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle,
     inv_hyps: Box<BinderList>, ob: Box<RawExp>, binders: Box<BinderList>,
     binder_bounds: Box<ParamBoundList>, cond_name: u64, cond_ann: u64, neg_cond_ann: u64,
     cond_poison: u64, d_old_name: u64, d_old_ty: u64, d_old_val: u64, d_old_eq_name: u64,
     d_old_eq_prop: u64, decrease_oblig: RawExp, body: Box<StmData>, st: St)
-    requires holds_all(hp, he, lv, wp_stm(FrameList::FNil, StmData::Loop {
+    requires holds_all(hp, he, lv, wp_stm(pp, FrameList::FNil, StmData::Loop {
             inv_hyps,
             inv_obligs: Box::new(RawExpList::Cons(ob, Box::new(RawExpList::Nil))),
             inv_obligs_exit: Box::new(RawExpList::Cons(ob, Box::new(RawExpList::Nil))),
@@ -6503,7 +6685,7 @@ pub proof fn wp_sound_bites_loop_init(hp: HpOracle, he: HeOracle, lv: LvOracle,
         }), st)
     ensures he(render_exp(*ob), st)
 {
-    wp_stm_sound(hp, he, lv, FrameList::FNil, StmData::Loop {
+    wp_stm_sound(pp, hp, he, lv, FrameList::FNil, StmData::Loop {
         inv_hyps,
         inv_obligs: Box::new(RawExpList::Cons(ob, Box::new(RawExpList::Nil))),
         inv_obligs_exit: Box::new(RawExpList::Cons(ob, Box::new(RawExpList::Nil))),
@@ -6515,7 +6697,7 @@ pub proof fn wp_sound_bites_loop_init(hp: HpOracle, he: HeOracle, lv: LvOracle,
         cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop,
         decrease_oblig, setup: Box::new(StmData::Skip), body,
     }, st);
-    u_esf_loop(hp, he, lv, FrameList::FNil, inv_hyps,
+    u_esf_loop(pp, hp, he, lv, FrameList::FNil, inv_hyps,
         Box::new(RawExpList::Cons(ob, Box::new(RawExpList::Nil))),
         Box::new(RawExpList::Cons(ob, Box::new(RawExpList::Nil))),
         Box::new(RawExpList::Nil),
@@ -6523,7 +6705,7 @@ pub proof fn wp_sound_bites_loop_init(hp: HpOracle, he: HeOracle, lv: LvOracle,
         999999, 999999, 999999,
         cond_poison, d_old_name, d_old_ty, d_old_val, d_old_eq_name, d_old_eq_prop,
         decrease_oblig, Box::new(StmData::Skip), body);
-    u_cso_nil(hp, he, lv, RawExpList::Cons(ob, Box::new(RawExpList::Nil)));
+    u_cso_nil(pp, hp, he, lv, RawExpList::Cons(ob, Box::new(RawExpList::Nil)));
     u_obligs_cons(he, ob, Box::new(RawExpList::Nil));
 }
 
