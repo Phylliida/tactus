@@ -2855,15 +2855,35 @@ impl<'a> Serializer<'a> {
                 let Some(vid) = crate::sst_to_lean::extract_simple_var_ident(&lhs.dest) else {
                     return Err("assign-field-path".to_string());
                 };
-                // Render the rhs ONCE as an LExpr — the value leaf, the
-                // hoist equation prop, and the poison check all read it.
-                // The rhs is scoped to the PREVIOUS binding, so the
-                // shadow renames apply BEFORE this dest's own freshening
-                // (`i := i + 1` keeps plain `i`; the next use is
-                // `i_hoist1`).
-                let rhs_lx_raw = crate::to_lean_sst_expr::sst_exp_to_ast_checked(rhs)
+                // Render + COERCE the rhs exactly as production's
+                // `walk_let` (sst_to_lean.rs:5704-5712): the typed spine
+                // with the binder-aware ctx, bridged into the DEST's
+                // declared typ via `into_slot` — a ref-typed value bound
+                // into a bare-typed local gets its `.deref`
+                // (find_cancellation_exec's cond-setup `tmp__6 := w`:
+                // production's hoisted eq is `tmp__6 = w.deref`, the
+                // bare-Var transcription diverged). Identity when
+                // val.typ == dest_typ (the common case; production's
+                // comment). The empty-ctx → binder-ctx switch is
+                // byte-neutral on the closing corpus: the ctx only
+                // affects class-method-call coercion inside the rhs,
+                // which no closing subject carries in an Assign (any
+                // that did would already diverge from production, which
+                // renders with the binder ctx). The value leaf, the
+                // hoist equation prop, and the poison check all read the
+                // coerced form. The rhs is scoped to the PREVIOUS
+                // binding, so the shadow renames apply BEFORE this
+                // dest's own freshening (`i := i + 1` keeps plain `i`;
+                // the next use is `i_hoist1`).
+                let dest_typ = self.local_typs.get(vid).cloned();
+                let rctx = self.render_ctx().with_let_binder_typs(&self.let_binder_typs);
+                let rhs_typed = crate::to_lean_sst_expr::sst_exp_to_typed(rhs, &rctx)
                     .map_err(|reason| format!("leaf-render: {}", reason))?;
-                let rhs_lx = self.apply_renames(&rhs_lx_raw);
+                let rhs_coerced = match &dest_typ {
+                    Some(t) => rhs_typed.into_slot(t),
+                    None => rhs_typed.into_untyped(),
+                };
+                let rhs_lx = self.apply_renames(&rhs_coerced);
                 let rhs_leaf = self.leaves.intern(pp_expr(&rhs_lx));
                 // N1-hoist classification (bootstrap-74 slice 2), mirroring
                 // hoist_all's per-let decision (see `assign_let_term`).
@@ -2873,7 +2893,7 @@ impl<'a> Serializer<'a> {
                 let chosen = self.fresh_let_name(src_name.as_str());
                 let lname = crate::lean_name::LeanName::synthetic(chosen);
                 let dest = self.text_leaf(lname.as_str());
-                Ok(self.assign_let_term(&lname, dest, self.local_typs.get(vid).cloned(), &rhs_lx, rhs_leaf))
+                Ok(self.assign_let_term(&lname, dest, dest_typ, &rhs_lx, rhs_leaf))
             }
 
             StmX::Return { ret_exp, .. } => {
