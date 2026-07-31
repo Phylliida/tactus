@@ -1,5 +1,35 @@
 # NEXT — bootstrap work queue (2026-07-21; superseded 2026-07-24)
 
+**2026-07-31 late pm: stage 2 (F4 poison derivation) LANDED, both
+eras, one session — completion record on the b80 card.** The poison
+mark is DERIVED reference-side now (`poisoned_props(c)` over
+`FnCtxData.residue_names` + the new `prop_deeps` side table) and the
+carried bit slots are DELETED from the vocabulary (FHyp 4→3; Assert
+4→3 / Assume 3→2 / AQT 4→3 / If 7→6 / IfCtor −2 / Loop 21→20).
+`hyp_poison`/`lexpr_mentions_var` retired from the cert path (they
+stay only as the forced-state mirror + emission-time guards); the N2
+IsVariant detector is now the LAST named trusted predicate on the
+cert path (next trust-shrink target after B). The A4 cross-check era
+validated derivation ≡ bit corpus-wide (probe9 33/33 + probe11 11/11
+ALL CLASSIFIED with derivation-driven assembly) BEFORE deletion.
+probe13's poison kills re-pointed at the derivation INPUTS
+(`poison_residue_drop` / `poison_deep_drop`, both flip 1→0; the old
+zero-the-bits `poison_flip` was dead-on-arrival under derivation-driven
+assembly — the review's "(not before)" note was wrong about that).
+Design review landed FIRST (card addendum): the freeze validated +
+the `poisoned_props`-precompute refinement (one threaded param, one
+derivation site). Surprises along the way: the discharge's
+feed_requires needed the pp-first arg layout (+ unit pins);
+`poisoned_props` takes the WHOLE FnCtxData (wf-transport can't do
+`<param>.<field>` projections); find_cancellation_exec's
+`hastype-range`-uncoverable prop needed the bit-gated dummy-deep
+fallback. Battery: gate 291/0 + pkg gate 54 + discharge 198/0,
+probes 9/11/13(22 classes)/14/17/37/38 ✓, units 428+7/0, golden
+re-vendored (era 2). probe20 stays deferred (no tgt gates).
+**NEXT: milestone B (b67 caching + b68 flip — the endgame's 4 gate
+conditions: P2 census-honest, P3 stmts-olean staleness fix +
+emitter-binary cache fingerprint).**
+
 **2026-07-31 pm: A7 scope items 1+3 DONE —
 `board/bootstrap-80-a7-callee-signature-vocab.md` (completion record).**
 probe9 ALL 33 CLOSE (zero honest-fails corpus-wide), probe11 ALL 11 tgt

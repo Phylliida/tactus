@@ -573,3 +573,85 @@ machinery; A4's probes-as-cross-check has the F5/F6 precedent. (b)
 In-place hyp-prop deepening (FHyp carries `RawExp`) — right end state
 at E, wrong increment now (breaks byte-neutrality on every goal); the
 side table migrates cleanly.
+
+## DONE (2026-07-31 late pm, one session) — scope item 2 (F4 poison derivation, BOTH eras)
+
+Design review first (addendum above, commit `6476e11e`): the freeze
+validated against both codebases; ONE refinement adopted
+(`poisoned_props` precomputed once at `ref_wp`, threaded as a single
+`LeafList` param — not the two tables — so the gate and collapse arms
+are membership checks). Two review predictions confirmed at impl time:
+(a) the global `residue_names` field is REQUIRED (production's vec is
+monotonic across branch joins — a frame-prefix derivation would be
+unfaithful); (b) Call.post's pass-through FrameList forces gate-time
+derivation (build-time can't reach it).
+
+**Era 1 (cross-check, `10bf25b7`/`66ff7e66`/`243d314a`/`11301ba6`):**
+tactus-core gains `PropDeepList` + FnCtxData `residue_names` +
+`prop_deeps` (arity 7→9); `raw_exp_mentions` family (nat idiom,
+structural, no binder shadowing — mirroring `lexpr_mentions_var`);
+`poisoned_props(c)` (takes the WHOLE FnCtxData — the discharge's
+wf-transport resolves own-param args, NOT `<param>.<field>`
+projections); `pp` threaded through wp_stm/frame_after/ret_frame/
+gate_wrap/close_e/close_each_e/close_sem_e/close_sem_obligs/exec_safe_f
+(~90 fns, scripted + hand-fix); the AssignH/RetLetH collapse DERIVED
+(`leaf_mem(pp, ep)`). Serializer: `register_prop_deep` at every
+hyp_poison site with an SST source (15 sites; pre-residue props skipped
+by monotonicity; eq props register the mention-equivalent RHS/scrutinee
+transcription), `guard_no_poison` rejects residue-mentioning Call.post
+props (no SST source; zero population corpus-wide); the collapse moved
+reference-side (AssignH/FLetH/RetLetH always emit the hoist payload;
+`mark_flet_forced` still mirrors production's forced state).
+link_discharge `feed_requires` moved to the pp-first self-Call layout
+(frame idx 4, stm idx 5, needle carries pp) + unit pins.
+**Cross-check result: probe9 33/33 + probe11 11/11 ALL CLASSIFIED with
+derivation-driven assembly ⟹ derivation ≡ bit corpus-wide** (the A4
+gate). probe13 22 classes incl. the re-pointed poison kills (below);
+probes 14/17/37/38 ✓; units 428+7/0; golden re-vendored.
+
+**Era 2 (deletion, `62f1b473`):** bit slots DELETED — FHyp 4→3;
+Assert 4→3 / Assume 3→2 / AssertQueryTactus 4→3 / If 7→6 /
+IfCtor −eq_poison,neg_poison / Loop −cond_poison (21→20); the u_*
+unfold families lose the bit params (313 scripted sites + hand-fix);
+serializer stops emitting bits (`hyp_poison` stays ONLY as the
+forced-state mirror + the emission-time guards); the P1 contract
+paragraph rewritten — the poison mark is no longer trusted; the N2
+IsVariant detector paragraph stays (now the LAST named trusted
+predicate on the cert path; the next trust-shrink target after B,
+per A3). probe13/38 gen.py splitters moved to the era-2 layouts.
+Gate 291/0 + pkg gate 54 + discharge 198/0.
+
+**probe13 poison kills re-pointed (era 1, NOT deletion time):** the
+old zero-the-bits `poison_flip` was DEAD the moment assembly became
+derivation-driven (the review addendum's "(not before)" note was
+wrong about the old channel staying live — caught at the first probe
+run). New ctx-side kills, both directions: `poison_residue_drop`
+(zero the table ⟹ missed poison ⟹ hoist vs production wrap ⟹ flip)
+and `poison_deep_drop` (drop the residue-mentioning entries ⟹ the
+missing-entry case ⟹ flip; targets computed the way the reference
+derives them, so regens re-aim). NO spurious-direction kill: it
+cannot bite on add_capped (the real poison wraps every post-residue
+goal; pre-residue props are unregistered by design) and the direction
+is covered corpus-wide by every hoisted baseline.
+
+**Deviations / surprises (all documented above):**
+- `poisoned_props` takes the whole FnCtxData (wf-transport can't
+  project struct fields) — the discharge pending was 197/1 until the
+  ctx-level entry landed.
+- find_cancellation_exec's `hastype-range`-uncoverable prop (a usize
+  HasType): the bit-gated dummy-deep fallback (bit 0 ⟹ dummy constant
+  deep, guaranteed mention-free; bit 1 ⟹ loud `prop-deep-uncoverable`
+  reject). The bridge backstops even a buggy bit.
+- The mode pins (prophecy_sound/seq_assume_gates/
+  closure_forwards_contract) gained `leaf_mem(pp, <prop>) == 0` side
+  conditions — the hoist-mode reading is conditional on the DERIVED
+  poison now, not a bit literal.
+- The d_old FLetH eq prop stays unregistered (production never
+  poison-checks it either — pre-existing status-quo gap, unchanged).
+- probe20 stays deferred (no tgt gates); probe10 untouched (not in
+  the battery).
+- D discipline: `wp_stm_sound` gained ONE universally-quantified
+  param (`pp`) — mechanical, content-free (the soundness theorem is
+  ∀-over-inputs anyway); the semantic vocabulary (GoalData/holds/St)
+  is untouched. Said explicitly per the acceptance item: era 1 left
+  it untouched; era 2 threaded the param.

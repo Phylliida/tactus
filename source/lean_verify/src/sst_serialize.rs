@@ -3763,8 +3763,8 @@ impl<'a> Serializer<'a> {
                     self.restore_branch(bstate);
                     self.hyp_ordinal = save;
                     return Ok(format!(
-                        "({}.StmData.If {} {} {} {} {} {} {})",
-                        NS, c, cn, nc, ncn, cp, box_(&t), box_(&e)
+                        "({}.StmData.If {} {} {} {} {} {})",
+                        NS, c, cn, nc, ncn, box_(&t), box_(&e)
                     ));
                 }
             }

@@ -2,5 +2,5 @@ import TactusDefs_lib_exec
 set_option linter.unusedVariables false
 set_option maxHeartbeats 800000
 set_option autoImplicit false
-@[reducible] noncomputable def _tactus_postcondition_u_wp_assign_at_lib_5238_13_1_stmt : Prop :=
-  ∀ (pp : lib.LeafList) (f : lib.FrameList) (x : Int) (h_x_bound : 0 ≤ x ∧ x < 18446744073709551616) (rhs : Int) (h_rhs_bound : 0 ≤ rhs ∧ rhs < 18446744073709551616), /- @rust:tactus-core/lib.rs:5238:13 -/ lib.wp_stm pp f (lib.StmData.Assign x rhs) = lib.GoalList.Nil
+@[reducible] noncomputable def _tactus_postcondition_u_wp_assign_at_lib_5223_13_1_stmt : Prop :=
+  ∀ (pp : lib.LeafList) (f : lib.FrameList) (x : Int) (h_x_bound : 0 ≤ x ∧ x < 18446744073709551616) (rhs : Int) (h_rhs_bound : 0 ≤ rhs ∧ rhs < 18446744073709551616), /- @rust:tactus-core/lib.rs:5223:13 -/ lib.wp_stm pp f (lib.StmData.Assign x rhs) = lib.GoalList.Nil

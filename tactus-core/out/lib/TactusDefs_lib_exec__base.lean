@@ -375,7 +375,7 @@ decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduc
 inductive lib.FrameList where
   | FNil
   | FBind (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
-  | FHyp (val0 : Int) (val1 : Int) (val2 : Int) (val3 : Tactus.Box lib.FrameList)
+  | FHyp (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
   | FLet (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
   | FLetH (val0 : Int) (val1 : Int) (val2 : Int) (val3 : Int) (val4 : Int) (val5 : Tactus.Box lib.FrameList)
   | FLetR (val0 : Int) (val1 : Int) (val2 : Tactus.Box lib.FrameList)
@@ -386,7 +386,7 @@ inductive lib.FrameList where
 @[simp] noncomputable def lib.FrameList.isFBind (x : lib.FrameList) : Prop :=
   match x with | lib.FrameList.FBind _ _ _ => True | _ => False
 @[simp] noncomputable def lib.FrameList.isFHyp (x : lib.FrameList) : Prop :=
-  match x with | lib.FrameList.FHyp _ _ _ _ => True | _ => False
+  match x with | lib.FrameList.FHyp _ _ _ => True | _ => False
 @[simp] noncomputable def lib.FrameList.isFLet (x : lib.FrameList) : Prop :=
   match x with | lib.FrameList.FLet _ _ _ => True | _ => False
 @[simp] noncomputable def lib.FrameList.isFLetH (x : lib.FrameList) : Prop :=
@@ -402,13 +402,11 @@ inductive lib.FrameList where
 @[simp] noncomputable def lib.FrameList.FBind_val2 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
   match x with | lib.FrameList.FBind _ _ val2 => val2 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.FrameList.FHyp_val0 (x : lib.FrameList) : Int :=
-  match x with | lib.FrameList.FHyp val0 _ _ _ => val0 | _ => Classical.ofNonempty
+  match x with | lib.FrameList.FHyp val0 _ _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.FrameList.FHyp_val1 (x : lib.FrameList) : Int :=
-  match x with | lib.FrameList.FHyp _ val1 _ _ => val1 | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.FrameList.FHyp_val2 (x : lib.FrameList) : Int :=
-  match x with | lib.FrameList.FHyp _ _ val2 _ => val2 | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.FrameList.FHyp_val3 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
-  match x with | lib.FrameList.FHyp _ _ _ val3 => val3 | _ => Classical.ofNonempty
+  match x with | lib.FrameList.FHyp _ val1 _ => val1 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.FrameList.FHyp_val2 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
+  match x with | lib.FrameList.FHyp _ _ val2 => val2 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.FrameList.FLet_val0 (x : lib.FrameList) : Int :=
   match x with | lib.FrameList.FLet val0 _ _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.FrameList.FLet_val1 (x : lib.FrameList) : Int :=
@@ -436,30 +434,30 @@ inductive lib.FrameList where
 @[simp] noncomputable def lib.FrameList.FUserCloser_val0 (x : lib.FrameList) : Tactus.Box lib.FrameList :=
   match x with | lib.FrameList.FUserCloser val0 => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.FrameList.height (s : lib.FrameList) : Nat :=
-  match s with | lib.FrameList.FNil => 1 | lib.FrameList.FBind _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FHyp _ _ _ val3 => 1 + lib.FrameList.height val3.deref | lib.FrameList.FLet _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FLetH _ _ _ _ _ val5 => 1 + lib.FrameList.height val5.deref | lib.FrameList.FLetR _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FUserCloser val0 => 1 + lib.FrameList.height val0.deref
+  match s with | lib.FrameList.FNil => 1 | lib.FrameList.FBind _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FHyp _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FLet _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FLetH _ _ _ _ _ val5 => 1 + lib.FrameList.height val5.deref | lib.FrameList.FLetR _ _ val2 => 1 + lib.FrameList.height val2.deref | lib.FrameList.FUserCloser val0 => 1 + lib.FrameList.height val0.deref
 termination_by sizeOf s
 decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.FrameList.FNil.sizeOf_spec, lib.FrameList.FBind.sizeOf_spec, lib.FrameList.FHyp.sizeOf_spec, lib.FrameList.FLet.sizeOf_spec, lib.FrameList.FLetH.sizeOf_spec, lib.FrameList.FLetR.sizeOf_spec, lib.FrameList.FUserCloser.sizeOf_spec]; omega)
 inductive lib.StmData where
-  | Assert (val0 : lib.RawExp) (val1 : Int) (val2 : Int) (val3 : Int)
-  | Assume (val0 : Int) (val1 : Int) (val2 : Int)
+  | Assert (val0 : lib.RawExp) (val1 : Int) (val2 : Int)
+  | Assume (val0 : Int) (val1 : Int)
   | Assign (val0 : Int) (val1 : Int)
   | AssignH (val0 : Int) (val1 : Int) (val2 : Int) (val3 : Int) (val4 : Int)
   | AssignR (val0 : Int) (val1 : Int)
   | Call (reqs : Tactus.Box lib.RawExpList) (post : Tactus.Box lib.FrameList)
   | DeadEnd (val0 : Tactus.Box lib.StmData)
   | Ret (val0 : Tactus.Box lib.RawExpList) (val1 : lib.RetBind)
-  | If (val0 : Int) (val1 : Int) (val2 : Int) (val3 : Int) (val4 : Int) (val5 : Tactus.Box lib.StmData) (val6 : Tactus.Box lib.StmData)
-  | Loop (inv_hyps : Tactus.Box lib.BinderList) (inv_obligs : Tactus.Box lib.RawExpList) (inv_obligs_exit : Tactus.Box lib.RawExpList) (inv_obligs_break : Tactus.Box lib.RawExpList) (binders : Tactus.Box lib.BinderList) (binder_bounds : Tactus.Box lib.ParamBoundList) (cond_name : Int) (cond_ann : Int) (neg_cond_ann : Int) (neg_neg_cond_ann : Int) (break_guard_ann : Int) (break_use_ann : Int) (cond_poison : Int) (d_old_name : Int) (d_old_ty : Int) (d_old_val : Int) (d_old_eq_name : Int) (d_old_eq_prop : Int) (decrease_oblig : lib.RawExp) (setup : Tactus.Box lib.StmData) (body : Tactus.Box lib.StmData)
+  | If (val0 : Int) (val1 : Int) (val2 : Int) (val3 : Int) (val4 : Tactus.Box lib.StmData) (val5 : Tactus.Box lib.StmData)
+  | Loop (inv_hyps : Tactus.Box lib.BinderList) (inv_obligs : Tactus.Box lib.RawExpList) (inv_obligs_exit : Tactus.Box lib.RawExpList) (inv_obligs_break : Tactus.Box lib.RawExpList) (binders : Tactus.Box lib.BinderList) (binder_bounds : Tactus.Box lib.ParamBoundList) (cond_name : Int) (cond_ann : Int) (neg_cond_ann : Int) (neg_neg_cond_ann : Int) (break_guard_ann : Int) (break_use_ann : Int) (d_old_name : Int) (d_old_ty : Int) (d_old_val : Int) (d_old_eq_name : Int) (d_old_eq_prop : Int) (decrease_oblig : lib.RawExp) (setup : Tactus.Box lib.StmData) (body : Tactus.Box lib.StmData)
   | AssertQueryNl (val0 : Tactus.Box lib.StmData) (val1 : lib.RawExp)
-  | AssertQueryTactus (val0 : lib.RawExp) (val1 : Int) (val2 : Int) (val3 : Int)
-  | IfCtor (pos_binders : Tactus.Box lib.BinderList) (eq_name : Int) (eq_prop : Int) (eq_poison : Int) (neg_name : Int) (neg_prop : Int) (neg_poison : Int) (thn : Tactus.Box lib.StmData) (els : Tactus.Box lib.StmData)
+  | AssertQueryTactus (val0 : lib.RawExp) (val1 : Int) (val2 : Int)
+  | IfCtor (pos_binders : Tactus.Box lib.BinderList) (eq_name : Int) (eq_prop : Int) (neg_name : Int) (neg_prop : Int) (thn : Tactus.Box lib.StmData) (els : Tactus.Box lib.StmData)
   | Skip
   | Seq (val0 : Tactus.Box lib.StmData) (val1 : Tactus.Box lib.StmData)
   deriving Inhabited
 @[simp] noncomputable def lib.StmData.isAssert (x : lib.StmData) : Prop :=
-  match x with | lib.StmData.Assert _ _ _ _ => True | _ => False
+  match x with | lib.StmData.Assert _ _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isAssume (x : lib.StmData) : Prop :=
-  match x with | lib.StmData.Assume _ _ _ => True | _ => False
+  match x with | lib.StmData.Assume _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isAssign (x : lib.StmData) : Prop :=
   match x with | lib.StmData.Assign _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isAssignH (x : lib.StmData) : Prop :=
@@ -473,33 +471,29 @@ inductive lib.StmData where
 @[simp] noncomputable def lib.StmData.isRet (x : lib.StmData) : Prop :=
   match x with | lib.StmData.Ret _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isIf (x : lib.StmData) : Prop :=
-  match x with | lib.StmData.If _ _ _ _ _ _ _ => True | _ => False
+  match x with | lib.StmData.If _ _ _ _ _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isLoop (x : lib.StmData) : Prop :=
-  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ => True | _ => False
+  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isAssertQueryNl (x : lib.StmData) : Prop :=
   match x with | lib.StmData.AssertQueryNl _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isAssertQueryTactus (x : lib.StmData) : Prop :=
-  match x with | lib.StmData.AssertQueryTactus _ _ _ _ => True | _ => False
+  match x with | lib.StmData.AssertQueryTactus _ _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isIfCtor (x : lib.StmData) : Prop :=
-  match x with | lib.StmData.IfCtor _ _ _ _ _ _ _ _ _ => True | _ => False
+  match x with | lib.StmData.IfCtor _ _ _ _ _ _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isSkip (x : lib.StmData) : Prop :=
   match x with | lib.StmData.Skip => True | _ => False
 @[simp] noncomputable def lib.StmData.isSeq (x : lib.StmData) : Prop :=
   match x with | lib.StmData.Seq _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.Assert_val0 (x : lib.StmData) : lib.RawExp :=
-  match x with | lib.StmData.Assert val0 _ _ _ => val0 | _ => Classical.ofNonempty
+  match x with | lib.StmData.Assert val0 _ _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Assert_val1 (x : lib.StmData) : Int :=
-  match x with | lib.StmData.Assert _ val1 _ _ => val1 | _ => Classical.ofNonempty
+  match x with | lib.StmData.Assert _ val1 _ => val1 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Assert_val2 (x : lib.StmData) : Int :=
-  match x with | lib.StmData.Assert _ _ val2 _ => val2 | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.StmData.Assert_val3 (x : lib.StmData) : Int :=
-  match x with | lib.StmData.Assert _ _ _ val3 => val3 | _ => Classical.ofNonempty
+  match x with | lib.StmData.Assert _ _ val2 => val2 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Assume_val0 (x : lib.StmData) : Int :=
-  match x with | lib.StmData.Assume val0 _ _ => val0 | _ => Classical.ofNonempty
+  match x with | lib.StmData.Assume val0 _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Assume_val1 (x : lib.StmData) : Int :=
-  match x with | lib.StmData.Assume _ val1 _ => val1 | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.StmData.Assume_val2 (x : lib.StmData) : Int :=
-  match x with | lib.StmData.Assume _ _ val2 => val2 | _ => Classical.ofNonempty
+  match x with | lib.StmData.Assume _ val1 => val1 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Assign_val0 (x : lib.StmData) : Int :=
   match x with | lib.StmData.Assign val0 _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Assign_val1 (x : lib.StmData) : Int :=
@@ -529,97 +523,87 @@ inductive lib.StmData where
 @[simp] noncomputable def lib.StmData.Ret_val1 (x : lib.StmData) : lib.RetBind :=
   match x with | lib.StmData.Ret _ val1 => val1 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.If_val0 (x : lib.StmData) : Int :=
-  match x with | lib.StmData.If val0 _ _ _ _ _ _ => val0 | _ => Classical.ofNonempty
+  match x with | lib.StmData.If val0 _ _ _ _ _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.If_val1 (x : lib.StmData) : Int :=
-  match x with | lib.StmData.If _ val1 _ _ _ _ _ => val1 | _ => Classical.ofNonempty
+  match x with | lib.StmData.If _ val1 _ _ _ _ => val1 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.If_val2 (x : lib.StmData) : Int :=
-  match x with | lib.StmData.If _ _ val2 _ _ _ _ => val2 | _ => Classical.ofNonempty
+  match x with | lib.StmData.If _ _ val2 _ _ _ => val2 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.If_val3 (x : lib.StmData) : Int :=
-  match x with | lib.StmData.If _ _ _ val3 _ _ _ => val3 | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.StmData.If_val4 (x : lib.StmData) : Int :=
-  match x with | lib.StmData.If _ _ _ _ val4 _ _ => val4 | _ => Classical.ofNonempty
+  match x with | lib.StmData.If _ _ _ val3 _ _ => val3 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.If_val4 (x : lib.StmData) : Tactus.Box lib.StmData :=
+  match x with | lib.StmData.If _ _ _ _ val4 _ => val4 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.If_val5 (x : lib.StmData) : Tactus.Box lib.StmData :=
-  match x with | lib.StmData.If _ _ _ _ _ val5 _ => val5 | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.StmData.If_val6 (x : lib.StmData) : Tactus.Box lib.StmData :=
-  match x with | lib.StmData.If _ _ _ _ _ _ val6 => val6 | _ => Classical.ofNonempty
+  match x with | lib.StmData.If _ _ _ _ _ val5 => val5 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_inv_hyps (x : lib.StmData) : Tactus.Box lib.BinderList :=
-  match x with | lib.StmData.Loop inv_hyps _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ => inv_hyps | _ => Classical.ofNonempty
+  match x with | lib.StmData.Loop inv_hyps _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ => inv_hyps | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_inv_obligs (x : lib.StmData) : Tactus.Box lib.RawExpList :=
-  match x with | lib.StmData.Loop _ inv_obligs _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ => inv_obligs | _ => Classical.ofNonempty
+  match x with | lib.StmData.Loop _ inv_obligs _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ => inv_obligs | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_inv_obligs_exit (x : lib.StmData) : Tactus.Box lib.RawExpList :=
-  match x with | lib.StmData.Loop _ _ inv_obligs_exit _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ => inv_obligs_exit | _ => Classical.ofNonempty
+  match x with | lib.StmData.Loop _ _ inv_obligs_exit _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ => inv_obligs_exit | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_inv_obligs_break (x : lib.StmData) : Tactus.Box lib.RawExpList :=
-  match x with | lib.StmData.Loop _ _ _ inv_obligs_break _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ => inv_obligs_break | _ => Classical.ofNonempty
+  match x with | lib.StmData.Loop _ _ _ inv_obligs_break _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ => inv_obligs_break | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_binders (x : lib.StmData) : Tactus.Box lib.BinderList :=
-  match x with | lib.StmData.Loop _ _ _ _ binders _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ => binders | _ => Classical.ofNonempty
+  match x with | lib.StmData.Loop _ _ _ _ binders _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ => binders | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_binder_bounds (x : lib.StmData) : Tactus.Box lib.ParamBoundList :=
-  match x with | lib.StmData.Loop _ _ _ _ _ binder_bounds _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ => binder_bounds | _ => Classical.ofNonempty
+  match x with | lib.StmData.Loop _ _ _ _ _ binder_bounds _ _ _ _ _ _ _ _ _ _ _ _ _ _ => binder_bounds | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_cond_name (x : lib.StmData) : Int :=
-  match x with | lib.StmData.Loop _ _ _ _ _ _ cond_name _ _ _ _ _ _ _ _ _ _ _ _ _ _ => cond_name | _ => Classical.ofNonempty
+  match x with | lib.StmData.Loop _ _ _ _ _ _ cond_name _ _ _ _ _ _ _ _ _ _ _ _ _ => cond_name | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_cond_ann (x : lib.StmData) : Int :=
-  match x with | lib.StmData.Loop _ _ _ _ _ _ _ cond_ann _ _ _ _ _ _ _ _ _ _ _ _ _ => cond_ann | _ => Classical.ofNonempty
+  match x with | lib.StmData.Loop _ _ _ _ _ _ _ cond_ann _ _ _ _ _ _ _ _ _ _ _ _ => cond_ann | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_neg_cond_ann (x : lib.StmData) : Int :=
-  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ neg_cond_ann _ _ _ _ _ _ _ _ _ _ _ _ => neg_cond_ann | _ => Classical.ofNonempty
+  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ neg_cond_ann _ _ _ _ _ _ _ _ _ _ _ => neg_cond_ann | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_neg_neg_cond_ann (x : lib.StmData) : Int :=
-  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ neg_neg_cond_ann _ _ _ _ _ _ _ _ _ _ _ => neg_neg_cond_ann | _ => Classical.ofNonempty
+  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ neg_neg_cond_ann _ _ _ _ _ _ _ _ _ _ => neg_neg_cond_ann | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_break_guard_ann (x : lib.StmData) : Int :=
-  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ break_guard_ann _ _ _ _ _ _ _ _ _ _ => break_guard_ann | _ => Classical.ofNonempty
+  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ break_guard_ann _ _ _ _ _ _ _ _ _ => break_guard_ann | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_break_use_ann (x : lib.StmData) : Int :=
-  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ break_use_ann _ _ _ _ _ _ _ _ _ => break_use_ann | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.StmData.Loop_cond_poison (x : lib.StmData) : Int :=
-  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ cond_poison _ _ _ _ _ _ _ _ => cond_poison | _ => Classical.ofNonempty
+  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ break_use_ann _ _ _ _ _ _ _ _ => break_use_ann | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_d_old_name (x : lib.StmData) : Int :=
-  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ d_old_name _ _ _ _ _ _ _ => d_old_name | _ => Classical.ofNonempty
+  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ d_old_name _ _ _ _ _ _ _ => d_old_name | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_d_old_ty (x : lib.StmData) : Int :=
-  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ d_old_ty _ _ _ _ _ _ => d_old_ty | _ => Classical.ofNonempty
+  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ d_old_ty _ _ _ _ _ _ => d_old_ty | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_d_old_val (x : lib.StmData) : Int :=
-  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ d_old_val _ _ _ _ _ => d_old_val | _ => Classical.ofNonempty
+  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ d_old_val _ _ _ _ _ => d_old_val | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_d_old_eq_name (x : lib.StmData) : Int :=
-  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ d_old_eq_name _ _ _ _ => d_old_eq_name | _ => Classical.ofNonempty
+  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ d_old_eq_name _ _ _ _ => d_old_eq_name | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_d_old_eq_prop (x : lib.StmData) : Int :=
-  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ d_old_eq_prop _ _ _ => d_old_eq_prop | _ => Classical.ofNonempty
+  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ d_old_eq_prop _ _ _ => d_old_eq_prop | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_decrease_oblig (x : lib.StmData) : lib.RawExp :=
-  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ decrease_oblig _ _ => decrease_oblig | _ => Classical.ofNonempty
+  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ decrease_oblig _ _ => decrease_oblig | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_setup (x : lib.StmData) : Tactus.Box lib.StmData :=
-  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ setup _ => setup | _ => Classical.ofNonempty
+  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ setup _ => setup | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Loop_body (x : lib.StmData) : Tactus.Box lib.StmData :=
-  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ body => body | _ => Classical.ofNonempty
+  match x with | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ body => body | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.AssertQueryNl_val0 (x : lib.StmData) : Tactus.Box lib.StmData :=
   match x with | lib.StmData.AssertQueryNl val0 _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.AssertQueryNl_val1 (x : lib.StmData) : lib.RawExp :=
   match x with | lib.StmData.AssertQueryNl _ val1 => val1 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.AssertQueryTactus_val0 (x : lib.StmData) : lib.RawExp :=
-  match x with | lib.StmData.AssertQueryTactus val0 _ _ _ => val0 | _ => Classical.ofNonempty
+  match x with | lib.StmData.AssertQueryTactus val0 _ _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.AssertQueryTactus_val1 (x : lib.StmData) : Int :=
-  match x with | lib.StmData.AssertQueryTactus _ val1 _ _ => val1 | _ => Classical.ofNonempty
+  match x with | lib.StmData.AssertQueryTactus _ val1 _ => val1 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.AssertQueryTactus_val2 (x : lib.StmData) : Int :=
-  match x with | lib.StmData.AssertQueryTactus _ _ val2 _ => val2 | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.StmData.AssertQueryTactus_val3 (x : lib.StmData) : Int :=
-  match x with | lib.StmData.AssertQueryTactus _ _ _ val3 => val3 | _ => Classical.ofNonempty
+  match x with | lib.StmData.AssertQueryTactus _ _ val2 => val2 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.IfCtor_pos_binders (x : lib.StmData) : Tactus.Box lib.BinderList :=
-  match x with | lib.StmData.IfCtor pos_binders _ _ _ _ _ _ _ _ => pos_binders | _ => Classical.ofNonempty
+  match x with | lib.StmData.IfCtor pos_binders _ _ _ _ _ _ => pos_binders | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.IfCtor_eq_name (x : lib.StmData) : Int :=
-  match x with | lib.StmData.IfCtor _ eq_name _ _ _ _ _ _ _ => eq_name | _ => Classical.ofNonempty
+  match x with | lib.StmData.IfCtor _ eq_name _ _ _ _ _ => eq_name | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.IfCtor_eq_prop (x : lib.StmData) : Int :=
-  match x with | lib.StmData.IfCtor _ _ eq_prop _ _ _ _ _ _ => eq_prop | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.StmData.IfCtor_eq_poison (x : lib.StmData) : Int :=
-  match x with | lib.StmData.IfCtor _ _ _ eq_poison _ _ _ _ _ => eq_poison | _ => Classical.ofNonempty
+  match x with | lib.StmData.IfCtor _ _ eq_prop _ _ _ _ => eq_prop | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.IfCtor_neg_name (x : lib.StmData) : Int :=
-  match x with | lib.StmData.IfCtor _ _ _ _ neg_name _ _ _ _ => neg_name | _ => Classical.ofNonempty
+  match x with | lib.StmData.IfCtor _ _ _ neg_name _ _ _ => neg_name | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.IfCtor_neg_prop (x : lib.StmData) : Int :=
-  match x with | lib.StmData.IfCtor _ _ _ _ _ neg_prop _ _ _ => neg_prop | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.StmData.IfCtor_neg_poison (x : lib.StmData) : Int :=
-  match x with | lib.StmData.IfCtor _ _ _ _ _ _ neg_poison _ _ => neg_poison | _ => Classical.ofNonempty
+  match x with | lib.StmData.IfCtor _ _ _ _ neg_prop _ _ => neg_prop | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.IfCtor_thn (x : lib.StmData) : Tactus.Box lib.StmData :=
-  match x with | lib.StmData.IfCtor _ _ _ _ _ _ _ thn _ => thn | _ => Classical.ofNonempty
+  match x with | lib.StmData.IfCtor _ _ _ _ _ thn _ => thn | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.IfCtor_els (x : lib.StmData) : Tactus.Box lib.StmData :=
-  match x with | lib.StmData.IfCtor _ _ _ _ _ _ _ _ els => els | _ => Classical.ofNonempty
+  match x with | lib.StmData.IfCtor _ _ _ _ _ _ els => els | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Seq_val0 (x : lib.StmData) : Tactus.Box lib.StmData :=
   match x with | lib.StmData.Seq val0 _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Seq_val1 (x : lib.StmData) : Tactus.Box lib.StmData :=
   match x with | lib.StmData.Seq _ val1 => val1 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.height (s : lib.StmData) : Nat :=
-  match s with | lib.StmData.Assert _ _ _ _ => 1 | lib.StmData.Assume _ _ _ => 1 | lib.StmData.Assign _ _ => 1 | lib.StmData.AssignH _ _ _ _ _ => 1 | lib.StmData.AssignR _ _ => 1 | lib.StmData.Call _ _ => 1 | lib.StmData.DeadEnd val0 => 1 + lib.StmData.height val0.deref | lib.StmData.Ret _ _ => 1 | lib.StmData.If _ _ _ _ _ val5 val6 => 1 + lib.StmData.height val5.deref + lib.StmData.height val6.deref | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ setup body => 1 + lib.StmData.height setup.deref + lib.StmData.height body.deref | lib.StmData.AssertQueryNl val0 _ => 1 + lib.StmData.height val0.deref | lib.StmData.AssertQueryTactus _ _ _ _ => 1 | lib.StmData.IfCtor _ _ _ _ _ _ _ thn els => 1 + lib.StmData.height thn.deref + lib.StmData.height els.deref | lib.StmData.Skip => 1 | lib.StmData.Seq val0 val1 => 1 + lib.StmData.height val0.deref + lib.StmData.height val1.deref
+  match s with | lib.StmData.Assert _ _ _ => 1 | lib.StmData.Assume _ _ => 1 | lib.StmData.Assign _ _ => 1 | lib.StmData.AssignH _ _ _ _ _ => 1 | lib.StmData.AssignR _ _ => 1 | lib.StmData.Call _ _ => 1 | lib.StmData.DeadEnd val0 => 1 + lib.StmData.height val0.deref | lib.StmData.Ret _ _ => 1 | lib.StmData.If _ _ _ _ val4 val5 => 1 + lib.StmData.height val4.deref + lib.StmData.height val5.deref | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ setup body => 1 + lib.StmData.height setup.deref + lib.StmData.height body.deref | lib.StmData.AssertQueryNl val0 _ => 1 + lib.StmData.height val0.deref | lib.StmData.AssertQueryTactus _ _ _ => 1 | lib.StmData.IfCtor _ _ _ _ _ thn els => 1 + lib.StmData.height thn.deref + lib.StmData.height els.deref | lib.StmData.Skip => 1 | lib.StmData.Seq val0 val1 => 1 + lib.StmData.height val0.deref + lib.StmData.height val1.deref
 termination_by sizeOf s
 decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.StmData.Assert.sizeOf_spec, lib.StmData.Assume.sizeOf_spec, lib.StmData.Assign.sizeOf_spec, lib.StmData.AssignH.sizeOf_spec, lib.StmData.AssignR.sizeOf_spec, lib.StmData.Call.sizeOf_spec, lib.StmData.DeadEnd.sizeOf_spec, lib.StmData.Ret.sizeOf_spec, lib.StmData.If.sizeOf_spec, lib.StmData.Loop.sizeOf_spec, lib.StmData.AssertQueryNl.sizeOf_spec, lib.StmData.AssertQueryTactus.sizeOf_spec, lib.StmData.IfCtor.sizeOf_spec, lib.StmData.Skip.sizeOf_spec, lib.StmData.Seq.sizeOf_spec]; omega)
 inductive lib.CastKind where
