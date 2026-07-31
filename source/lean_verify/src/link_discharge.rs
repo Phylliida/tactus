@@ -691,16 +691,19 @@ fn feed_requires(
         let mut best: Option<(usize, &Vec<Arg>)> = None;
         for n in &post_vc.spine {
             let Node::Call { is_self: true, args: cargs, .. } = n else { continue };
-            // cargs = [hp, he, lv, frame?, stm?, st] — the frame arg is
-            // index 3 when present (an expr, possibly a let name).
-            let Some(frame_arg) = cargs.get(3) else { continue };
+            // cargs = [pp, hp, he, lv, frame?, stm?, st] — pp leads
+            // (F4's derived poison set threads first through the whole
+            // wp_stm/exec_safe_f family), so the frame arg is index 4
+            // when present (an expr, possibly a let name), stm index 5.
+            let Some(pp_arg) = cargs.get(0) else { continue };
+            let Some(frame_arg) = cargs.get(4) else { continue };
             let frame = env
                 .lets
                 .get(&frame_arg.text)
                 .cloned()
                 .unwrap_or_else(|| frame_arg.text.clone());
-            let stm = cargs.get(4).map(|a| a.text.clone()).unwrap_or_default();
-            let needle = format!("lib.wp_stm ({}) {}", frame, stm);
+            let stm = cargs.get(5).map(|a| a.text.clone()).unwrap_or_default();
+            let needle = format!("lib.wp_stm {} ({}) {}", pp_arg.text, frame, stm);
             if prop.contains(&needle) && best.map_or(true, |(bl, _)| needle.len() > bl) {
                 best = Some((needle.len(), cargs));
             }
