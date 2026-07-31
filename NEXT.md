@@ -1,14 +1,17 @@
 # NEXT — bootstrap work queue (2026-07-21; superseded 2026-07-24)
 
-**2026-07-31: A7 CARDED — `board/bootstrap-80-a7-callee-signature-vocab.md`.**
-Step-0 evidence frozen (vec_read leaf-level: the View-deref divergence is
-the G2 rule firing on a `TyRef` arg whose callee param IS the ref type;
-the `Int.ofNat` gap is CallN carrying no per-arg param types — lib.rs:1262
-"deferred to W7c"). Scope = callee-signature vocab + Q3 poison derivation
-reference-side + the `&mut T` unsubstituted-typ quirk (freeze-time call).
-Constraint (Danielle 2026-07-31): NO full tgt gate runs — acceptance uses
-probe11's scoped per-module emits. Next session: design freeze (6 open
-questions on the card) → implement → B (b67 caching + b68 flip).
+**2026-07-31: A7 CARDED + DESIGN FROZEN —
+`board/bootstrap-80-a7-callee-signature-vocab.md`.** All 6 freeze
+questions resolved under Danielle's principles: per-site expected param
+types on the call nodes (RawList element pairs; NO signature table —
+nodes self-describing, no lookup/fallback in render_exp); poison BIT
+DELETED from the vocab — derived on the fly from a ctx side table
+(residue_names + prop_deeps; frames/goals/wp_stm_sound untouched);
+&mut-T unsubstituted-typ quirk = FIX production + mirror. Byte-neutrality
+stated as a lemma (F6). Constraint (Danielle 2026-07-31): NO full tgt
+gate runs — acceptance uses probe11's scoped per-module emits. Next
+session: implement (ONE batched tactus-core vocab edit → serializer →
+probes) → B (b67 caching + b68 flip).
 
 **2026-07-28: b79 (break-form loop arm) DONE — see
 `board/bootstrap-79-break-form-loop-arm.md` (full record).** The
