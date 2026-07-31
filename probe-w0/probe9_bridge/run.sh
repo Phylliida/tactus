@@ -60,17 +60,29 @@ honest_fail_reason() {
     # the FROZEN refWp reproduces production's 4 goals via its flat If/Seq
     # arms. (Option 1 — teach refWp — was proven infeasible: it forces
     # WellFounded.fix, which `decide` cannot reduce.) Now expected-CLOSE.
-    vec_read)   printf '%s' 'stage-B reference-renderer coercion derivation (bootstrap-74 slice 2, 2026-07-21): the binder telescope matches production EXACTLY (FLetH/RetLetH + _h_hoist names all correct — the N1-hoist mirror is faithful). The remaining gap is leaf RENDERING: render_exp of the reference RawExp derives `v.deref` where production writes `v` (View.view call arg — the mirror tags a Ref-wrapped binder as dereferenceable in a slot that wants the wrapper) and misses the `Int.ofNat` cast on the Seq.index CallN arg (per-arg spec-call coercions need the callee signature, which the fixed-vocabulary mirror does not carry). Stage-A assembly is certified; this is a stage-B deep-leaf coverage gap — carded on b74 (follow-up queue §7.7).' ;;
-    # NOTE (bootstrap-79, 2026-07-28): count_to_len (the break-form
-    # subject) is A7-class — its entry/exit-reclose/postcondition
-    # goals carry view()-bearing invariant/ensures leaves (the vec_read
-    # deref class). The break-form FRAME ASSEMBLY is fully validated:
-    # the body-assert/maintain/decrease goals CLOSE outright, and the
-    # leaf-normalized spine bridge (strips probe) closes over all six
-    # goals (entry, exit-reclose, body, maintain, decrease,
-    # postcondition — the THREE invariant families + the guard leaves
-    # + the double setup-walk counter replay all byte-match).
-    count_to_len) printf '%s' 'A7 stage-B deep-leaf class on view()-bearing invariant/ensures leaves (vec_read class; the b79 break-form assembly itself is byte-perfect — goals 2/3/4 close outright, the leaf-normalized spine bridge closes over all six). Closes with A7 stage-B callee-signature vocab.' ;;
+    # NOTE (bootstrap-80 A7, 2026-07-31): the ENTIRE stage-B deep-leaf
+    # honest-fail class is FIXED — vec_read, count_to_len, vec_push7,
+    # fill_zeros all CLOSE and are expected-CLOSE. Two landings:
+    # (1) the callee-signature vocabulary: RawList carries per-arg
+    # EXPECTED param typs (fn_param_typs_of, same VIR fn_map production
+    # consults), render_exp derives the per-arg slot coercions via
+    # reconcile_arg (the two-phase coerce_lexpr fragment: sort bridge +
+    # wrapper reconciliation — Ref↔bare deref/mk-wrap, Ref↔Box,
+    # passthrough when the callee param IS ref-typed, which was the
+    # vec_read `v.deref` mis-derivation; `Int.ofNat` on Seq.index args).
+    # The `Tactus.Ref.mk`/`Tactus.Box.mk` wraps are first-class
+    # ExprData nodes (id-free; the reference cannot mint interned ids).
+    # (2) F5 (pulled forward — vec_read's residual telescope divergence
+    # was NOT the leaf class): production's bound predicates ran on the
+    # UNINSTANTIATED declared typ, so a generic callee (`Seq.index` →
+    # `Int`, `swap_incr` at `&mut T`) silently dropped the numeric
+    # bound hyp; production now substitutes (instantiate_callee_typ,
+    # single-sourced with the cert serializer's ret_typ_subst) at the
+    # Phase-1 mut-arg / Phase-E ret / ∀-path ret / prophecy sites, and
+    # the cert serializer's Phase-1 mirror substitutes identically.
+    # If any of the four reverts to failing, that is a reclassify-
+    # required regression (an A7 reconcile_arg or F5 substitution bug),
+    # not a new honest-fail class.
     # NOTE (bootstrap-77, 2026-07-24): head_exec is expected-CLOSE again —
     # the A5 `ret_fork`/`StmData::IfCtor` arm mirrors production's
     # walk_let fork (N2 ctor frames on the positive branch, per-branch
@@ -79,26 +91,7 @@ honest_fail_reason() {
     # bootstrap-78 S3 (2026-07-26): the mut-call FRAME machinery is
     # bridge-validated by call_inc + inc (both CLOSE: mut_post/ret
     # binders, bound hyp, ens hyp, plain rebind FLets, fn-entry
-    # preamble, at_pre ensures rewrite). vec_push7's frame spine
-    # matches production node-for-node; the decide fails ONLY in the
-    # deep ensures leaves — `view (Tactus.Ref.mk v)`: production
-    # derives the Ref.mk wrap from the View::view arg slot, the
-    # fixed-vocabulary mirror cannot (same A7 stage-B callee-signature
-    # class as vec_read, one more member). Expected to CLOSE when A7
-    # lands.
-    vec_push7) printf '%s' 'stage-B A7 class (bootstrap-78 S3, 2026-07-26): mut-call frame spine matches production exactly (All mut_post/All ret/Imp ens/Let rebind after the preamble lets — manually verified against the cert); the divergence is deep-leaf only: ensures leaves need the derived `Tactus.Ref.mk` wrap on View.view args (vec_read class). Closes with A7 stage-B callee-signature vocab.' ;;
-    # fill_zeros: ONE remaining class — the A7 deep-leaf gap on its
-    # view()-bearing invariant/ensures leaves (vec_read/vec_push7
-    # class). The former second class — the b77 leading-hyp wrap
-    # divergence (production `_h_ctx_N` named binders vs close_e_wrap
-    # anonymous Imp) — was RESOLVED by S3-pre (2026-07-26): production
-    # split_leading_binders is a pure prefix latch naming `_h_hoist_k`
-    # (= the serializer's interned FHyp names, per-goal positions ==
-    # walk ordinals), and refWp's close_e_wrap_lead renders leading
-    # FHyps as named All up to the first let-class frame. Positive
-    # evidence: add_capped + proof_block_fn certs changed shape with
-    # S3-pre and still CLOSE.
-    fill_zeros) printf '%s' 'A7 stage-B deep-leaf class on view()-bearing invariant leaves (vec_read/vec_push7 class; the b77 leading-hyp wrap divergence was RESOLVED by S3-pre — _h_hoist prefix latch on both sides). Frame assembly around the in-loop mut call (havoc incl. the SOUNDNESS-fixed mod set, mut_post_5/ret_6 counter byte-match) verified against the spine sidecar. Closes with A7 stage-B callee-signature vocab.' ;;
+    # preamble, at_pre ensures rewrite).
     *)         printf '%s' '' ;;
   esac
 }

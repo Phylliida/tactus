@@ -4265,8 +4265,8 @@ fn push_post_call_frames(
 
     // Phase 1, then the prophecy ∀-bind (BEFORE the ensures Hyp, which
     // references `P`).
-    push_mut_arg_binders(callee, subst, obl, &mut new_obl);
-    push_prophecy_frames(return_prophecy.as_ref(), callee, subst, dest, &mut new_obl);
+    push_mut_arg_binders(callee, typ_args, subst, obl, &mut new_obl);
+    push_prophecy_frames(return_prophecy.as_ref(), callee, typ_args, subst, dest, &mut new_obl);
 
     // Phases 2/3 — or the #128 substitution path replacing them.
     // P3 (DESIGN-typed-renderer.md): single-walk ret-eq extraction on
@@ -4315,7 +4315,7 @@ fn push_post_call_frames(
     });
     let (dest_value, use_dest_name) =
         push_ret_frames(
-            substituted_ensures, eq_extraction, callee, subst, dest,
+            substituted_ensures, eq_extraction, callee, typ_args, subst, dest,
             Some(build_call_fact_info(callee, subst, e)), &mut new_obl);
 
     // Phase 4.
@@ -4416,6 +4416,7 @@ fn mint_return_prophecy(
 /// frames push onto `new_obl`.
 fn push_mut_arg_binders(
     callee: &FunctionX,
+    typ_args: &[Typ],
     subst: &CallSubstitutions,
     obl: &OblCtx,
     new_obl: &mut OblCtx,
@@ -4439,8 +4440,8 @@ fn push_mut_arg_binders(
             new_obl.clear_prophecy(info.rebind_local());
             continue;
         }
-        let typ = &callee.params[info.param_idx].x.typ;
-        let lean_typ = substitute(&typ_to_expr(typ), &subst.typ_subst);
+        let declared = &callee.params[info.param_idx].x.typ;
+        let lean_typ = substitute(&typ_to_expr(declared), &subst.typ_subst);
         new_obl.frames.push_back(CtxFrame::Binder(LBinder::explicit(info.fresh.clone(), lean_typ)));
         // Bound predicate: pass the inner-typed view via TypedExpr
         // coercion. `type_bound_predicate` already recurses through
@@ -4448,11 +4449,16 @@ fn push_mut_arg_binders(
         // that the value-side was wrapper-typed; bridging via
         // `into_slot(&inner)` produces `fresh.deref` for the
         // wrapper case and `fresh` for the bare case.
-        let inner_typ = crate::to_lean_expr::strip_one_ref_decoration(typ);
+        // F5 (bootstrap-80): compute on the INSTANTIATED param typ —
+        // the declared typ is a bare `T` for a generic `&mut T` callee,
+        // which carries no numeric bound (b78's mirrored quirk; the
+        // cert serializer mirrors this same substitution).
+        let typ = instantiate_callee_typ(callee, typ_args, declared);
+        let inner_typ = crate::to_lean_expr::strip_one_ref_decoration(&typ);
         let inner_form = crate::typed_expr::TypedExpr::var(
             info.fresh.clone(), typ.clone(),
         ).into_slot(&inner_typ);
-        if let Some(pred) = type_bound_predicate(&inner_form, typ) {
+        if let Some(pred) = type_bound_predicate(&inner_form, &typ) {
             new_obl.frames.push_back(CtxFrame::Hyp(pred, HypProvenance::Other));
         }
     }
@@ -4468,6 +4474,7 @@ fn push_mut_arg_binders(
 fn push_prophecy_frames(
     return_prophecy: Option<&ReturnProphecy>,
     callee: &FunctionX,
+    typ_args: &[Typ],
     subst: &CallSubstitutions,
     dest: Option<&VarIdent>,
     new_obl: &mut OblCtx,
@@ -4481,9 +4488,13 @@ fn push_prophecy_frames(
         let ret_typ = &callee.ret.x.typ;
         let lean_typ = substitute(&typ_to_expr(ret_typ), &subst.typ_subst);
         new_obl.frames.push_back(CtxFrame::Binder(LBinder::explicit(rp.var.clone(), lean_typ)));
-        let inner_form = crate::typed_expr::TypedExpr::var(rp.var.clone(), ret_typ.clone())
+        // F5 (bootstrap-80): the bound runs on the INSTANTIATED ret typ
+        // (declared is a bare typ param for a generic callee — the
+        // predicate would silently elide).
+        let ret_typ_subst = instantiate_callee_typ(callee, typ_args, ret_typ);
+        let inner_form = crate::typed_expr::TypedExpr::var(rp.var.clone(), ret_typ_subst.clone())
             .into_slot(&rp.inner_typ);
-        if let Some(pred) = type_bound_predicate(&inner_form, ret_typ) {
+        if let Some(pred) = type_bound_predicate(&inner_form, &ret_typ_subst) {
             new_obl.frames.push_back(CtxFrame::Hyp(pred, HypProvenance::Other));
         }
         if let Some(d) = dest {
@@ -4897,15 +4908,49 @@ fn is_len_call(e: &Expr) -> bool {
     }
 }
 
+/// VIR-level typ-arg instantiation of a callee's declared typ (param or
+/// ret): `subst_typ` when the call's typ args line up with the callee's
+/// typ params, else the declared typ unchanged. Single source for the
+/// computation the cert serializer inlined as `ret_typ_subst`
+/// (bootstrap-80 F5: the bound predicates below must run on the
+/// INSTANTIATED typ — a generic callee's declared `T`/`&mut T` carries
+/// no numeric bound, silently dropping the hyp for every concrete
+/// instantiation).
+pub(crate) fn instantiate_callee_typ(
+    callee: &FunctionX,
+    typ_args: &[Typ],
+    declared: &Typ,
+) -> Typ {
+    if callee.typ_params.len() == typ_args.len() {
+        let map: HashMap<vir::ast::Ident, Typ> = callee
+            .typ_params
+            .iter()
+            .cloned()
+            .zip(typ_args.iter().cloned())
+            .collect();
+        vir::sst_util::subst_typ(&map, declared)
+    } else {
+        declared.clone()
+    }
+}
+
 fn push_ret_frames(
     substituted_ensures: Option<LExpr>,
     eq_extraction: Option<(LExpr, Typ)>,
     callee: &FunctionX,
+    typ_args: &[Typ],
     subst: &CallSubstitutions,
     dest: Option<&VarIdent>,
     call_fact: Option<CallFactInfo>,
     new_obl: &mut OblCtx,
 ) -> (LExpr, bool) {
+    // F5 (bootstrap-80): the ret bound predicates below run on the
+    // INSTANTIATED ret typ — the declared typ is a bare typ param for a
+    // generic callee, which `type_bound_predicate` cannot bound, so the
+    // hyp was silently dropped for every concrete instantiation
+    // (vec_read's `Seq.index … → Int`). The cert serializer's mirror
+    // already computes on `ret_typ_subst`; this aligns production.
+    let ret_typ_subst = instantiate_callee_typ(callee, typ_args, &callee.ret.x.typ);
     // Link-discharge L1: the woven ensures hyp carries this call's
     // spine entry so the generator can discharge it positionally.
     let ens_prov = match call_fact {
@@ -4983,7 +5028,7 @@ fn push_ret_frames(
             // sort is faithful and strongest (for a ℤ-valued E bound
             // into a ℕ dest, `0 ≤ E` is exactly the fact that makes
             // the `Int.toNat E` bridge lossless).
-            if let Some(pred) = type_bound_predicate(raw_e, &ret.typ) {
+            if let Some(pred) = type_bound_predicate(raw_e, &ret_typ_subst) {
                 new_obl.frames.push_back(CtxFrame::Hyp(pred, HypProvenance::Other));
             }
             // The eq clause that gave us E has been dropped from
@@ -5015,7 +5060,7 @@ fn push_ret_frames(
             let ret_typ_lean = substitute(&typ_to_expr(&ret.typ), &subst.typ_subst);
             new_obl.frames.push_back(CtxFrame::Binder(LBinder::explicit(binder_name.clone(), ret_typ_lean)));
             if let Some(pred) = type_bound_predicate(
-                &LExpr::var(binder_name.clone()), &ret.typ,
+                &LExpr::var(binder_name.clone()), &ret_typ_subst,
             ) {
                 new_obl.frames.push_back(CtxFrame::Hyp(pred, HypProvenance::Other));
             }
@@ -5344,16 +5389,9 @@ pub(crate) fn cert_call_leaves<'a>(
     // serializer's job; here we only render the leaves + tag the path. ──
     let ret = &callee.ret.x;
     // VIR-level instantiated ret typ (production: the dest-let binder
-    // typ site). Identity for non-generic callees.
-    let ret_typ_subst: Typ = if callee.typ_params.len() == typ_args.len() {
-        let map: HashMap<vir::ast::Ident, Typ> = callee.typ_params.iter()
-            .cloned()
-            .zip(typ_args.iter().cloned())
-            .collect();
-        vir::sst_util::subst_typ(&map, &ret.typ)
-    } else {
-        ret.typ.clone()
-    };
+    // typ site). Identity for non-generic callees. F5: single-sourced
+    // through `instantiate_callee_typ`.
+    let ret_typ_subst: Typ = instantiate_callee_typ(callee, typ_args, &ret.typ);
     let ret_eq = vir_find_ret_eq(&inlined.ensures, &subst);
     let substituted_ensures = render_call_ensures(
         &inlined.ensures, &subst, None, callee, &render_ctx_ens,
@@ -5443,13 +5481,18 @@ pub(crate) fn cert_call_leaves<'a>(
     // earlier `&mut`-returning call, which `call-mut-ret` rejects — so
     // no fn with one ever reaches this arm.
     let cert_mut_args: Vec<CertMutArg> = subst.mut_args.iter().map(|info| {
-        let typ = &callee.params[info.param_idx].x.typ;
-        let binder_typ = substitute(&typ_to_expr(typ), &subst.typ_subst);
-        let inner_typ = crate::to_lean_expr::strip_one_ref_decoration(typ);
+        let declared = &callee.params[info.param_idx].x.typ;
+        let binder_typ = substitute(&typ_to_expr(declared), &subst.typ_subst);
+        // F5 (bootstrap-80): the bound runs on the INSTANTIATED param
+        // typ, mirroring production's fixed `push_mut_arg_binders` —
+        // the declared typ is a bare `T` for a generic `&mut T` callee
+        // (b78's "mirrored production quirk", now fixed both sides).
+        let typ = instantiate_callee_typ(callee, typ_args, declared);
+        let inner_typ = crate::to_lean_expr::strip_one_ref_decoration(&typ);
         let inner_form = crate::typed_expr::TypedExpr::var(
             info.fresh.clone(), typ.clone(),
         ).into_slot(&inner_typ);
-        let bound = crate::to_lean_sst_expr::type_bound_predicate(&inner_form, typ);
+        let bound = crate::to_lean_sst_expr::type_bound_predicate(&inner_form, &typ);
         let rebind_value = crate::typed_expr::TypedExpr::var(
             info.fresh.clone(), typ.clone(),
         ).into_slot(&inner_typ);
