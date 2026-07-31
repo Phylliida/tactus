@@ -1,10 +1,10 @@
 # bootstrap-80 — A7: stage-B callee-signature vocabulary
 
-Status: **DESIGN FROZEN 2026-07-31 — all 6 open questions resolved
-(§ "Design freeze" below), under Danielle's standing delegation with
-her principles (1 right-way/cleaner, 2 trusted-surface shrink, 3
-Lean-idiomatic, 4 transparency, 5 predictability, 6 invest for
-clean). Implementation not started.**
+Status: **SCOPE ITEMS 1+3 DONE 2026-07-31 (one session). probe9 ALL
+33 bridges CLOSE (zero honest-fails anywhere in the corpus);
+probe11 ALL 11 tgt subjects CLOSE; probes 13(21)/14/17/37/38 +
+units 428+7/0 green; golden byte-stable. Remaining: scope item 2
+(poison derivation, F4 — carded stages below).**
 Closes the LAST coverage-arm class of milestone A. All six A7-class
 honest-fails are the SAME class (vec_read deep-leaf): frame assembly
 byte-perfect everywhere; divergence is leaf RENDERING only.
@@ -394,3 +394,81 @@ no-tgt-gate constraint.
 - Battery: tactus-core gate + package gate + Link discharge 198/0,
   lean_verify units, e2e, probes 9/11/13/14/20/37/38, golden
   re-vendored.
+
+## DONE (2026-07-31, one session) — scope items 1 + 3
+
+- **Stage 1: the vocabulary (`1b01cb11`).** RawList elements pair
+  each arg with the callee's EXPECTED param typ (serializer:
+  `fn_param_typs_of` extracted from production's method as the single
+  source, over the same fn_map; fallback = arg.typ, mirroring
+  `into_slot(&a.typ)`). `reconcile_arg` derives the per-arg slot
+  coercion reference-side as a TAG if-chain (a nested match breaks
+  the one-line Lean emission — "redundant alternative", the
+  documented lib.rs:3161 idiom): sort bridge both directions +
+  wrapper reconciliation (Ref/Box ↔ bare deref/mk-wrap, Ref↔Box
+  peel+rewrap, passthrough when the callee param IS ref-typed — the
+  vec_read G2 mis-derivation). `ExprData.RefMk/BoxMk` first-class
+  wrapper nodes (id-free; the reference cannot mint interned ids —
+  production's transcriber maps the same apps). New pin fn
+  `a7_reconcile_kernel_computes`. **Gate 286/0 + pkg gate 54 +
+  discharge 198/0.**
+- **F5 pulled forward (`df5c184b`) — vec_read's residual was NOT the
+  leaf class.** After stage 1, vec_read's goal 1 still diverged:
+  an EXTRA `_h_hoist` bound hyp in the reference telescope. Root
+  cause: production's `type_bound_predicate` ran on the UNINSTANTIATED
+  declared typ, so a generic callee (`Seq.index` → `Int`; `swap_incr`
+  at `&mut T`) silently elided the numeric bound hyp — the b78
+  "mirrored production quirk", bigger than carded (Phase-E ret bound
+  + ∀-path + prophecy, not just Phase-1). Fixed per the freeze:
+  `instantiate_callee_typ` single-source; production substitutes at
+  all four sites; the cert serializer's Phase-1 mirror substitutes
+  identically (its ret-bound already did). The serializer's existing
+  FHyp then matched production's NEW theorem binder exactly.
+- **Assign-rhs `into_slot(dest_typ)` (`f22a50c9`) — find_cancellation's
+  residual, masked inside the "A7-class" attribution.** probe11
+  per-goal bisection (24 goals, 11–20 diverging): the cond-setup
+  hoisted eq prop read `tmp__6 = w` vs production's `tmp__6 = w.deref`
+  — production's `walk_let` bridges the rhs into the dest typ
+  (`sst_exp_to_typed` + `into_slot`), the serializer rendered raw.
+  Mirrored with the binder-aware ctx (byte-neutral switch: the ctx
+  only affects class-method coercion, absent from every closing
+  Assign rhs).
+- **Classification sweep:** probe9 33/33 CLOSE (vec_read, count_to_len,
+  fill_zeros, vec_push7 reclassified; every other subject
+  byte-stable — F6 held incl. the golden). probe11 11/11 CLOSE
+  (copy_word + find_cancellation_exec reclassified; scoped
+  per-module regen only — NO tgt gate, per the constraint).
+  probe13 → 21 classes: the expected-typ kill (A5) + the b79 Loop
+  classes strengthened to the FULL deep bridge (strips retired).
+  probe38: the A7 tripwire FIRED as designed → close+kill pair.
+  probe17: pre-existing stale-red since the prelude split (pinned
+  e81f dir; NOT in the recent battery lines) — fixed to the
+  all-preludes glob; defs bridge closes WITH the new CallN pairs.
+  probe37: eval/edenote gained RefMk/BoxMk arms (the non-exhaustive
+  match produced sorryAx — caught by the probe's own axiom audit,
+  exactly the fail-loud design). Units 428+7/0; golden byte-stable.
+- **probe20 DEFERRED (documented):** its ~130 vendored tgt defcerts
+  carry the OLD RawList shape and will not elaborate against the new
+  vocabulary; regeneration needs the tgt-slice emit, deferred under
+  the no-tgt-gates constraint. Re-emit with the new binary when tgt
+  work resumes.
+- **D discipline:** no new StmData arms; FrameList untouched;
+  `wp_stm_sound` untouched (the vocab growth is leaf-rendering +
+  Call-arg data). The soundness claim covers exactly what it covered
+  before.
+- **Before/after census (endgame acceptance):** A7-class honest-fails
+  6 → 0 (probe9 ×4 + probe11 ×2, all CLOSE); probe9 honest-fail set
+  EMPTY (was: vec_read, count_to_len, fill_zeros, vec_push7);
+  probe11 honest-fail set EMPTY (was: copy_word,
+  find_cancellation_exec); the vec_read Ret-goal `=0` stage-B
+  tripwire FIRED and is replaced.
+
+**Remaining (scope item 2, F4 — poison derivation):** FnCtxData gains
+`residue_names` + the `prop_deeps` side table; refWp derives
+wrap-forcing + the FLetH→FLet collapse via `raw_exp_mentions`; the
+carried bit is deleted after the cross-check era (A4 sequencing:
+bridges green with derivation active ⟹ derivation ≡ bit on the
+corpus); probe13 `poison_flip` re-points at the derivation input.
+Impl-time checklist (from A3): enumerate EVERY `hyp_poison` call
+site (FHyp props, FLetH eq props, the c_lx cond site :1104, IfCtor
+eq/neg props) and transcribe deep for exactly those.

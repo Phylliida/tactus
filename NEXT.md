@@ -1,17 +1,27 @@
 # NEXT — bootstrap work queue (2026-07-21; superseded 2026-07-24)
 
-**2026-07-31: A7 CARDED + DESIGN FROZEN —
-`board/bootstrap-80-a7-callee-signature-vocab.md`.** All 6 freeze
-questions resolved under Danielle's principles: per-site expected param
-types on the call nodes (RawList element pairs; NO signature table —
-nodes self-describing, no lookup/fallback in render_exp); poison BIT
-DELETED from the vocab — derived on the fly from a ctx side table
-(residue_names + prop_deeps; frames/goals/wp_stm_sound untouched);
-&mut-T unsubstituted-typ quirk = FIX production + mirror. Byte-neutrality
-stated as a lemma (F6). Constraint (Danielle 2026-07-31): NO full tgt
-gate runs — acceptance uses probe11's scoped per-module emits. Next
-session: implement (ONE batched tactus-core vocab edit → serializer →
-probes) → B (b67 caching + b68 flip).
+**2026-07-31 pm: A7 scope items 1+3 DONE —
+`board/bootstrap-80-a7-callee-signature-vocab.md` (completion record).**
+probe9 ALL 33 CLOSE (zero honest-fails corpus-wide), probe11 ALL 11 tgt
+CLOSE (scoped regen only — no tgt gate). THREE landings: (1) the
+callee-signature vocab (RawList per-arg expected typs + reconcile_arg
+two-phase slot reconciliation + RefMk/BoxMk id-free nodes); (2) F5
+PULLED FORWARD — vec_read's residual was production's bound predicates
+running on the UNINSTANTIATED declared typ (generic callees silently
+lost bound hyps; instantiate_callee_typ, 4 production sites + Phase-1
+serializer mirror); (3) Assign-rhs `into_slot(dest_typ)` (walk_let's
+coercion — find_cancellation's `tmp__6 = w.deref`, masked inside the
+A7-class attribution). probe13 → 21 classes (expected-typ kill; Loop
+classes full-strength), probe38 tripwire fired→close+kill, probe17
+de-staled (pre-existing, pinned-prelude), probe37 RefMk/BoxMk arms,
+units 428+7/0, golden byte-stable, gate 286/0 + discharge 198/0.
+probe20 deferred (vendored old-shape tgt defcerts; needs the tgt-slice
+re-emit, deferred under the no-tgt-gates constraint).
+**NEXT: stage 2 = scope item 2 (F4 poison derivation — residue_names +
+prop_deeps side table, derive wrap-forcing + FLetH collapse
+reference-side, delete the bit after the cross-check era, re-point
+probe13 poison_flip; impl-time checklist on the card) → B (b67 caching
++ b68 flip).**
 
 **2026-07-28: b79 (break-form loop arm) DONE — see
 `board/bootstrap-79-break-form-loop-arm.md` (full record).** The
