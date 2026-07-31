@@ -2499,19 +2499,27 @@ pub open spec fn raw_list_mentions(rs: LeafList, l: RawList) -> nat
 // direction (production wrapped on a real mention, we hoist → the goal
 // shapes diverge), correct-by-luck in the other; totality loudness rests
 // on the serializer's emission-time assertion (b80 card, review addendum).
+// The ctx-level entry `poisoned_props` takes the WHOLE FnCtxData (not the
+// two field projections) so the Link discharge's wf-transport — which
+// resolves own-param args, not `<param>.<field>` projections — can feed
+// its preservation lemma (b80 stage-2 landing evidence).
 #[verifier::structural_decreases]
-pub open spec fn poisoned_props(rs: LeafList, ds: PropDeepList) -> LeafList
+pub open spec fn poisoned_props_of(rs: LeafList, ds: PropDeepList) -> LeafList
     decreases ds
 {
     match ds {
         PropDeepList::Nil => LeafList::Nil,
         PropDeepList::Cons(id, deep, t) =>
             if raw_exp_mentions(rs, *deep) == 1 {
-                LeafList::Cons(id, Box::new(poisoned_props(rs, *t)))
+                LeafList::Cons(id, Box::new(poisoned_props_of(rs, *t)))
             } else {
-                poisoned_props(rs, *t)
+                poisoned_props_of(rs, *t)
             },
     }
+}
+
+pub open spec fn poisoned_props(c: FnCtxData) -> LeafList {
+    poisoned_props_of(c.residue_names, c.prop_deeps)
 }
 
 // The N1 wrap gate, second half (bootstrap-74 slice 2): any POISONED
@@ -3291,7 +3299,7 @@ pub open spec fn seed_frame(c: FnCtxData) -> FrameList {
 // single poison source (`pp`) through the walk, the gate, and the
 // FLetH/RetLetH collapse.
 pub open spec fn ref_wp(c: FnCtxData, s: StmData) -> GoalList {
-    wp_stm(poisoned_props(c.residue_names, c.prop_deeps), seed_frame(c), s)
+    wp_stm(poisoned_props(c), seed_frame(c), s)
 }
 
 // Structural equality for the `decide` bridge (DESIGN §2.3). STRICT:
@@ -6373,7 +6381,7 @@ pub proof fn wp_stm_sound(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle
 
 // ref_wp unfold + top-level soundness through the genuine seed_frame.
 pub proof fn u_ref_wp(c: FnCtxData, s: StmData)
-    ensures ref_wp(c, s) == wp_stm(poisoned_props(c.residue_names, c.prop_deeps), seed_frame(c), s)
+    ensures ref_wp(c, s) == wp_stm(poisoned_props(c), seed_frame(c), s)
 {}
 
 /// THE LOOP-CLOSURE THEOREM (hand-Lean `ref_wp_sound`): the emitted
@@ -6382,10 +6390,10 @@ pub proof fn u_ref_wp(c: FnCtxData, s: StmData)
 /// triple consistent with the leaf typing (valuation-parametric).
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc])")]
 pub proof fn ref_wp_sound(hp: HpOracle, he: HeOracle, lv: LvOracle, c: FnCtxData, s: StmData, st: St)
-    ensures holds_all(hp, he, lv, ref_wp(c, s), st) == exec_safe_f(poisoned_props(c.residue_names, c.prop_deeps), hp, he, lv, seed_frame(c), s, st)
+    ensures holds_all(hp, he, lv, ref_wp(c, s), st) == exec_safe_f(poisoned_props(c), hp, he, lv, seed_frame(c), s, st)
 {
     u_ref_wp(c, s);
-    wp_stm_sound(poisoned_props(c.residue_names, c.prop_deeps), hp, he, lv, seed_frame(c), s, st);
+    wp_stm_sound(poisoned_props(c), hp, he, lv, seed_frame(c), s, st);
 }
 
 // ── W5 frame-algebra one-step unfolds (bootstrap-65): the frame_after /
