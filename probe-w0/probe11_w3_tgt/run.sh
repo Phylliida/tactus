@@ -87,17 +87,23 @@ export LEAN_PATH="$CORE_OUT:$CORE_OUT/pkg:$PRELUDE"
 # cert_call_leaves (no double Ref.mk on earlier call-dest args).
 honest_fail_reason() {
   case "$1" in
-    runtime__find_cancellation_exec) printf '%s' 'stage-B reference-renderer coercion derivation (bootstrap-77, 2026-07-24): the vec_read class, newly VISIBLE because the fn finally serializes (its assert-query-tactus census tag retired). Stage-A assembly matches (goal count 21 = production; spines align); the per-goal divergence is deep-leaf ONLY — the reference render_exp derives `App idx (FieldProj (Atom v) deref)` where production writes `App idx (Atom v)` (View.view call arg on the &Vec param — per-arg spec-call coercions need the callee signature the fixed-vocabulary mirror does not carry). Same class and same fix as probe9 vec_read: endgame A7 (stage-B callee-signature vocabulary).' ;;
+    # bootstrap-80 A7 (2026-07-31): find_cancellation_exec and copy_word
+    # are FIXED and now expected-CLOSE. Three landings closed them:
+    # (1) the callee-signature vocabulary (per-arg expected param typs →
+    # reconcile_arg derives the per-arg slot coercions reference-side);
+    # (2) F5 — production's bound predicates now run on the INSTANTIATED
+    # typ (a generic callee's declared typ-param silently elided the
+    # numeric bound hyp); (3) the Assign-rhs `into_slot(dest_typ)`
+    # coercion mirror (production's walk_let derefs a ref-typed value
+    # bound into a bare local — find_cancellation's cond-setup
+    # `tmp__6 = w.deref`). find_cancellation's residual after (1)+(2)
+    # was (3), masked inside the "A7-class" attribution: goals 11–20
+    # diverged on the eq-prop leaf text, not the call-arg class. If
+    # either reverts to failing, that is a reclassify-required
+    # regression, not a new honest-fail class.
     # bootstrap-79 (2026-07-28): copy_word CERT RETURNED (the break-form
-    # loop arm). A7-class as the b78 card predicted: the
-    # entry/exit-reclose/maintain invariants and the first AQT assert
-    # are view()-bearing (vec_read deref class — goals 0,1,3,4,7,10,11
-    # diverge deep-leaf only); ALL frame channels validate — goals
-    # 2,5,6,8,9,12,13,14 close outright (incl. the mut-call push frames
-    # and the Ret-dest-collision `out` → `out_hoist1` rename, found
-    # here for the first time and FIXED serializer-side), and the
-    # leaf-normalized spine bridge closes over all 15 goals.
-    runtime__copy_word) printf '%s' 'A7 stage-B deep-leaf class on view()-bearing leaves (vec_read class; b78 card prediction confirmed). The b79 break-form assembly is byte-perfect — non-view goals close outright incl. the push mut frames + the Ret-dest-collision rename (out → out_hoist1, first collision subject, fixed by the b79 Ret-arm work); leaf-normalized spine bridge closes over all 15 goals. Closes with A7 stage-B callee-signature vocab.' ;;
+    # loop arm — Ret-dest-collision `out` → `out_hoist1` rename found
+    # here first and FIXED serializer-side).
     *) printf '%s' '' ;;
   esac
 }
