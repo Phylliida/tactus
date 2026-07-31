@@ -107,6 +107,20 @@ def perturb_req_atom(sst):
     return mut
 
 
+def drop_index_expected(sst):
+    """A7 kill: drop the Seq.index 2nd arg's EXPECTED param typ
+    (TyInt → TyNat) in the Ret's CallN. reconcile_arg then derives NO
+    `Int.ofNat` where production inserts one — pins that the
+    expected-typ channel is live (the vec_read goal-1 close depends
+    on it)."""
+    pat = "lib.RawExp.Var 2 lib.TypData.TyNat)) lib.TypData.TyInt"
+    i = sst.find(pat)
+    assert i != -1, "no (Var 2 TyNat, expected TyInt) pair in vec_read SST"
+    mut = sst[:i] + "lib.RawExp.Var 2 lib.TypData.TyNat)) lib.TypData.TyNat" + sst[i + len(pat):]
+    assert mut != sst
+    return mut
+
+
 def main():
     L = []
     L.append("import TactusDefs_lib_exec")
@@ -159,15 +173,18 @@ def main():
     L.append(f"@[reducible] def vr_sst : lib.StmData := {sst}")
     L.append(f"@[reducible] def vr_goals : lib.GoalList := {goals}")
     L.append(f"@[reducible] def vr_sst_reqmut : lib.StmData := {perturb_req_atom(sst)}")
+    L.append(f"@[reducible] def vr_sst_expdrop : lib.StmData := {drop_index_expected(sst)}")
     L.append("-- baseline: goal 0 (Call PRECONDITION, generic instantiation) closes.")
     L.append("example : gl_nth_eq (lib.ref_wp vr_ctx vr_sst) vr_goals 0 = 1 := by decide")
     L.append("-- kill: perturbing the transcribed req atom flips goal 0.")
     L.append("example : gl_nth_eq (lib.ref_wp vr_ctx vr_sst_reqmut) vr_goals 0 = 0 := by decide")
-    L.append("-- A7 TRIPWIRE: goal 1 (Ret) is the documented stage-B honest-fail")
-    L.append("-- (view-call deref + Int.ofNat CallN coercion). When the A7 vocabulary")
-    L.append("-- lands and this closes, this example fails loud — replace with a")
-    L.append("-- close+kill pair. Never a silent cap (P2).")
-    L.append("example : gl_nth_eq (lib.ref_wp vr_ctx vr_sst) vr_goals 1 = 0 := by decide")
+    L.append("-- A7 LANDED (bootstrap-80, 2026-07-31): goal 1 (Ret) now CLOSES —")
+    L.append("-- the tripwire fired as designed and is replaced by this close+kill")
+    L.append("-- pair (P2). The kill drops the Seq.index 2nd arg's EXPECTED typ")
+    L.append("-- (TyInt → TyNat): reconcile_arg then derives NO `Int.ofNat` where")
+    L.append("-- production inserts one — the expected-typ channel is live.")
+    L.append("example : gl_nth_eq (lib.ref_wp vr_ctx vr_sst) vr_goals 1 = 1 := by decide")
+    L.append("example : gl_nth_eq (lib.ref_wp vr_ctx vr_sst_expdrop) vr_goals 1 = 0 := by decide")
     L.append("")
 
     out = pathlib.Path(__file__).with_name("B70B71Close.lean")

@@ -193,6 +193,22 @@ def poison_drop(sst):
     return sst2
 
 
+def expected_typ_drop(sst):
+    """A7 (bootstrap-80 F3) expected-typ channel kill. The RawList pair
+    slot carries the callee's EXPECTED param typ; reconcile_arg derives
+    the per-arg coercion from the (actual, expected) pair. Flipping the
+    Seq.index index-arg's expected typ TyInt → TyNat makes the reference
+    derive NO `Int.ofNat` where production inserts one — pins that the
+    per-arg signature channel is load-bearing in the bridge (an SST-side
+    mutation: the reference's own input is perturbed)."""
+    pat = "lib.RawExp.Var 2 lib.TypData.TyNat)) lib.TypData.TyInt"
+    i = sst.find(pat)
+    assert i != -1, "expected_typ_drop: no (Var 2 TyNat, expected TyInt) pair in vec_read SST"
+    mut = sst[:i] + "lib.RawExp.Var 2 lib.TypData.TyNat)) lib.TypData.TyNat" + sst[i + len(pat):]
+    assert mut != sst
+    return mut
+
+
 def _ifctor_args(sst):
     """Locate the (single) `lib.StmData.IfCtor` node and return the spans of
     its positional args: (pos_binders, [6 scalar spans], thn, els). Layout
@@ -500,6 +516,10 @@ CLASSES = [
     ("count_to_len", "loop_guard_leaf_drop",  "Loop break-form: degenerate the exit-guard span-mark'd ¬exp (b79)", loop_guard_leaf_drop, "sst", "close"),
     ("count_to_len", "loop_negneg_leaf_drop", "Loop break-form: degenerate the maintain ¬(¬cond) else-guard (b79)", loop_negneg_leaf_drop, "sst", "close"),
     ("count_to_len", "loop_use_leaf_drop",    "Loop break-form: degenerate the post-loop bare ¬cond (b79)",    loop_use_leaf_drop,    "sst", "close"),
+    # bootstrap-80 A7: the expected-typ channel kill — the per-arg callee
+    # param typs the RawList pairs carry are load-bearing (flipping one
+    # flips the derived `Int.ofNat`, hence the bridge).
+    ("vec_read", "expected_typ_drop", "drop the Seq.index arg's EXPECTED typ TyInt→TyNat (A7 reconcile channel)", expected_typ_drop, "sst", "close"),
 ]
 
 
@@ -518,10 +538,10 @@ def main():
     L.append("-- INDEPENDENTLY re-derives the correct structure. If any mutation still")
     L.append("-- equalled 1, its `= 0` example would error.")
     L.append("")
-    L.append("-- bootstrap-79: the leaf-normalized comparison used by the count_to_len")
-    L.append("-- Loop classes — the subject is A7-class (view()-bearing leaves diverge")
-    L.append("-- on the documented vec_read deref class), so the frame channels under")
-    L.append("-- test are compared with every obligation leaf normalized to a constant.")
+    L.append("-- bootstrap-79: the leaf-normalized comparison, retained for")
+    L.append("-- reference — count_to_len's Loop classes used it while the")
+    L.append("-- subject was A7-class. A7 landed (bootstrap-80): the Loop")
+    L.append("-- classes now run the FULL deep bridge (strips unused).")
     L.append("noncomputable def strip : lib.GoalData → lib.GoalData")
     L.append("  | .All x t b => .All x t ⟨strip b.deref⟩")
     L.append("  | .Imp h b => .Imp h ⟨strip b.deref⟩")
@@ -556,10 +576,12 @@ def main():
             L.append("")
             fired += 1
             continue
-        # bootstrap-79: count_to_len's Loop classes use the leaf-normalized
-        # comparison (the A7 leaf divergence is orthogonal to the frame
-        # channels under test).
-        norm = fn == "count_to_len"
+        # bootstrap-79: count_to_len's Loop classes used the leaf-normalized
+        # comparison while the subject was A7-class. A7 LANDED (bootstrap-80,
+        # 2026-07-31): count_to_len CLOSES the full deep bridge, so the
+        # classes run at full strength now (norm = False; the strips
+        # normalizer is retained above for reference).
+        norm = False
         def cmp(sst_term, goals_term):
             if norm:
                 return f"lib.goals_eq (strips (lib.ref_wp {cls}_ctx {sst_term})) (strips {goals_term})"
