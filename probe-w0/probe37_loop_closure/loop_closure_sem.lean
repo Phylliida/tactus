@@ -477,13 +477,17 @@ example (E : SymEnv) (x ty : Int) (t : lib.GoalData) (st : St)
 theorem soundness_concrete (E : SymEnv) (c : lib.FnCtxData) (s : lib.StmData) (st : St)
     (hwf_s : lib.StmDataWf s) (hwf_c : lib.FnCtxDataWf c) :
     holdsAll (hpOf E) (heOf E) (lvOf E) (lib.ref_wp c s) st
-      ↔ execSafeF (hpOf E) (heOf E) (lvOf E) (lib.seed_frame c) s st :=
+      ↔ execSafeF (lib.poisoned_props c) (hpOf E) (heOf E) (lvOf E) (lib.seed_frame c) s st :=
   -- b77: the closed theorem gained the `h_c_bound` binder (the new
   -- `FnCtxData.closer_default` scalar's projected bound); it is the
   -- final conjunct of `FnCtxDataWf c`. b78 S2: `mut_params` added a
   -- `MutParamListWf` conjunct after `reqs`, pushing it one `.2` deeper.
+  -- bootstrap-80 stage 2 (F4): `residue_names` + `prop_deeps` added two
+  -- more wf conjuncts after `enss` (pushing it two `.2`s deeper), and
+  -- `exec_safe_f` gained the derived poison set as its first arg
+  -- (`lib.poisoned_props c`, exactly what `ref_wp` threads).
   iff_of_eq (lib.ref_wp_sound_closed (hpOf E) (heOf E) (lvOf E) c
-    hwf_c.2.2.2.2.2.2 s st hwf_s hwf_c)
+    hwf_c.2.2.2.2.2.2.2.2 s st hwf_s hwf_c)
 
 -- box-deref rfl helper for ExprList (mirror u_box_ed; used by the AppN fold).
 @[simp] theorem u_box_el (x : lib.ExprList) : (Tactus.Box.mk x).deref = x := rfl
