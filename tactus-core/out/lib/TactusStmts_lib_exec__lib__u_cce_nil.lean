@@ -2,5 +2,5 @@ import TactusDefs_lib_exec
 set_option linter.unusedVariables false
 set_option maxHeartbeats 800000
 set_option autoImplicit false
-@[reducible] noncomputable def _tactus_postcondition_u_cce_nil_at_lib_5044_13_1_stmt : Prop :=
-  ∀ (f : lib.FrameList), /- @rust:tactus-core/lib.rs:5044:13 -/ lib.close_each_e f lib.RawExpList.Nil = lib.GoalList.Nil
+@[reducible] noncomputable def _tactus_postcondition_u_cce_nil_at_lib_5217_13_1_stmt : Prop :=
+  ∀ (pp : lib.LeafList) (f : lib.FrameList), /- @rust:tactus-core/lib.rs:5217:13 -/ lib.close_each_e pp f lib.RawExpList.Nil = lib.GoalList.Nil

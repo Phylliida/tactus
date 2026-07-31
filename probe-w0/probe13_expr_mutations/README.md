@@ -32,7 +32,6 @@ classes** (SST-side), each on its own live cert:
 | `wrong_field` | `mk_point`   | G3 struct field | GOAL: wrong accessor: `FieldProj (Atom N) F` → `FieldProj (Atom N) 999999` |
 | `wrong_width` | `add_capped` | G6 HasType | GOAL: wrong overflow bound: `Lit 2^64` → `Lit 2^32` |
 | `poison_residue_drop` | `add_capped` | F4 derived poison (bootstrap-80 stage 2) | CTX: zero `residue_names` — a missed real poison must flip (miss direction) |
-| `poison_residue_spurious` | `add_capped` | F4 derived poison | CTX: cons a deep-occurring name onto `residue_names` — a spurious poison must flip (spurious direction) |
 | `poison_deep_drop` | `add_capped` | F4 derived poison | CTX: drop the residue-mentioning `prop_deeps` entries — a missing table entry must flip (missing-entry kill) |
 | `ifctor_eq_drop` | `head_exec` | b77/A5 + N2 frame assembly | SST: degenerate the `IfCtor` ctor-equation hyp leaf (sentinel id) |
 | `ifctor_binder_drop` | `head_exec` | b77/A5 + N2 frame assembly | SST: drop the field-binder telescope (`pos_binders` → Nil) |
@@ -48,8 +47,10 @@ channel (ctor-equation hyp, field-binder telescope, else-branch hyp, arm
 attachment) proves each is load-bearing in the bridge until A7 derives the
 detector reference-side. Uncovered: the peel decision itself. The poison channel is derived
 reference-side since bootstrap-80 stage 2 (F4) — the IfCtor eq/neg props ride
-the same `prop_deeps` table; the channel is pinned by the three `poison_*`
-ctx-side kills above (which replaced the retired zero-the-bits `poison_flip`:
+the same `prop_deeps` table; the channel is pinned by the two `poison_*`
+ctx-side kills above (no spurious-direction kill: it cannot bite on
+add_capped — the real poison wraps every post-residue goal — and the
+direction is covered corpus-wide by every hoisted baseline) (which replaced the retired zero-the-bits `poison_flip`:
 era-1 StmData bits are unread, so that kill was dead by construction).
 
 For each class the generated `ExprMutations.lean` asserts, all by `decide`:

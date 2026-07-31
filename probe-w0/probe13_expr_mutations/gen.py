@@ -20,8 +20,8 @@ classes plus the P1 poison-channel class, each on its own live cert:
   * wrong_field  (mk_point,   G3 struct field):           emit a WRONG field accessor
   * wrong_width  (add_capped, G6 HasType overflow):       2^64 bound -> 2^32
   * poison_*     (add_capped, F4 derived-poison channel, bootstrap-80 stage 2):
-                  residue_names zeroed (miss) / cons spurious (spurious) /
-                  residue-mentioning prop_deeps dropped (missing entry),
+                  residue_names zeroed (miss direction) / residue-mentioning
+                  prop_deeps dropped (missing-entry kill),
                  SST-side — pins that a serializer mismark flips the bridge
                  (DESIGN-bootstrap-endgame §1 P1)
   * ifctor_eq_drop / ifctor_binder_drop / ifctor_neg_drop / ifctor_arm_swap
@@ -193,15 +193,12 @@ def poison_residue_drop(ctx):
     return _join_mk(args)
 
 
-def poison_residue_spurious(ctx):
-    """F4 derivation-input kill, SPURIOUS direction: cons a name that DOES
-    occur in the deep props (param id 0 = x, mentioned by every pre-residue
-    assert prop) onto residue_names — the derived set poisons every hyp
-    mentioning it, refWp WRAPS goals production HOISTED; the verdict must
-    flip. (Both directions live: this and poison_residue_drop.)"""
-    args = _split_mk_args(ctx)
-    args[6] = f"(lib.LeafList.Cons 0 (Tactus.Box.mk {args[6]}))"
-    return _join_mk(args)
+# NOTE (no spurious-direction kill class): a spurious-residue kill cannot
+# bite on add_capped — the real poison wraps every post-residue goal, and
+# pre-residue props are unregistered by design (no deep to poison). The
+# spurious direction is covered CORPUS-WIDE by the baselines: any
+# over-poisoning by the derivation would mismatch a hoisted production
+# goal somewhere in the probe9/probe11 subject set.
 
 
 def poison_deep_drop(ctx):
@@ -218,33 +215,38 @@ def poison_deep_drop(ctx):
     assert resids, "poison_deep_drop: no residues in ctx"
     s = args[7]
     key = "(lib.PropDeepList.Cons "
-    out, i, n_dropped = [], 0, 0
+    n_dropped = 0
     while True:
-        j = s.find(key, i)
-        if j == -1:
-            out.append(s[i:])
+        # find the FIRST entry whose deep mentions a residue
+        i = 0
+        hit = None
+        while True:
+            j = s.find(key, i)
+            if j == -1:
+                break
+            m = re.match(r"(\d+) ", s[j + len(key):])
+            assert m, f"malformed prop_deeps entry at {j}"
+            d0 = j + len(key) + m.end()
+            assert s[d0] == "(", f"prop_deeps deep not a paren term at {d0}"
+            d1 = match_paren(s, d0) + 1
+            if any(re.search(rf"\(lib\.RawExp\.Var {r}\b", s[d0:d1]) for r in resids):
+                hit = (j, d1)
+                break
+            i = match_paren(s, j) + 1
+        if hit is None:
             break
-        m = re.match(r"(\d+) ", s[j + len(key):])
-        assert m, f"malformed prop_deeps entry at {j}"
-        d0 = j + len(key) + m.end()
-        assert s[d0] == "(", f"prop_deeps deep not a paren term at {d0}"
-        d1 = match_paren(s, d0) + 1
-        deep = s[d0:d1]
+        j, d1 = hit
         e1 = match_paren(s, j) + 1
-        if any(re.search(rf"\(lib\.RawExp\.Var {r}\b", deep) for r in resids):
-            # Drop the entry: replace it with its own tail (the last
-            # arg, a Tactus.Box.mk-wrapped PropDeepList).
-            entry_inner = s[j + len(key):e1 - 1]  # "ID DEEP (Tactus.Box.mk TAIL)"
-            tail_open = s.index("(Tactus.Box.mk ", d1)
-            tail = s[tail_open + len("(Tactus.Box.mk "):match_paren(s, tail_open)]
-            out.append(s[i:j])
-            out.append(tail)
-            n_dropped += 1
-        else:
-            out.append(s[i:e1])
-        i = e1
+        # splice the entry out: replace it with its own tail (the last
+        # arg, a Tactus.Box.mk-wrapped PropDeepList), then RESCAN — the
+        # tail may hold more matching entries (the Assert/Assume pair
+        # registers the same prop twice).
+        tail_open = s.index("(Tactus.Box.mk ", d1)
+        tail = s[tail_open + len("(Tactus.Box.mk "):match_paren(s, tail_open)]
+        s = s[:j] + tail + s[e1:]
+        n_dropped += 1
     assert n_dropped > 0, "poison_deep_drop: no residue-mentioning deeps found"
-    args[7] = "".join(out)
+    args[7] = s
     return _join_mk(args)
 
 
@@ -547,7 +549,6 @@ CLASSES = [
     # residue_names / prop_deeps), both directions + the missing-entry
     # case. The old zero-the-bits kill is retired: era-1 bits are unread.
     ("add_capped", "poison_residue_drop", "zero the residue_names table (F4 poison derivation, miss direction)", poison_residue_drop, "ctx", "close"),
-    ("add_capped", "poison_residue_spurious", "cons a deep-occurring name onto residue_names (F4 poison derivation, spurious direction)", poison_residue_spurious, "ctx", "close"),
     ("add_capped", "poison_deep_drop", "drop the residue-mentioning prop_deeps entries (F4 missing-entry kill)", poison_deep_drop, "ctx", "close"),
     # b77 arm-structure kills (card §Follow-ups): pin the NEW IfCtor /
     # AssertQueryTactus arms. The four IfCtor kills are ALSO the interim

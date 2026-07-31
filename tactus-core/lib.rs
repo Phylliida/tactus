@@ -209,7 +209,7 @@ pub enum RetBind {
 
 pub enum StmData {
     /// StmX::Assert — (annotated obligation `RawExp`, hyp NAME leaf, bare
-    /// hyp leaf, poison bit). The GOAL this assert emits closes the
+    /// hyp leaf). The GOAL this assert emits closes the
     /// ANNOTATED obligation
     /// (`/- @rust:LOC -/ prop`, production's `span_mark` render) via
     /// `close_e` → `LeafE(render_exp(ob))` (W6d.1b: the obligation slot is
@@ -223,19 +223,20 @@ pub enum StmData {
     /// obligation use `atom_ob(id)` (= `Var(id, TyBool)`, renders to
     /// `Atom(id)`) so the deep spine matches the stage-A ids by construction.
     /// The hyp NAME (`_h_hoist_i`, bootstrap-74 slice 2) is the serializer's
-    /// mirror of production's hyp ordinal; the POISON bit (1) marks a prop
-    /// whose text mentions a residue-let name — production's hoist_all
-    /// bails the whole goal to wrap mode then (the model's leaves are
-    /// opaque, so the serializer computes the mark).
-    Assert(RawExp, u64, u64, u64),
-    /// StmX::Assume — (hyp NAME leaf, prop leaf, poison bit). Same
-    /// naming/poison discipline as `Assert`.
-    Assume(u64, u64, u64),
+    /// mirror of production's hyp ordinal. F4 (bootstrap-80 stage 2): the
+    /// poison bit is GONE — the wrap-gate poison mark is DERIVED
+    /// reference-side (`poisoned_props` over `FnCtxData.prop_deeps`).
+    Assert(RawExp, u64, u64),
+    /// StmX::Assume — (hyp NAME leaf, prop leaf). Same
+    /// naming discipline as `Assert`.
+    Assume(u64, u64),
     /// StmX::Assign — (dest local leaf, rhs leaf). Plain form: a let that
     /// is NOT hoistable — typ-less, or (slice-2 collapse) a hoistable let
-    /// whose equation prop mentions a residue name. Poisoned-collapse is
-    /// LOSSLESS: poison forces the whole goal into wrap mode, where the
-    /// hoist payload (typ/eq leaves) is discarded anyway.
+    /// whose equation prop mentions a residue name. F4: the
+    /// poison-collapse is DERIVED reference-side (`frame_after`'s
+    /// AssignH arm), LOSSLESS either way: poison forces the whole goal
+    /// into wrap mode, where the hoist payload (typ/eq leaves) is
+    /// discarded anyway.
     Assign(u64, u64),
     /// StmX::Assign, HOISTABLE (bootstrap-74 slice 2) — (dest leaf, typ
     /// leaf, rhs leaf, eq-name leaf, eq-prop leaf): a typed non-Bool
@@ -278,22 +279,23 @@ pub enum StmData {
     /// the frame extended by the return binding.
     Ret(Box<RawExpList>, RetBind),
     /// StmX::If — (cond leaf, cond-hyp NAME leaf, ¬cond leaf, ¬cond-hyp
-    /// NAME leaf, cond poison bit, then, else); absent else = Skip.
+    /// NAME leaf, then, else); absent else = Skip.
     /// Both prop leaves are ANNOTATED (span_mark'd), byte-matching production's
-    /// `Wp::Branch`: the then-branch hyp is `cond_marked =
-    /// span_mark(loc, Hypothesis(BranchCondition), cond)`, the else-branch
-    /// hyp is `not(cond_marked)` (`sst_to_lean::walk_obligations`). The
-    /// serializer mints them via `oblig_leaf`/`neg_oblig_leaf` (the
+    /// `Wp::Branch`: it pushes `cond_marked =
+    /// span_mark(loc, Hypothesis(BranchCondition), cond)` as the then-branch
+    /// hyp and `not(cond_marked)` as the else-branch hyp
+    /// (`sst_to_lean::walk_obligations`). The serializer mints them via
+    /// `oblig_leaf`/`neg_oblig_leaf` (the
     /// `AssertKind` never reaches the pp, so an `Obligation(Plain)` mark
     /// interns to the SAME text as production's `BranchCondition` mark —
     /// bootstrap-17). The `cond` leaf is the then-branch hyp; `¬cond` is
     /// BOTH the else-branch hyp AND the fall-through continuation hyp when
     /// the then-branch DIVERGES (`frame_after`, DESIGN §2.4.1). The name
     /// leaves are the serializer's `_h_hoist_i` mirror (bootstrap-74 slice
-    /// 2); the poison bit covers BOTH hyps (`c` and `¬c` mention the same
-    /// names) — a cond mentioning a residue let (e.g. `if tmp__1`) forces
-    /// whole-goal wrap.
-    If(u64, u64, u64, u64, u64, Box<StmData>, Box<StmData>),
+    /// 2); the poison of both hyps is DERIVED (`c` and `¬c` share the
+    /// mention set) — a cond mentioning a residue let (e.g. `if tmp__1`)
+    /// forces whole-goal wrap.
+    If(u64, u64, u64, u64, Box<StmData>, Box<StmData>),
     /// StmX::Loop — the maintain/use telescopes production builds around a
     /// loop (finding-3, UNIFORM post-N1-hoist shape — bootstrap-74 slice
     /// 2, evidence DESIGN-b74-slice2-serializer §2b). Production havocs
@@ -433,13 +435,13 @@ pub enum StmData {
     /// inline (kernel-checked at elaboration under the user's tactic),
     /// never assumed — census counts it proven-inline and it must not
     /// trip assume-warnings. Fields mirror `Assert`: annotated P
-    /// obligation, hyp NAME leaf, bare P leaf, poison bit. The
+    /// obligation, hyp NAME leaf, bare P leaf. The
     /// PROOF-BLOCK kind (`proof { tac }`) has NO mirror node: it emits
     /// no theorem and pushes no hyp — the tactic rides the emitter's
     /// closer prefix AFTER the hoist decision (closers are not
     /// stage-A-certified), and the fn-level `closer_is_default` DFS
     /// already routes such fns to wrap mode.
-    AssertQueryTactus(RawExp, u64, u64, u64),
+    AssertQueryTactus(RawExp, u64, u64),
     /// StmX-less (bootstrap-77 / A5): production's `walk_let` FORK of a
     /// spine-position value-if whose POSITIVE condition is an IsVariant
     /// discriminator that N2 (`branch_ctor_frames`) upgrades to

@@ -33,19 +33,28 @@
 //! claim — a mismark fails the bridge, never silent-passes.
 //!
 //! One qualification to that claim (endgame policy P1,
-//! `DESIGN-bootstrap-endgame.md` §1): the N1 wrap-gate POISON MARK is
-//! not a transcription but a semantic predicate computed *here*
-//! ([`Serializer::hyp_poison`] — "does this prop mention an in-scope
-//! residue name"), mirroring `hoist_all`'s `lexpr_mentions_var` bail
-//! check. The model reads the mark; it cannot recompute it while
-//! stage-A leaves are opaque ids. A lone wrong mark diverges refWp from
-//! production and fails the bridge loudly — but a CORRELATED bug in
-//! both mentions-checks is a common-mode channel (the bootstrap-48/B1
-//! class) that this contract explicitly carries as trusted until A7,
-//! when deep `ExprData` leaves let refWp derive the mark
-//! reference-side and this serializer's copy demotes to a cross-check.
-//! Pinned live by the poison-flip mutation (probe13 `poison_flip`
-//! class): flipping the emitted poison bit must flip the bridge 1→0.
+//! `DESIGN-bootstrap-endgame.md` §1) — RETIRED at bootstrap-80 stage 2
+//! (F4): the N1 wrap-gate POISON MARK was a semantic predicate computed
+//! here ([`Serializer::hyp_poison`]), mirroring `hoist_all`'s
+//! `lexpr_mentions_var` bail check — a common-mode channel carried as
+//! trusted until deep leaves let refWp derive the mark reference-side.
+//! That derivation is now the ONLY channel: the cert carries
+//! `FnCtxData.residue_names` + the `prop_deeps` side table (dumb
+//! faithful `raw_exp` transcriptions of exactly the props
+//! [`Serializer::hyp_poison`] checks), and refWp derives the poison set
+//! (`poisoned_props`) — the bit slots are DELETED from the vocabulary.
+//! `hyp_poison` / `lexpr_mentions_var` no longer reach the cert; they
+//! remain ONLY as (a) the forced-state mirror feeding `mark_flet_forced`
+//! / `mark_poison_forced` (production's branch-join classification state)
+//! and (b) emission-time guards: a residue mention on a prop with no
+//! transcriber (`Call.post` LExpr-side props) or an uncoverable
+//! transcription rejects loud (`prop-deep-uncoverable`), and an
+//! uncoverable bit-0 prop registers a dummy constant deep (guaranteed
+//! mention-free by the same check; the bridge backstops even a buggy
+//! check — a wrong 0 hoists where production wrapped). The channel is
+//! pinned live by the probe13 `poison_residue_drop` / `poison_deep_drop`
+//! mutation kills (the derivation INPUTS are perturbed; each must flip
+//! the bridge 1→0).
 //!
 //! SECOND named trusted predicate (bootstrap-77): the N2 IsVariant
 //! DETECTOR. `ctor_fork_frames` decides whether a fork's positive
@@ -57,15 +66,16 @@
 //! wrapper-deref count) and the FRAME ASSEMBLY are recomputed here
 //! independently; only the peel-to-IsVariant decision is shared.
 //! Like the poison mark, this is carried as trusted until the
-//! reference side can express the check (A7-era deep scrutinee
-//! leaves, or an independent serializer-side peel — b77 card
-//! follow-up); the assembled frames are pinned live meanwhile by the
+//! reference side can express the check (a mirror datatype
+//! environment — W7-adjacent, the next trust-shrink target after
+//! milestone B); the assembled frames are pinned live meanwhile by the
 //! probe13 `ifctor_eq_drop` / `ifctor_binder_drop` / `ifctor_neg_drop`
 //! / `ifctor_arm_swap` mutation kills — one per assembly output channel
 //! (ctor-equation hyp, field-binder telescope, else-branch hyp, arm
-//! attachment), each must flip the bridge 1→0. The peel DECISION and
-//! the IfCtor poison bits (both 0 in the pinned cert; the poison
-//! channel itself is pinned by `poison_flip`) remain uncovered.
+//! attachment), each must flip the bridge 1→0. The peel DECISION remains
+//! uncovered. The IfCtor poison bits are GONE with F4 (their props ride
+//! the same `prop_deeps` table, registered mention-equivalent via the
+//! scrutinee).
 //!
 //! # Snapshot point (faithfulness anchor #1)
 //!
@@ -1053,16 +1063,21 @@ impl<'a> Serializer<'a> {
 
     /// F4: register a prop's deep transcription in the `prop_deeps` side
     /// table. `leaf_id` is the FHyp / eq-prop leaf the reference looks
-    /// up; `e` is the SST exp the prop was rendered from. The
+    /// up; `e` is the SST exp the prop was rendered from; `hp` is the
+    /// prop's era-1 poison bit (the caller just computed it). The
     /// transcription is the dumb faithful `raw_exp` copy — renames and
     /// the Span/Not/eq wrappers around it don't change the Var-atom set
     /// the mention check reads (an eq prop's deep transcribes the RHS:
     /// the dest binder is a non-Bool let / synthetic ret name, never a
     /// residue name). Skipped when no residue name is in scope (a prop
-    /// can only mention names that exist at its walk point); with
-    /// residues in scope, a transcription failure rejects LOUD — the
-    /// reference could not derive the mark, so the cert must not sail.
-    fn register_prop_deep(&mut self, leaf_id: u64, e: &Exp) -> Sr<()> {
+    /// can only mention names that exist at its walk point). On a
+    /// transcription failure (a shape outside `raw_exp`'s coverage,
+    /// e.g. a `usize` HasType range): bit 1 rejects LOUD (genuinely
+    /// underivable — `prop-deep-uncoverable`); bit 0 registers a dummy
+    /// constant deep — the derived 0 is GUARANTEED correct by the bit
+    /// the caller just computed, and the bridge backstops even a buggy
+    /// bit (a wrong 0 hoists where production wrapped → red).
+    fn register_prop_deep(&mut self, leaf_id: u64, e: &Exp, hp: u64) -> Sr<()> {
         if self.residue_names.is_empty() {
             return Ok(());
         }
@@ -1071,7 +1086,17 @@ impl<'a> Serializer<'a> {
                 self.prop_deeps.push((leaf_id, raw));
                 Ok(())
             }
-            Err(reason) => Err(format!("prop-deep-uncoverable: {}", reason)),
+            Err(reason) => {
+                if hp == 1 {
+                    Err(format!("prop-deep-uncoverable: {}", reason))
+                } else {
+                    self.prop_deeps.push((
+                        leaf_id,
+                        format!("({}.RawExp.Lit 0 ({}.TypData.TyBool))", NS, NS),
+                    ));
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -1167,12 +1192,12 @@ impl<'a> Serializer<'a> {
         // F4: register the ¬cond prop's deep (the eq prop's deep is
         // registered in `ctor_fork_frames`; the plain-If path's `c`
         // registers below).
-        self.register_prop_deep(nc, cond)?;
+        self.register_prop_deep(nc, cond, cp)?;
         let save = self.hyp_ordinal;
         let bstate = self.branch_state();
         let hyp_name = format!("_h_hoist_{}", save + 1);
         match self.ctor_fork_frames(cond)? {
-            Some((pos_binders, eq_prop, eq_poison)) => {
+            Some((pos_binders, eq_prop)) => {
                 let eq_name = self.text_leaf(&hyp_name);
                 self.hyp_ordinal = save + 1;
                 let t = self.ret_fork(then_e)?;
@@ -1182,15 +1207,13 @@ impl<'a> Serializer<'a> {
                 self.restore_branch(bstate);
                 self.hyp_ordinal = save;
                 Ok(format!(
-                    "({}.StmData.IfCtor {} {} {} {} {} {} {} {} {})",
+                    "({}.StmData.IfCtor {} {} {} {} {} {} {})",
                     NS,
                     box_(&pos_binders),
                     eq_name,
                     eq_prop,
-                    eq_poison,
                     eq_name,
                     nc,
-                    cp,
                     box_(&t),
                     box_(&el)
                 ))
@@ -1198,7 +1221,7 @@ impl<'a> Serializer<'a> {
             None => {
                 let c = self.leaves.intern(pp_expr(&c_lx));
                 // F4: register the cond prop's deep.
-                self.register_prop_deep(c, cond)?;
+                self.register_prop_deep(c, cond, cp)?;
                 let cn = self.text_leaf(&hyp_name);
                 self.hyp_ordinal = save + 1;
                 let t = self.ret_fork(then_e)?;
@@ -1208,8 +1231,8 @@ impl<'a> Serializer<'a> {
                 self.restore_branch(bstate);
                 self.hyp_ordinal = save;
                 Ok(format!(
-                    "({}.StmData.If {} {} {} {} {} {} {})",
-                    NS, c, cn, nc, cn, cp, box_(&t), box_(&el)
+                    "({}.StmData.If {} {} {} {} {} {})",
+                    NS, c, cn, nc, cn, box_(&t), box_(&el)
                 ))
             }
         }
@@ -1226,7 +1249,7 @@ impl<'a> Serializer<'a> {
     /// keeps the plain cond hyp, exactly like production. NOTE the N2
     /// gate's default-closer condition is implied at the call site (the
     /// fork only runs on the default Return route).
-    fn ctor_fork_frames(&mut self, cond: &Exp) -> Sr<Option<(String, u64, u64)>> {
+    fn ctor_fork_frames(&mut self, cond: &Exp) -> Sr<Option<(String, u64)>> {
         let Some(p) = crate::sst_to_lean::branch_isvariant_of(cond, true) else {
             return Ok(None);
         };
@@ -1308,9 +1331,9 @@ impl<'a> Serializer<'a> {
         // scrutinee transcription: the synthetic side (ctor name, fresh
         // field names) carries no residue names by construction, so the
         // eq prop's residue mentions are exactly the scrutinee's.
-        self.register_prop_deep(eq_prop, p.inner)?;
+        self.register_prop_deep(eq_prop, p.inner, eq_poison)?;
         let pos_binders = self.binder_list(&entries);
-        Ok(Some((pos_binders, eq_prop, eq_poison)))
+        Ok(Some((pos_binders, eq_prop)))
     }
 
     /// The N1-hoist classification for a plain let statement
@@ -1352,7 +1375,8 @@ impl<'a> Serializer<'a> {
             }
             Some(typ) => {
                 let eq_lx = LExpr::eq(LExpr::var(lname.clone()), rhs_lx.clone());
-                if self.hyp_poison(&eq_lx) == 1 {
+                let hp = self.hyp_poison(&eq_lx);
+                if hp == 1 {
                     // Poison forces wrap from here (production collapses;
                     // the reference DERIVES the collapse from the deep).
                     self.mark_flet_forced();
@@ -1362,7 +1386,7 @@ impl<'a> Serializer<'a> {
                 // F4: register the eq prop's deep (the RHS transcription
                 // is mention-equivalent — the dest binder is a non-Bool
                 // let, never a residue name).
-                self.register_prop_deep(ep, rhs_exp)?;
+                self.register_prop_deep(ep, rhs_exp, hp)?;
                 Ok(format!(
                     "({}.StmData.AssignH {} {} {} {} {})",
                     NS, dest, ty_leaf, rhs_leaf, en, ep
@@ -2895,7 +2919,7 @@ impl<'a> Serializer<'a> {
                 }
                 let hyp = self.leaves.intern(pp_expr(&hyp_lx));
                 // F4: register the prop's deep for the poison derivation.
-                self.register_prop_deep(hyp, e)?;
+                self.register_prop_deep(hyp, e, hp)?;
                 // The forward hyp's `_h_hoist_i` name (bump AFTER the prop
                 // interns so the name leaf follows the prop in the table).
                 let hn = self.next_hyp_name();
@@ -2905,7 +2929,7 @@ impl<'a> Serializer<'a> {
                 // (same interned id the goal side atom-matches — the W6d.2a
                 // verdict-neutral behavior).
                 let (_id, slot) = self.oblig_slot(e)?;
-                Ok(format!("({}.StmData.Assert {} {} {} {})", NS, slot, hn, hyp, hp))
+                Ok(format!("({}.StmData.Assert {} {} {})", NS, slot, hn, hyp))
             }
 
             StmX::Assume(e) => {
@@ -2928,9 +2952,9 @@ impl<'a> Serializer<'a> {
                 }
                 let id = self.leaves.intern(pp_expr(&e_lx));
                 // F4: register the prop's deep for the poison derivation.
-                self.register_prop_deep(id, e)?;
+                self.register_prop_deep(id, e, hp)?;
                 let hn = self.next_hyp_name();
-                Ok(format!("({}.StmData.Assume {} {} {})", NS, hn, id, hp))
+                Ok(format!("({}.StmData.Assume {} {})", NS, hn, id))
             }
 
             StmX::Assign { lhs, rhs } => {
@@ -3157,8 +3181,8 @@ impl<'a> Serializer<'a> {
                 }
                 // F4: register both cond props' deeps for the poison
                 // derivation (c and ¬c share the mention set).
-                self.register_prop_deep(c, cond)?;
-                self.register_prop_deep(nc, cond)?;
+                self.register_prop_deep(c, cond, cp)?;
+                self.register_prop_deep(nc, cond, cp)?;
                 let save = self.hyp_ordinal;
                 // Each branch is a separate walk path: the cond hyp is
                 // `_h_hoist_{save+1}` in BOTH, and branch-local shadows /
@@ -3203,7 +3227,7 @@ impl<'a> Serializer<'a> {
                 // past it.
                 let fallthrough = stm_diverges(then_stm) && e == self.skip();
                 self.hyp_ordinal = if fallthrough { save + 1 } else { save };
-                Ok(format!("({}.StmData.If {} {} {} {} {} {} {})", NS, c, cn, nc, ncn, cp, box_(&t), box_(&e)))
+                Ok(format!("({}.StmData.If {} {} {} {} {} {})", NS, c, cn, nc, ncn, box_(&t), box_(&e)))
             }
 
             StmX::Loop {
@@ -3408,12 +3432,12 @@ impl<'a> Serializer<'a> {
                         }
                         let hyp = self.leaves.intern(pp_expr(&hyp_lx));
                         // F4: register the prop's deep for the poison derivation.
-                        self.register_prop_deep(hyp, cond)?;
+                        self.register_prop_deep(hyp, cond, hp)?;
                         let hn = self.next_hyp_name();
                         let (_id, slot) = self.oblig_slot(cond)?;
                         Ok(format!(
-                            "({}.StmData.AssertQueryTactus {} {} {} {})",
-                            NS, slot, hn, hyp, hp
+                            "({}.StmData.AssertQueryTactus {} {} {})",
+                            NS, slot, hn, hyp
                         ))
                     }
                 }
@@ -3570,7 +3594,8 @@ impl<'a> Serializer<'a> {
                                 // F4: register the eq prop's deep (the
                                 // RHS transcription is mention-equivalent
                                 // — the ret binder is never a residue).
-                                self.register_prop_deep(ep, e)?;
+                                let hp = self.hyp_poison(&LExpr::eq(LExpr::var(lname.clone()), coerced.clone()));
+                                self.register_prop_deep(ep, e, hp)?;
                                 format!(
                                     "{}.RetBind.RetLetH {} {} {} {} {}",
                                     NS, nleaf, ty_leaf, vleaf, en, ep
@@ -3670,8 +3695,8 @@ impl<'a> Serializer<'a> {
                     }
                     // F4: register both cond props' deeps (c, ¬c — same
                     // mention set).
-                    self.register_prop_deep(c, cond)?;
-                    self.register_prop_deep(nc, cond)?;
+                    self.register_prop_deep(c, cond, cp)?;
+                    self.register_prop_deep(nc, cond, cp)?;
                     let save = self.hyp_ordinal;
                     let bstate = self.branch_state();
                     let cn = self.text_leaf(&format!("_h_hoist_{}", save + 1));
@@ -3840,8 +3865,8 @@ impl<'a> Serializer<'a> {
                     self.guard_no_poison(hp, "call-post rest hyp")?;
                     let r = self.leaves.intern(pp_expr(&rest));
                     post = format!(
-                        "({}.FrameList.FHyp {} {} {} {})",
-                        NS, rest_name.unwrap(), r, hp, box_(&post)
+                        "({}.FrameList.FHyp {} {} {})",
+                        NS, rest_name.unwrap(), r, box_(&post)
                     );
                 }
                 if let Some(eb) = e_bound {
@@ -3853,8 +3878,8 @@ impl<'a> Serializer<'a> {
                     self.guard_no_poison(hp, "call-post e_bound hyp")?;
                     let b = self.leaves.intern(pp_expr(&eb));
                     post = format!(
-                        "({}.FrameList.FHyp {} {} {} {})",
-                        NS, eb_name.unwrap(), b, hp, box_(&post)
+                        "({}.FrameList.FHyp {} {} {})",
+                        NS, eb_name.unwrap(), b, box_(&post)
                     );
                 }
                 post
@@ -3889,8 +3914,8 @@ impl<'a> Serializer<'a> {
                     self.guard_no_poison(hp, "call-post ens hyp")?;
                     let i = self.leaves.intern(pp_expr(&e));
                     post = format!(
-                        "({}.FrameList.FHyp {} {} {} {})",
-                        NS, ens_name.unwrap(), i, hp, box_(&post)
+                        "({}.FrameList.FHyp {} {} {})",
+                        NS, ens_name.unwrap(), i, box_(&post)
                     );
                 }
                 if let Some(rb) = ret_bound {
@@ -3902,8 +3927,8 @@ impl<'a> Serializer<'a> {
                     self.guard_no_poison(hp, "call-post ret_bound hyp")?;
                     let b = self.leaves.intern(pp_expr(&rb));
                     post = format!(
-                        "({}.FrameList.FHyp {} {} {} {})",
-                        NS, rb_name.unwrap(), b, hp, box_(&post)
+                        "({}.FrameList.FHyp {} {} {})",
+                        NS, rb_name.unwrap(), b, box_(&post)
                     );
                 }
                 let bn = self.text_leaf(binder_name.as_str());
@@ -3926,8 +3951,8 @@ impl<'a> Serializer<'a> {
                 self.guard_no_poison(hp, "call-post mut bound hyp")?;
                 let bid = self.leaves.intern(pp_expr(b));
                 post = format!(
-                    "({}.FrameList.FHyp {} {} {} {})",
-                    NS, bname.expect("name minted iff bound"), bid, hp, box_(&post)
+                    "({}.FrameList.FHyp {} {} {})",
+                    NS, bname.expect("name minted iff bound"), bid, box_(&post)
                 );
             }
             let fname = self.text_leaf(m.fresh.as_str());
@@ -4198,7 +4223,7 @@ impl<'a> Serializer<'a> {
         // sentinels (shapes absent from this loop form) are skipped.
         for prop_id in [cond_ann, neg_cond_ann, neg_neg_cond_ann, break_guard_ann, break_use_ann] {
             if prop_id != 999999 {
-                self.register_prop_deep(prop_id, cond_exp)?;
+                self.register_prop_deep(prop_id, cond_exp, cond_poison)?;
             }
         }
         // The restore point: classical = the telescope end (post-cond);
@@ -4266,7 +4291,7 @@ impl<'a> Serializer<'a> {
         }
 
         Ok(format!(
-            "({}.StmData.Loop {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {})",
+            "({}.StmData.Loop {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {})",
             NS,
             box_(&inv_hyps),
             box_(&inv_obligs),
@@ -4280,7 +4305,6 @@ impl<'a> Serializer<'a> {
             neg_neg_cond_ann,
             break_guard_ann,
             break_use_ann,
-            cond_poison,
             d_old_name,
             d_old_ty,
             d_old_val,

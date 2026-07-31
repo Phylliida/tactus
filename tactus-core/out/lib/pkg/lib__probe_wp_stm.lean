@@ -5,5 +5,5 @@ set_option maxHeartbeats 800000
 set_option autoImplicit false
 -- tactus-closer: user
 theorem lib.probe_wp_stm :
-    lib.goal_count (lib.wp_stm lib.FrameList.FNil (lib.StmData.Assert (lib.atom_ob 9) 0 9 0)) = 1 ∧ lib.goal_count (lib.wp_stm lib.FrameList.FNil lib.StmData.Skip) = 0 := by
+    lib.goal_count (lib.wp_stm lib.LeafList.Nil lib.FrameList.FNil (lib.StmData.Assert (lib.atom_ob 9) 0 9 0)) = 1 ∧ lib.goal_count (lib.wp_stm lib.LeafList.Nil lib.FrameList.FNil lib.StmData.Skip) = 0 := by
   decide 
