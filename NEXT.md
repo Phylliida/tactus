@@ -1,5 +1,15 @@
 # NEXT — bootstrap work queue (2026-07-21; superseded 2026-07-24)
 
+**2026-07-31: A7 CARDED — `board/bootstrap-80-a7-callee-signature-vocab.md`.**
+Step-0 evidence frozen (vec_read leaf-level: the View-deref divergence is
+the G2 rule firing on a `TyRef` arg whose callee param IS the ref type;
+the `Int.ofNat` gap is CallN carrying no per-arg param types — lib.rs:1262
+"deferred to W7c"). Scope = callee-signature vocab + Q3 poison derivation
+reference-side + the `&mut T` unsubstituted-typ quirk (freeze-time call).
+Constraint (Danielle 2026-07-31): NO full tgt gate runs — acceptance uses
+probe11's scoped per-module emits. Next session: design freeze (6 open
+questions on the card) → implement → B (b67 caching + b68 flip).
+
 **2026-07-28: b79 (break-form loop arm) DONE — see
 `board/bootstrap-79-break-form-loop-arm.md` (full record).** The
 loop_normalize coverage regression is closed: `StmData::Loop` gains
