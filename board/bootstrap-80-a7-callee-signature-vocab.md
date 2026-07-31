@@ -163,6 +163,9 @@ of scope.
 
 **F3 (Q3 — where callee param types live):** RESOLVED: **per-site,
 carried on the call node** — NOT a signature table on FnCtxData.
+**AMENDED by the review addendum (A1 below): the render rule is the
+full two-phase `coerce_lexpr` reconciliation, not a two-case
+enumeration.**
 - `RawList` (used ONLY by `RawExp::CallN`) gains the expected param
   typ per element: `Cons(Box<RawExp>, TypData, Box<RawList>)`.
   Element-pairs, not a parallel list — no zip, no length-mismatch
@@ -266,6 +269,105 @@ For every currently-CLOSING bridge, rendered output is unchanged:
   re-source land together; one cache invalidation, one golden
   re-vendor.
 
+## Freeze review addendum (2026-07-31, second pass — Danielle's
+"what would come back to bite us" review)
+
+**A1 — F3's rule was understated; restated as the full two-phase
+reconciliation.** Production's decision is `coerce_lexpr`
+(`expr_shared.rs:1101`): (phase 1) numeric-sort bridge — peel ALL
+wrappers, `Int.toNat`/`Int.ofNat` at the bare value, rewrap;
+(phase 2) wrapper-sequence reconciliation — longest common suffix,
+peel the non-matching outer wraps, rewrap (`from=[Ref],to=[]` →
+`.deref`; `from=[],to=[Ref]` → `Tactus.Ref.mk`; kind mismatch at
+equal depth → peel+rewrap). The freeze's "ofNat + deref" enumeration
+MISSED the depth-grow case, and it is not hypothetical: vec_push7's
+cert carries `Call 11 (TyNamed 10) (Var 0 (TyNamed 12)) (TyNamed 12)`
+(the &mut final-value `v` at the POINTEE type) where production
+renders `view (Tactus.Ref.mk v)` — the `+1` mk-wrap. The reference
+rule, restated over the TypData fragment (depth ≤1, kinds
+Ref/Box distinct, pointees opaque):
+- both bare: sort bridge iff TyInt↔TyNat (CastKind has both
+  directions — the freeze's ofNat-only statement was also
+  incomplete; toNat is the symmetric case).
+- wrapper → non-wrapper: `.deref` (blind peel, matches production's
+  inner-type-agnostic peel).
+- non-wrapper → wrapper: `.mk` wrap of the target kind
+  (`Tactus.Ref.mk` / `Tactus.Box.mk`).
+- equal tags: passthrough (the vec_read view case) — EXCEPT
+  TyBox↔TyRef, which is VISIBLE (distinct tags) and reproduces
+  production's peel+rewrap.
+Named blind spots (all fail LOUD — bridge divergence, never silent;
+census-tag per P2 if one ever appears):
+- sort-bridge-under-wrapper (e.g. `&int` arg → `nat` param):
+  production peels, bridges, rewraps; TypData pointees are opaque
+  leaf ids, so the reference cannot see the pointee's sort.
+  Corpus population: expected zero.
+- MutRef-vs-Ref at equal depth: both erase to `TyRef` — kind-blind
+  (Lean erases the distinction; production's wrap sequences keep
+  it). Expected zero.
+- multi-layer wraps: cannot arise — TypData is depth-bounded 0/1;
+  deeper types already fail loud at transcription.
+The implementation mirrors coerce_lexpr's TWO-PHASE STRUCTURE
+(sort first, then wrappers), not a case list — principle 1.
+
+**A2 — E2/F2 is bigger than stated (both coercions, not just
+ofNat).** vec_push7's oblig leaves render `((v : Vec …) : Seq Int)`
+— Vec's OWN View instance, NO `Ref.mk` — while the goal path renders
+`Tactus.Ref.mk v` + the Ref View instance. Production's oblig-leaf
+path diverges from its goal path on the FULL coercion table, not
+just ofNat. Deferral from A7 stands (not on the bridge comparison
+path; both forms elaborate via defeq/NatCast), but this becomes
+load-bearing at E (W8 authority flip) and at any future hyp-prop
+deepening. RECOMMEND a separate production-cleanup brick: unify the
+oblig-leaf path on `coerce_lexpr` (principle 1; card it at E at the
+latest).
+
+**A3 — the N2 IsVariant detector is a SECOND trusted predicate the
+freeze was silent about.** The sst_serialize.rs contract names two:
+the poison mark (F4 retires it) AND `branch_isvariant_of` (shared
+single-source, common-mode). Deriving it reference-side needs a
+datatype environment in the mirror vocabulary (dt-in-map,
+multi-variant, typ-args) — a W7-adjacent growth, NOT this brick.
+Scoped OUT explicitly: it remains trusted post-A7, pinned live by
+the four IfCtor mutation kills, and is the natural next trust-shrink
+target after B (candidate: reference-side datatype env — fold into
+the E-milestone planning). The IfCtor poison BITS, by contrast, are
+the poison mark applied to IfCtor frame hyps — F4's `prop_deeps`
+table must cover those props too (impl-time check: enumerate every
+`hyp_poison` call site — FHyp props, FLetH eq props, the c_lx site
+at :1104, IfCtor frames — and transcribe deep for exactly those).
+
+**A4 — F4 landing sequence: the cross-check era comes free, then
+delete.** One vocab edit (side table + residue_names land; bit
+slots still present), refWp switches to derivation-driven assembly;
+if derivation ≠ what the bit would have said anywhere on the
+corpus, that subject's bridge reds — the probe battery IS the
+equivalence cross-check (the bit was validated by green bridges,
+so green-after-switch ⟹ derivation ≡ bit on the corpus). Delete
+the bit slots in a follow-up edit within the same arc once probes
+are green; re-point `poison_flip` at the derivation input at
+deletion time (not before — until then the old kill still bites
+the old channel).
+
+**A5 — new probe13 kill class for the expected-typ channel.** The
+per-arg expected types are transcribed data the bridge checks, but
+liveness wants a kill: perturb one expected typ (Nat↔Int, or add/
+remove a TyRef layer) in a pinned cert ⟹ bridge flips 1→0. Cheap;
+same harness as the existing expression kills.
+
+**A6 — accepted blast-radius notes (no action, recorded).**
+(a) Obligation certs now depend on callee SIGNATURES (per-site
+expected types): a vstd/prelude signature change ripples into
+obligation certs, not just defcerts — correct (the goals do change)
+but a wider invalidation surface for warm-cache/byte-stability.
+(b) `prop_deeps` grows every cert and the `decide` workload on
+Loop-heavy subjects (count_to_len: 21 goals) — watch probe9
+wall-times; report in the completion record.
+(c) F5's production fix changes goal shapes for generic-&mut
+callees beyond the fixture (tgt modules outside probe11's scoped
+pair stay stale-shape until their next regen) — accepted under the
+no-tgt-gate constraint.
+
 ## Acceptance
 
 - probe9: `vec_read`, `vec_push7`, `fill_zeros`, `count_to_len` all
@@ -277,13 +379,14 @@ For every currently-CLOSING bridge, rendered output is unchanged:
   is replaced by the close).
 - Atom-fallback census before/after table on the scoped tgt emits
   (endgame acceptance: "shrinks measurably").
-- Poison mark derived reference-side; carried bit deleted from the
-  vocab; probe13 `poison_flip` re-pointed at the derivation input
-  and still flipping; the P1 contract paragraph in sst_serialize.rs
-  updated (the bit is no longer trusted).
+- Poison mark derived reference-side (A4 sequencing); carried bit
+  deleted from the vocab by arc end; probe13 `poison_flip`
+  re-pointed at the derivation input and still flipping; the P1
+  contract paragraph in sst_serialize.rs updated (the bit is no
+  longer trusted; the N2 detector paragraph stays, per A3).
+- probe13 gains the expected-typ kill class (A5).
 - F5: production bound predicate on the substituted param typ +
-  mirror; swap_incr/call_swap_incr re-close with the new bound
-  hyps.
+  mirror + swap_incr/call_swap_incr pins, ONE commit.
 - D discipline: no new StmData arms and FrameList untouched (the
   vocab growth is leaf-rendering + ctx metadata), so
   `wp_stm_sound` is untouched; say so explicitly in the completion
