@@ -476,3 +476,100 @@ corpus); probe13 `poison_flip` re-points at the derivation input.
 Impl-time checklist (from A3): enumerate EVERY `hyp_poison` call
 site (FHyp props, FLetH eq props, the c_lx cond site :1104, IfCtor
 eq/neg props) and transcribe deep for exactly those.
+
+## Design review 2026-07-31 (pre-impl, second session — ACCEPTED with one refinement)
+
+Reviewed the frozen F4 plan against both codebases (all `hyp_poison`
+call sites, the refWp gate/assembly/semantic dispatchers, probe13,
+the P1 contract). Verdict: proceed as frozen; findings below.
+
+**Freeze choices validated against the code:**
+
+- **`residue_names` as a GLOBAL ctx field is required, not just
+  convenient.** The obvious simplification — derive the residue set
+  from the `FLetR` frames in the current prefix — is subtly WRONG:
+  production's `residue_names` is monotonic across branch joins (the
+  branch state save at sst_serialize.rs:1006 saves
+  `(bound_names, rename_env, flet_forced, poison_forced)` and
+  deliberately NOT `residue_names`). A frame-prefix derivation
+  diverges from production at joins; the global table mirrors
+  production's actual implementation state (principle 5). Do not
+  "simplify" this later.
+- **Full `RawExp` transcription over a var-id projection.** A smaller
+  per-prop Var-id table would be a serializer-computed projection —
+  another trusted semantic predicate, the same class as the bit
+  itself. Full transcription keeps the serializer dumb and is
+  forward-compatible with hyp-prop deepening at E.
+- **Gate-time derivation (at `has_poisoned_hyp`), not build-time.**
+  `StmData::Call.post` is a serializer-emitted `FrameList` appended
+  VERBATIM by `frame_after` — refWp never builds those frames, so
+  build-time derivation can't reach their FHyp bits without a rewrite
+  pass. Deriving at the gate covers StmData-built and Call.post
+  frames uniformly, single-sourced. (Coverage census: of the 68
+  `FrameList.FHyp` literals in vendored certs, ZERO carry bit 1; the
+  only positive poison marks corpus-wide are add_capped's
+  Assert/Assume pair. Say so in the completion record.)
+
+**REFINEMENT (adopted): precompute `poisoned_props: LeafList` once at
+`ref_wp`, thread ONE param — not the two tables.** One spec fn
+`poisoned_props(residues, deeps) -> LeafList` (prop ids whose deep
+mentions a residue); the gate and the collapse arms become a
+`leaf_mem` membership check (the file's `binder_has_id` nat idiom).
+Same information, single derivation site, one threaded param, cheaper
+kernel reduction than per-goal-per-frame mention scans (count_to_len:
+21 goals — A6(b)). probe13 re-point unaffected: overwrite
+`residue_names` → the derived set picks up spurious ids → wrap forces
+→ flip. Missing-entry semantics FALL OUT of the precompute: an absent
+entry derives 0 (no membership) — loud-by-bridge in the divergence
+direction (production wrapped, we hoist → red), correct-by-luck in
+the other. Totality loudness therefore rests on the serializer-side
+assertion, below.
+
+**Impl-time specifications (settled at review):**
+
+- `raw_exp_mentions` returns `nat` (1/0), NOT bool
+  (Classical.propDecidable sticks `decide`); structural_decreases;
+  td_tag if-chain idiom (no nested match).
+- Totality, two layers: (a) serializer asserts every
+  `hyp_poison`-checked prop id gets a `prop_deeps` entry (built at
+  the same call site — enforceable at emission, loudest); (b)
+  reference-side missing entry derives 0 (see refinement). New
+  probe13 kill class: delete the add_capped prop-25 entry → missed
+  poison → hoist vs production wrap → bridge flips 1→0.
+- Loop cond fan-out: `cond_poison` covers FIVE props (`cond_ann`,
+  `neg_cond_ann`, `neg_neg_cond_ann`, `break_guard_ann`,
+  `break_use_ann`) — `prop_deeps` needs all five entries per loop;
+  derive per-prop, no shortcut (uniform, principle 5).
+- The `AssignH`/`RetLetH` collapse move REQUIRES a paired serializer
+  change in the same landing: the serializer STOPS collapsing
+  poisoned typed lets to `Assign`/`RetLet` (emits the hoist payload
+  always; `Assign`/`RetLet` narrow to typ-less/Bool-only) and refWp
+  derives the collapse — a poisoned eq prop forces wrap ONLY via the
+  collapse to plain FLet (`has_poisoned_hyp`'s FLetH arm reads no
+  bit), so the two sides must land together. Goal-shape-neutral
+  (FLet/FLetH wrap-render identically; the goal was wrap-forced
+  either way).
+- Acceptance wording fix: "`wp_stm_sound` untouched" holds for era 1
+  only. Era 2 (slot deletion) threads the derived set through
+  `wp_stm`/`gate_wrap`/`close_sem_*`, so `wp_stm_sound` gains one
+  universally-quantified param — mechanical, content-free (b79 arity
+  16→21 precedent). Say exactly that in the completion record.
+- probe13 re-point kills BOTH directions: overwrite `residue_names`
+  with occurring names (forces wrap) AND delete a needed name (missed
+  poison → hoist vs production wrap). Today's `poison_flip` covers
+  only the zero-marks direction.
+- Era-2 doc sweep: FHyp's doc comment (lib.rs:752-757, "the model's
+  leaves are opaque ids, so the serializer computes the mark
+  textually") and the StmData Assert/Assume/If/IfCtor/Loop
+  poison-field docs.
+- A4 masking-gap check PASSES: a bit/derivation divergence inside an
+  already-wrap-forced goal (mut-param fns) is irrelevant — production
+  doesn't care either — so probes-green ⟹ derivation ≡ bit wherever
+  it matters.
+
+**Alternatives considered and rejected:** (a) explicit per-cert
+`bit ≡ derivation` decide-pin era — needs throwaway cert-emission
+machinery; A4's probes-as-cross-check has the F5/F6 precedent. (b)
+In-place hyp-prop deepening (FHyp carries `RawExp`) — right end state
+at E, wrong increment now (breaks byte-neutrality on every goal); the
+side table migrates cleanly.
