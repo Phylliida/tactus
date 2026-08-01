@@ -5045,7 +5045,7 @@ pub proof fn u_gate_ucl(t: Box<FrameList>)
 {}
 
 // Poison-gate one-step pins.
-pub proof fn u_gatep_nil(pp: LeafList, )
+pub proof fn u_gatep_nil(pp: LeafList)
     ensures has_poisoned_hyp(pp, FrameList::FNil) == 0
 {}
 pub proof fn u_gatep_bind(pp: LeafList, x: u64, ty: u64, t: Box<FrameList>)
@@ -6454,7 +6454,7 @@ pub proof fn prophecy_sound(pp: LeafList, xfut: u64, ty: u64, resolve: u64, h: u
     u_gate_nil();
     u_gatep_bind(pp, xfut, ty, Box::new(FrameList::FHyp(0, resolve, Box::new(FrameList::FNil))));
     u_gatep_hyp(pp, 0, resolve, Box::new(FrameList::FNil));
-    u_gatep_nil(pp, );
+    u_gatep_nil(pp);
     u_gateu_bind(xfut, ty, Box::new(FrameList::FHyp(0, resolve, Box::new(FrameList::FNil))));
     u_gateu_hyp(0, resolve, Box::new(FrameList::FNil));
     u_gateu_nil();
@@ -6492,7 +6492,7 @@ pub proof fn prophecy_swapped_sound(pp: LeafList, xfut: u64, ty: u64, resolve: u
     u_gate_bind(xfut, ty, Box::new(FrameList::FNil));
     u_gate_nil();
     u_gatep_bind(pp, xfut, ty, Box::new(FrameList::FNil));
-    u_gatep_nil(pp, );
+    u_gatep_nil(pp);
     u_ce_hoist_mode(pp, f, obl);
     u_ceh_unfold(f, obl);
     u_cer_bind(xfut, ty, Box::new(FrameList::FNil), GoalData::LeafE(render_exp(obl)));
@@ -6539,7 +6539,7 @@ pub proof fn closure_deadend_isolates(pp: LeafList, q: u64, h: u64, obl: RawExp)
     u_wp_assert(pp, FrameList::FNil, obl, 0, h);
     u_gapp_nil(wp_stm(pp, FrameList::FNil, StmData::Assert(obl, 0, h)));
     u_gate_nil();
-    u_gatep_nil(pp, );
+    u_gatep_nil(pp);
     u_ce_hoist_mode(pp, FrameList::FNil, obl);
     u_ceh_unfold(FrameList::FNil, obl);
     u_cer_nil(GoalData::LeafE(render_exp(obl)));
@@ -6572,7 +6572,7 @@ pub proof fn seq_assume_gates(pp: LeafList, q: u64, h: u64, obl: RawExp)
     u_gate_hyp(0, q, Box::new(FrameList::FNil));
     u_gate_nil();
     u_gatep_hyp(pp, 0, q, Box::new(FrameList::FNil));
-    u_gatep_nil(pp, );
+    u_gatep_nil(pp);
     u_gateu_hyp(0, q, Box::new(FrameList::FNil));
     u_gateu_nil();
     u_ce_hoist_mode(pp, fh, obl);
@@ -6623,7 +6623,7 @@ pub proof fn closure_forwards_contract(pp: LeafList, hp: HpOracle, he: HeOracle,
     u_gate_hyp(0, ext, Box::new(FrameList::FNil));
     u_gate_nil();
     u_gatep_hyp(pp, 0, ext, Box::new(FrameList::FNil));
-    u_gatep_nil(pp, );
+    u_gatep_nil(pp);
     u_gateu_hyp(0, ext, Box::new(FrameList::FNil));
     u_gateu_nil();
     u_cse_hoist_mode(pp, hp, he, lv, FrameList::FHyp(0, ext, Box::new(FrameList::FNil)), obl);
