@@ -655,3 +655,16 @@ is covered corpus-wide by every hoisted baseline.
   ∀-over-inputs anyway); the semantic vocabulary (GoalData/holds/St)
   is untouched. Said explicitly per the acceptance item: era 1 left
   it untouched; era 2 threaded the param.
+
+**Post-implementation design review follow-ups (same day, second
+session's review — F1/F2/F3):** (F1) the uncoverable bit-0 fallback is
+now the OPAQUE-ATOM idiom (`atom_ob(leaf_id)` — honest-by-convention,
+mention-safe since bare-Var transcriptions never fail) instead of a
+dummy constant deep that falsely claimed the prop was a constant
+(transparency, principle 4). (F2) `prop_deeps` dedups by prop id at
+registration (the Assert/Assume pair shares a leaf — duplicate entries
+were cert noise and the direct cause of the `poison_deep_drop` rescan
+bug). (F3) trailing-comma script residue swept. Re-validated: gate
+291/0 + pkg gate 54 + discharge 198/0, probes 9/11/13 ✓, units 428/0,
+golden re-vendored; add_capped table = 4 unique entries;
+find_cancellation cert carries the atom_ob fallback.

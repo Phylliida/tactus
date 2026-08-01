@@ -49,7 +49,7 @@
 //! and (b) emission-time guards: a residue mention on a prop with no
 //! transcriber (`Call.post` LExpr-side props) or an uncoverable
 //! transcription rejects loud (`prop-deep-uncoverable`), and an
-//! uncoverable bit-0 prop registers a dummy constant deep (guaranteed
+//! uncoverable bit-0 prop registers the opaque-atom fallback deep (guaranteed
 //! mention-free by the same check; the bridge backstops even a buggy
 //! check — a wrong 0 hoists where production wrapped). The channel is
 //! pinned live by the probe13 `poison_residue_drop` / `poison_deep_drop`
@@ -610,8 +610,11 @@ struct Serializer<'a> {
     /// props walked BEFORE any residue let exists (a prop can only
     /// mention names that exist at its walk point, and `residue_names`
     /// is monotone — the reference derives 0 for those, which is
-    /// correct); with residues in scope, a transcription failure is a
-    /// loud `prop-deep-uncoverable` reject.
+    /// correct); with residues in scope, a transcription failure rejects
+    /// loud when the prop's bit is 1 (`prop-deep-uncoverable`) and
+    /// registers the opaque-atom fallback when 0 (guaranteed
+    /// mention-free). One entry per prop id (the Assert/Assume pair
+    /// shares a leaf).
     prop_deeps: Vec<(u64, String)>,
     /// Wrap-mode mirror (endgame A2): true when the fn's closer is
     /// NON-default (`!sst_to_lean::closer_is_default` — a fn-level
@@ -1073,12 +1076,19 @@ impl<'a> Serializer<'a> {
     /// can only mention names that exist at its walk point). On a
     /// transcription failure (a shape outside `raw_exp`'s coverage,
     /// e.g. a `usize` HasType range): bit 1 rejects LOUD (genuinely
-    /// underivable — `prop-deep-uncoverable`); bit 0 registers a dummy
+    /// underivable — `prop-deep-uncoverable`); bit 0 registers the opaque-atom
     /// constant deep — the derived 0 is GUARANTEED correct by the bit
     /// the caller just computed, and the bridge backstops even a buggy
     /// bit (a wrong 0 hoists where production wrapped → red).
     fn register_prop_deep(&mut self, leaf_id: u64, e: &Exp, hp: u64) -> Sr<()> {
         if self.residue_names.is_empty() {
+            return Ok(());
+        }
+        // One entry per prop id (keep first): the Assert forward hyp and
+        // its following Assume carry the SAME prop leaf (FINDINGS-b74
+        // §3's duplicated pair) — without dedup the table holds the same
+        // transcription twice, cert-noise with no semantic content.
+        if self.prop_deeps.iter().any(|(id, _)| *id == leaf_id) {
             return Ok(());
         }
         match self.raw_exp(e) {
@@ -1090,9 +1100,17 @@ impl<'a> Serializer<'a> {
                 if hp == 1 {
                     Err(format!("prop-deep-uncoverable: {}", reason))
                 } else {
+                    // The OPAQUE-ATOM fallback (the `atom_ob` idiom used
+                    // for uncoverable obligations): honest about being a
+                    // non-transcription, and mention-safe — the prop's own
+                    // leaf id can coincide with a residue name only when
+                    // the prop text IS the bare residue var, and bare-Var
+                    // transcriptions never fail, so that case can't reach
+                    // here. The derived 0 is guaranteed correct by the
+                    // caller's bit; the bridge backstops even a buggy bit.
                     self.prop_deeps.push((
                         leaf_id,
-                        format!("({}.RawExp.Lit 0 ({}.TypData.TyBool))", NS, NS),
+                        format!("({}.RawExp.Var {} ({}.TypData.TyBool))", NS, leaf_id, NS),
                     ));
                     Ok(())
                 }
