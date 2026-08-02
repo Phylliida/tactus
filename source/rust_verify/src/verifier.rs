@@ -1717,6 +1717,16 @@ impl Verifier {
             // shared key masked the difference; the flag itself is gone
             // since e5f7aea — proof-fns always route under --lean-backend).
             base.update_tag(&format!("lean:{:?}", self.args.lean_backend));
+            // P3(b)/b67: the emitter/closer BINARY version — a rebuilt
+            // binary with changed WP-translation / SST→AIR / closer logic
+            // must not reuse verdicts cached by its predecessor (the
+            // documented b74 hole; the krate hash doesn't see Rust-side
+            // translation changes). One-time invalidation on upgrade is
+            // the intended effect.
+            base.update_tag(&format!(
+                "emitter:{}",
+                lean_verify::project::emitter_fingerprint()
+            ));
             base.update_debug(&krate);
             let mut bc = crate::verification_cache::BucketCache::new(base);
             for function in krate.functions.iter() {

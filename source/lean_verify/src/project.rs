@@ -29,6 +29,37 @@ pub fn project_ready(project_dir: &Path) -> bool {
     project_dir.join("lakefile.lean").exists() && project_dir.join(".lake").exists()
 }
 
+/// Emitter/closer BINARY identity (P3/b67): the vargo build version
+/// (`VARGO_BUILD_VERSION`, set for the whole build so this crate sees the
+/// same string `rust_verify::util::verus_build_info` reports) plus an
+/// FNV-1a content hash of the running executable. Content, not mtime:
+/// deterministic, and it catches dirty-tree rebuilds where the version
+/// string is unchanged (`<sha>.dirty` for two different trees). Used by
+/// the `-V cache` base key (the documented b74 hole: a rebuilt binary
+/// with changed closer logic reused old Z3 verdicts) and by the W4b
+/// bridge pass markers. Island/pkg verdict caches deliberately do NOT
+/// use this (they key on emitted text; "this text elaborates" is a
+/// binary-independent fact — see `ladder_fingerprint`).
+/// Memoized per process; over-invalidates on any relink — the safe
+/// direction, and "one re-verify per rebuilt binary" is the ladder
+/// precedent's honest price.
+pub fn emitter_fingerprint() -> &'static str {
+    static FP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    FP.get_or_init(|| {
+        let version = option_env!("VARGO_BUILD_VERSION").unwrap_or("unknown");
+        let mut h: u64 = 0xcbf29ce484222325;
+        if let Ok(exe) = std::env::current_exe() {
+            if let Ok(bytes) = std::fs::read(&exe) {
+                for b in bytes {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+            }
+        }
+        format!("{}:fnv1a:{:016x}", version, h)
+    })
+}
+
 /// Fingerprint of the Lean environment islands and oleans are built
 /// against: `lean --version` output plus, when the Mathlib project
 /// exists, the bytes of its `lean-toolchain` and `lake-manifest.json`

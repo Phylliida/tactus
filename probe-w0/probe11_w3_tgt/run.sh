@@ -34,8 +34,14 @@
 #     /home/bepis/prog/verus-cad/tactus-group-theory/src/lib.rs \
 #     --emit-lean --tactus-emit-cert --verify-module runtime \
 #     TACTUS_LEAN_OUT=$OUT      # (env; see command form in the board card)
-# Must run COLD (omit -V cache): a cache-hit fn skips the emit path (census
-# prereq B). The cert lands at $OUT/lib/cert/runtime__impl__4__clone.cert.lean.
+# Regen runs COLD (omit -V cache) by recipe. MECHANISM NOTE (corrected
+# 2026-08-01, b67): the old claim "a cache-hit fn skips the emit path" is
+# stale — it predates the tactus routing restructure. Today the tactus
+# route never consults the -V Z3-verdict cache (verified empirically:
+# a warm run with 43 cached fns still re-emits every cert, full census),
+# and b67 keys the bridge pass cache on cert CONTENT, so emission and
+# caching compose safely by construction either way. The cert lands at
+# $OUT/lib/cert/runtime__impl__4__clone.cert.lean.
 #
 # Classification (same discipline as probe9_bridge):
 #   CLOSE       — refWp reconstructs production verbatim; = 1 bridge elaborates.

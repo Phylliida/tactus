@@ -3891,6 +3891,40 @@ pub fn check_package(
     })
 }
 
+/// W4b (b67): content key for the per-cert bridge pass cache. Covers
+/// everything a PASS verdict depends on: the bridge module text (cert
+/// body + suffix), the tactus-core oleans (`core_olean_hash`), the Lean
+/// toolchain, and the emitter binary (P3(b) — bridge assembly +
+/// failure-parsing are Rust-side). FNV-1a, matching `vocab_hash` /
+/// `core_olean_hash` style; the `w4b1` tag versions the scheme.
+fn bridge_cache_key(bridge_text: &str, core_hash: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for piece in [
+        "w4b1",
+        bridge_text,
+        core_hash,
+        crate::project::toolchain_fingerprint(),
+        crate::project::emitter_fingerprint(),
+    ] {
+        for b in piece.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        // Component separator (FNV over concatenation would be ambiguous).
+        h ^= 0xff;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("fnv1a:{:016x}", h)
+}
+
+/// Island-marker discipline for the bridge pass cache (b67): the marker
+/// exists IFF the last completed bridge run on exactly this module text,
+/// against exactly this core/toolchain/emitter, passed. It is REMOVED
+/// before any live run — a crashed or failed run leaves no stale trust.
+fn bridge_cache_hit(marker: &Path, key: &str) -> bool {
+    std::fs::read_to_string(marker).ok().as_deref() == Some(key)
+}
+
 /// W4a (bootstrap-38): elaborate the refWp↔production `decide` bridge over
 /// every emitted obligation cert, INSIDE the package gate. This is the
 /// external probe `run.sh` logic (probe9/probe11) promoted in-process: for
@@ -3908,8 +3942,10 @@ pub fn check_package(
 /// across checkout layouts is deliberately avoided. When the var is unset
 /// (or the dir is missing `TactusDefs_lib_exec.olean`), the bridge SKIPS
 /// with a loud note — opt-in, so no default gate path breaks. The dir's
-/// olean content-hash is recorded in the note as an audit trail and to
-/// stage W4b's cache key.
+/// olean content-hash is recorded in the note as an audit trail and is
+/// consumed by the W4b pass cache (b67): each cert's bridge module is
+/// re-elaborated only when its content key (module text + core hash +
+/// toolchain + emitter binary) has no `.verified` marker on disk.
 ///
 /// Returns the one-line summary the gate prints verbatim.
 fn run_bridge_step(crate_name: &str, base_path: &str) -> String {
@@ -3951,6 +3987,7 @@ fn run_bridge_step(crate_name: &str, base_path: &str) -> String {
 
     let mut checked = 0usize;
     let mut passed = 0usize;
+    let mut cached = 0usize;
     let mut failed_names: Vec<String> = Vec::new();
     for cert in &certs {
         let leaf = cert
@@ -3982,7 +4019,18 @@ fn run_bridge_step(crate_name: &str, base_path: &str) -> String {
             ns = crate::sst_serialize::cert_ns(),
             leaf = leaf,
         ));
-        if std::fs::write(bridge_dir.join(format!("{}.lean", module)), &text).is_err() {
+        // W4b (b67): content-keyed pass cache. A hit means the last
+        // completed bridge run on EXACTLY this text, core, toolchain,
+        // and emitter passed — skip the lean spawn. Miss/failed/crashed
+        // runs leave no marker, so nothing stale is ever trusted.
+        let key = bridge_cache_key(&text, &core_hash);
+        let marker = bridge_dir.join(format!("{}.verified", module));
+        if bridge_cache_hit(&marker, &key) {
+            cached += 1;
+            continue;
+        }
+        let _ = std::fs::remove_file(&marker);
+        if write_lean_file_tracked(&bridge_dir.join(format!("{}.lean", module)), &text).is_err() {
             failed_names.push(leaf.to_string());
             continue;
         }
@@ -3990,16 +4038,17 @@ fn run_bridge_step(crate_name: &str, base_path: &str) -> String {
         run_lean(&bridge_dir, &module, false, &bridge_path, &mut local_failures);
         if local_failures.is_empty() {
             passed += 1;
+            let _ = std::fs::write(&marker, &key);
         } else {
             failed_names.push(leaf.to_string());
         }
     }
 
-    let failed = checked - passed;
+    let failed = checked - passed - cached;
     let mut note = format!(
-        "{} obligations bridge-checked against tactus-core ({} passed, {} failed) \
+        "{} obligations bridge-checked against tactus-core ({} passed, {} failed, {} cached) \
          [core-olean {}]",
-        checked, passed, failed, core_hash,
+        checked, passed, failed, cached, core_hash,
     );
     if !failed_names.is_empty() {
         note.push_str(&format!("; failed: {}", failed_names.join(", ")));
@@ -4009,10 +4058,11 @@ fn run_bridge_step(crate_name: &str, base_path: &str) -> String {
 
 /// FNV-1a over the sorted `.olean` files in `dir` (name + bytes). A
 /// dependency-free content hash of the tactus-core build the bridge ran
-/// against — audit trail for W4a, and the seed of W4b's bridge cache key
-/// (a core-logic change to `ref_wp`/`goals_eq` flips this digest, so a
-/// future cache cannot silently reuse a stale PASS). Placeholder for the
-/// SHA-256 §6 vendoring will bring, matching `vocab_hash`'s FNV-1a style.
+/// against — audit trail for W4a, and a component of W4b's bridge cache
+/// key (a core-logic change to `ref_wp`/`goals_eq` flips this digest, so
+/// the pass cache cannot silently reuse a stale PASS). Placeholder for
+/// the SHA-256 §6 vendoring will bring, matching `vocab_hash`'s FNV-1a
+/// style.
 fn core_olean_hash(dir: &Path) -> String {
     let mut oleans: Vec<PathBuf> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
