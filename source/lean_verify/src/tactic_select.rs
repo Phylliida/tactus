@@ -267,6 +267,39 @@ pub(crate) const TERM_SIMP_LEMMAS: &str =
      Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, \
      Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add";
 
+/// Prop-connective recursion guards lower through decidable instances
+/// into DITE-form context hyps the TERM set cannot decompose (tgt
+/// word_numbering / m1_guard, found 2026-08-02; each set is the
+/// `simp_all?`-named minimum for its shape):
+/// - OR-guard (`if c ∨ P then`): the negated guard hyp arrives as
+///   `h : ¬if x : c then True else P` — dite→ite, the True-branch
+///   collapse to `¬c → P`, `not_imp` splits to `¬c ∧ ¬P`, `Nat.not_le`
+///   hands omega the strict bound. `not_false_eq_true`: the decomposed
+///   ¬-facts double as False-direction rewrites, so a goal that IS
+///   one of the decomposed facts (`¬len W = 0`, tgt m3_blinker's
+///   drop_base_run) reduces to `¬False` mid-simp and needs the
+///   one-step collapse (omega can't close `¬False`).
+pub(crate) const TERM_DITE_OR_LEMMAS: &str =
+    "dite_eq_ite, if_true_left, not_imp, Nat.not_le, not_false_eq_true";
+/// - AND-guard (`if c ∧ P then`, `>`-flavored): the guard hyp arrives
+///   as `h : if h : c then P else False` — `>` normalizes to `<`,
+///   dite→ite, the False-branch collapse to `c ∧ P`, then simp_all's
+///   ∧-split hands omega the bound.
+pub(crate) const TERM_DITE_AND_LEMMAS: &str =
+    "gt_iff_lt, dite_eq_ite, if_false_right";
+
+/// The fun_induction companion-theorem case set (tgt m3_blinker's
+/// `drop_base_run_len_le`, 2026-08-02): fun_induction's per-case goals
+/// carry BOTH polarities of the dite-encoded guard (positive in the
+/// base cases, negated in the step cases) plus the guard-contradiction
+/// branches, so the goals are heterogeneous propositional cleanups —
+/// `simp_all?` names this union across all four case shapes
+/// (dite normalization, the True-branch collapse, then ¬/∨/→
+/// cleanup into omega-usable or vacuous-closing form).
+pub(crate) const TERM_DITE_PROP_LEMMAS: &str =
+    "dite_eq_ite, if_true_left, not_or, not_false_eq_true, imp_false, \
+     not_true_eq_false, not_imp, or_self, Nat.le_refl";
+
 /// Arithmetic collapse lemmas for the goal-only form G arm: identity /
 /// annihilator / cast-push laws PLUS (sub)distribution, so the whole
 /// expansion reaches a monomial normal form whose nonlinear pieces
