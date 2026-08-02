@@ -1973,6 +1973,12 @@ fn seq_suffix_mono_companion_cmd(
     // vacuous guard-contradiction branches `split` can introduce. Validated
     // against the real emitted `m3_blinker` oleans under BOTH the gate
     // prelude and a plain-`∨` prelude (bootstrap-47).
+    // Dite legs (2026-08-02): a Prop-connective guard (`len W = 0 ∨ P`)
+    // leaves dite-form context hyps in the fun_induction cases that the
+    // TERM legs can't decompose (tgt m3_blinker's drop_base_run_len_le
+    // itself, 74:8). The inner le_trans-chain goal is the companion
+    // tail's domain (decreasing side condition); the OUTER cases are
+    // heterogeneous propositional cleanups — TERM_DITE_PROP's union.
     let cmd = Command::Raw(format!(
         "theorem {mono_name} (W : {seq_t} {elem_arg}) :\n    \
          {len} {elem_arg} ({fn_n} W) ≤ {len} {elem_arg} W := by\n  \
@@ -1982,10 +1988,14 @@ fn seq_suffix_mono_companion_cmd(
          | (apply Nat.le_trans <;>\n          \
          first\n            \
          | assumption\n            \
-         | (apply Nat.le_of_lt; apply {df}_len_lt <;> (first | assumption | omega | (simp_all only [{ts}] <;> omega) | simp_all only [{ts}])))\n      \
+         | (apply Nat.le_of_lt; apply {df}_len_lt <;> (first | assumption | omega | (simp_all only [{ts}] <;> omega) | simp_all only [{ts}] | (simp_all only [{dite_or}] <;> omega) | (simp_all only [{dite_and}] <;> omega))))\n      \
          | (simp_all only [{ts}] <;> omega)\n      \
-         | simp_all only [{ts}]",
+         | simp_all only [{ts}]\n      \
+         | (simp_all only [{dite_prop}] <;> omega)",
         ts = crate::tactic_select::TERM_SIMP_LEMMAS,
+        dite_or = crate::tactic_select::TERM_DITE_OR_LEMMAS,
+        dite_and = crate::tactic_select::TERM_DITE_AND_LEMMAS,
+        dite_prop = crate::tactic_select::TERM_DITE_PROP_LEMMAS,
     ));
     Some((mono_name, cmd))
 }

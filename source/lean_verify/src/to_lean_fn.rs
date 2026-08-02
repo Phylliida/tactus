@@ -365,7 +365,23 @@ fn collect_arg_signals(
                     // the measure head itself — not a suffix context
                 } else {
                     let last = s.rsplit('.').next().unwrap_or(s);
-                    if last.chars().next().map_or(false, |c| c.is_uppercase()) {
+                    // Structure-instance construction (`<Type>.mk` —
+                    // tgt ii_subset's `KPWord.mk (first tail).2
+                    // (drop_first tail)`, 2026-08-02): the LAST segment
+                    // is lowercase, so the bare case check mistook the
+                    // ctor for a lowercase suffix fn and marked every
+                    // drop/subrange inside as a NESTED suffix (the
+                    // chaining rung's domain) — mis-classifying a
+                    // direct drop measure as Chaining. A constructor
+                    // wrapper is length-neutral here, so the drop
+                    // inside stays a DIRECT drop signal.
+                    let penult_upper = s
+                        .rsplit('.').nth(1)
+                        .and_then(|p| p.chars().next())
+                        .map_or(false, |c| c.is_uppercase());
+                    if last.chars().next().map_or(false, |c| c.is_uppercase())
+                        || (last == "mk" && penult_upper)
+                    {
                         out.ctor = true;
                     } else {
                         ctx = true;
@@ -477,6 +493,22 @@ fn measure_is_arith_shaped(e: &LExpr) -> bool {
     )
 }
 
+/// The shared companion-close tail for the decreasing_by templates:
+/// assumption/omega first, then the TERM normalizer (with and without
+/// the omega finish), then the two dite-guard decomposers
+/// (`TERM_DITE_OR/AND_LEMMAS` — Prop-connective guards arrive as
+/// dite-form context hyps; the dite legs only run when the TERM legs
+/// can't close, and at their target shapes every named lemma fires,
+/// so they add zero unused-simp-argument warnings).
+fn companion_close_tail() -> String {
+    format!(
+        "(first | assumption | omega | (simp_all only [{ts}] <;> omega) | simp_all only [{ts}] | (simp_all only [{dite_or}] <;> omega) | (simp_all only [{dite_and}] <;> omega))",
+        ts = crate::tactic_select::TERM_SIMP_LEMMAS,
+        dite_or = crate::tactic_select::TERM_DITE_OR_LEMMAS,
+        dite_and = crate::tactic_select::TERM_DITE_AND_LEMMAS,
+    )
+}
+
 fn decreasing_by_tactic(measure: &LExpr, self_name: &str, body: &LExpr) -> String {
     let q = |n: &str| match crate::to_lean_type::crate_ns() {
         Some(ns) => format!("{}.{}", ns, n),
@@ -495,35 +527,41 @@ fn decreasing_by_tactic(measure: &LExpr, self_name: &str, body: &LExpr) -> Strin
             let monos = SUFFIX_MONO_NAMES.with(|s| s.borrow().clone());
             let applies: String = monos.iter().map(|m| format!("apply {} | ", m)).collect();
             format!(
-                "all_goals (apply Nat.lt_of_le_of_lt <;> (first | {applies}(apply {df} <;> (first | assumption | omega | (simp_all only [{ts}] <;> omega) | simp_all only [{ts}]))))",
+                "all_goals (apply Nat.lt_of_le_of_lt <;> (first | {applies}(apply {df} <;> {tail})))",
                 df = q("Seq.drop_first_len_lt"),
-                ts = crate::tactic_select::TERM_SIMP_LEMMAS,
+                tail = companion_close_tail(),
             )
         }
         DecreasingKind::SeqSubrange => format!(
-            "all_goals (apply {} <;> (first | assumption | omega | (simp_all only [{}] <;> omega) | simp_all only [{}]))",
+            "all_goals (apply {} <;> {})",
             q("Seq.subrange_tail_len_lt"),
-            crate::tactic_select::TERM_SIMP_LEMMAS,
-            crate::tactic_select::TERM_SIMP_LEMMAS,
+            companion_close_tail(),
         ),
         DecreasingKind::SeqDropFirst => format!(
-            "all_goals (apply {} <;> (first | assumption | omega | (simp_all only [{}] <;> omega) | simp_all only [{}]))",
+            "all_goals (apply {} <;> {})",
             q("Seq.drop_first_len_lt"),
-            crate::tactic_select::TERM_SIMP_LEMMAS,
-            crate::tactic_select::TERM_SIMP_LEMMAS,
+            companion_close_tail(),
         ),
         DecreasingKind::SeqDropLast => format!(
-            "all_goals (apply {} <;> (first | assumption | omega | (simp_all only [{}] <;> omega) | simp_all only [{}]))",
+            "all_goals (apply {} <;> {})",
             q("Seq.drop_last_len_lt"),
-            crate::tactic_select::TERM_SIMP_LEMMAS,
-            crate::tactic_select::TERM_SIMP_LEMMAS,
+            companion_close_tail(),
         ),
         DecreasingKind::Modular => "all_goals (apply Nat.mod_lt <;> omega)".to_string(),
-        // Inner 2-ladder: the Prop-ite guard case (bootstrap-44) is
-        // guard-shape dependent, which the measure can't predict.
+        // Third leg (tgt word_numbering, 2026-08-02): a DISJUNCTIVE
+        // Prop guard (`alpha = 0 ∨ m ≤ 1`) elaborates the negated
+        // guard-hyp as a dite (`¬if x : c then True else P`), which the
+        // TERM set cannot decompose; the inline set is the `simp_all?`-
+        // named minimum for this kind's POSITIVE arithmetic goals
+        // (`0 < alpha`, `1 < m`). A separate leg, not a TERM
+        // addition: at sites where omega or the TERM leg already
+        // closes, nothing new runs — zero unused-simp-arg warnings.
+        // (The companion tail's OR set carries `not_false` too — its
+        // goals can BE the decomposed ¬-fact and reduce to `¬False`
+        // mid-simp; Div's positive goals never do.)
         DecreasingKind::Div => {
             format!(
-                "all_goals (apply Nat.div_lt_self <;> (first | omega | (simp_all only [{}] <;> omega)))",
+                "all_goals (apply Nat.div_lt_self <;> (first | omega | (simp_all only [{}] <;> omega) | (simp_all only [dite_eq_ite, if_true_left, not_imp, Nat.not_le] <;> omega)))",
                 crate::tactic_select::TERM_SIMP_LEMMAS,
             )
         }
@@ -543,18 +581,19 @@ fn decreasing_by_tactic(measure: &LExpr, self_name: &str, body: &LExpr) -> Strin
                         .map(|m| format!("apply {} | ", m))
                         .collect();
                     format!(
-                        " | (apply Nat.lt_of_le_of_lt <;> (first | {applies}(apply {df} <;> (first | assumption | omega | (simp_all only [{ts}] <;> omega) | simp_all only [{ts}]))))",
+                        " | (apply Nat.lt_of_le_of_lt <;> (first | {applies}(apply {df} <;> {tail})))",
                         df = q("Seq.drop_first_len_lt"),
-                        ts = crate::tactic_select::TERM_SIMP_LEMMAS,
+                        tail = companion_close_tail(),
                     )
                 }
             });
             format!(
-                "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Nat.div_lt_self <;> (simp_all only [{ts}] <;> omega)) | (apply {ds} <;> (first | assumption | omega | (simp_all only [{ts}] <;> omega) | simp_all only [{ts}])) | (apply {df} <;> (first | assumption | omega | (simp_all only [{ts}] <;> omega) | simp_all only [{ts}])) | (apply {dl} <;> (first | assumption | omega | (simp_all only [{ts}] <;> omega) | simp_all only [{ts}])) | ((repeat split) <;> omega){chain_rung} | decreasing_tactic)",
+                "all_goals (first | omega | (apply Nat.mod_lt <;> omega) | (apply Nat.div_lt_self <;> omega) | (apply Nat.div_lt_self <;> (simp_all only [{ts}] <;> omega)) | (apply {ds} <;> {tail}) | (apply {df} <;> {tail}) | (apply {dl} <;> {tail}) | ((repeat split) <;> omega){chain_rung} | decreasing_tactic)",
                 ts = crate::tactic_select::TERM_SIMP_LEMMAS,
                 ds = q("Seq.subrange_tail_len_lt"),
                 df = q("Seq.drop_first_len_lt"),
                 dl = q("Seq.drop_last_len_lt"),
+                tail = companion_close_tail(),
             )
         }
     }
