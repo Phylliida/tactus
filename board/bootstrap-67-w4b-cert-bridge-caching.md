@@ -204,18 +204,16 @@ binary, so the in-gate bridge never executes on tgt today.
 
 ### Findings for Danielle
 
-1. **tgt runtime-module gate drift (pre-existing, NOT b67-caused).**
-   `TactusDefs_lib_exec__word_numbering` "simp_all made no progress" ×4
-   (exec + spec defs parts), `Seq.drop_first_len_lt` unify failure in
-   `TactusDefs_lib__ii_subset`, `lemma_inverse_word_element`
-   tactus_auto failures. Reproduces identically without
-   `--tactus-bridge`; b67's diff touches only cache keys / cert writes /
-   the bridge step. The accepted tgt path (probe11 scoped
-   `--emit-lean` + external bridge) is green. This looks like
-   worktree-binary vs tgt drift accumulated since the last tgt gate —
-   worth its own brick if tgt gates ever resume; under the standing
-   constraint it only means the in-gate bridge has no tgt subject
-   today.
+1. **tgt runtime-module gate drift (RESOLVED 2026-08-02 — see
+   `FINDINGS-tgt-runtime-module-gate.md`).** Diagnosed on request: NOT
+   b67, NOT bootstrap-lane (identical on tgt's blessed binary) — latent
+   decreasing_by/mono-template bugs since mainline-10/N3 (ctor
+   mis-classification; dite-encoded Prop-connective guards the named
+   TERM set can't decompose). Fixed in `00827513`: the whole tgt defs
+   layer elaborates again. Residual: 11 errors in 3 recursive proof fns
+   (N3 script-form closer class — paths (a) script-author
+   `have`-instantiation move / leg coverage, (b) S2c fn-level
+   overrides; Danielle's call). Port to `tactus/source` needed.
 2. **Cert perturbation composition (by construction, verified).** A
    hand-edit to an on-disk cert does not produce a bridge red: the gate
    re-emits certs from SST before bridging, and D3's content-compare
