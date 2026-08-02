@@ -1509,3 +1509,23 @@ fn goal_data_gate_deep_only_when_in_deep_ids() {
            (Tactus.Box.mk (lib.ExprData.Atom 2))))"
     );
 }
+
+// ── b67 (W4b): cert write content-compare pin ───────────────────────
+
+#[test]
+fn write_if_changed_skips_byte_identical_rewrite() {
+    let pid = std::process::id();
+    let path = std::env::temp_dir().join(format!("tactus_b67_wic_{}.txt", pid));
+    let _ = std::fs::remove_file(&path);
+    // First call writes.
+    assert_eq!(super::write_if_changed(&path, "aaa").unwrap(), true);
+    let mtime1 = std::fs::metadata(&path).unwrap().modified().unwrap();
+    // Identical content: no rewrite, mtime preserved.
+    assert_eq!(super::write_if_changed(&path, "aaa").unwrap(), false);
+    let mtime2 = std::fs::metadata(&path).unwrap().modified().unwrap();
+    assert_eq!(mtime1, mtime2, "byte-identical rewrite must keep the mtime");
+    // Changed content: rewritten.
+    assert_eq!(super::write_if_changed(&path, "bbb").unwrap(), true);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "bbb");
+    let _ = std::fs::remove_file(&path);
+}

@@ -230,3 +230,51 @@ fn collect_referenced_datatypes_honours_extra_seed() {
     assert!(matches!(&got[0].name, Dt::Path(p) if short_name(p) == "Foo"),
         "the collected datatype should be Foo");
 }
+
+// ── b67 (W4b): bridge pass cache + emitter fingerprint pins ─────────
+
+#[test]
+fn bridge_cache_key_deterministic_and_sensitive() {
+    let k1 = bridge_cache_key("text-a", "core-1");
+    let k2 = bridge_cache_key("text-a", "core-1");
+    assert_eq!(k1, k2, "same inputs must give the same key");
+    assert_ne!(
+        bridge_cache_key("text-b", "core-1"), k1,
+        "bridge module text is a key component"
+    );
+    assert_ne!(
+        bridge_cache_key("text-a", "core-2"), k1,
+        "the core-olean hash is a key component"
+    );
+    // Component boundaries are unambiguous (separator between pieces):
+    // ("ab","c") must not collide with ("a","bc").
+    assert_ne!(
+        bridge_cache_key("ab", "c"), bridge_cache_key("a", "bc"),
+        "concatenation-ambiguous inputs must not collide"
+    );
+}
+
+#[test]
+fn bridge_cache_hit_marker_discipline() {
+    let pid = std::process::id();
+    let marker = std::env::temp_dir().join(format!("tactus_b67_marker_{}.verified", pid));
+    let _ = std::fs::remove_file(&marker);
+    let key = bridge_cache_key("text", "core");
+    // No marker → miss.
+    assert!(!bridge_cache_hit(&marker, &key));
+    // Marker with the wrong key → miss.
+    std::fs::write(&marker, "fnv1a:0000000000000000").unwrap();
+    assert!(!bridge_cache_hit(&marker, &key));
+    // Marker with the exact key → hit.
+    std::fs::write(&marker, &key).unwrap();
+    assert!(bridge_cache_hit(&marker, &key));
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[test]
+fn emitter_fingerprint_stable_and_shaped() {
+    let fp1 = crate::project::emitter_fingerprint();
+    let fp2 = crate::project::emitter_fingerprint();
+    assert_eq!(fp1, fp2, "memoized per process");
+    assert!(fp1.contains(":fnv1a:"), "version:fnv1a:<hash> shape, got {}", fp1);
+}

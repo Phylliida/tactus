@@ -4987,6 +4987,18 @@ fn cert_leaf_name(fn_name: &str) -> String {
     fn_name.replace(['«', '»'], "").replace('.', "__")
 }
 
+/// M5e-style content-compare write (b67): write only when the on-disk
+/// text differs, so a byte-identical re-emission keeps the file's mtime.
+/// Returns whether the file was (re)written.
+fn write_if_changed(path: &std::path::Path, text: &str) -> std::io::Result<bool> {
+    let changed = std::fs::read_to_string(path).ok().as_deref() != Some(text);
+    if changed {
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(text.as_bytes())?;
+    }
+    Ok(changed)
+}
+
 fn write_cert_file(crate_name: &str, fn_name: &str, body: &CertBody) -> std::io::Result<()> {
     let leaf = cert_leaf_name(fn_name);
     let dir = crate::generate::lean_out_root()
@@ -4997,10 +5009,10 @@ fn write_cert_file(crate_name: &str, fn_name: &str, body: &CertBody) -> std::io:
 
     let text = render_cert(crate_name, fn_name, &leaf, body);
 
-    // Write atomically-ish: full contents in one call. Determinism: the
-    // text is a pure function of the inputs (no timestamps).
-    let mut f = std::fs::File::create(&path)?;
-    f.write_all(text.as_bytes())?;
+    // Determinism: the text is a pure function of the inputs (no
+    // timestamps). Content-compare write (b67): byte-identical
+    // re-emissions keep the mtime.
+    write_if_changed(&path, &text)?;
     Ok(())
 }
 
@@ -5207,8 +5219,7 @@ fn write_def_cert_file(
     // obligation cert's `.cert.lean` (nor the datatype's `.dtcert.lean`).
     let path = dir.join(format!("{}.defcert.lean", leaf));
     let text = render_def_cert(crate_name, fn_name, &leaf, raw, defdata);
-    let mut f = std::fs::File::create(&path)?;
-    f.write_all(text.as_bytes())?;
+    write_if_changed(&path, &text)?;
     Ok(())
 }
 
@@ -5225,8 +5236,7 @@ fn write_dt_cert_file(
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.dtcert.lean", leaf));
     let text = render_dt_cert(crate_name, dt_name, &leaf, raw, dtdata);
-    let mut f = std::fs::File::create(&path)?;
-    f.write_all(text.as_bytes())?;
+    write_if_changed(&path, &text)?;
     Ok(())
 }
 
