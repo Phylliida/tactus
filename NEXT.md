@@ -1,5 +1,31 @@
 # NEXT — bootstrap work queue (2026-07-21; superseded 2026-07-24)
 
+**2026-08-02 pm: tgt runtime-module gate DIAGNOSED + defs layer
+REPAIRED (`00827513`, findings doc `FINDINGS-tgt-runtime-module-gate.md`).**
+The b67 cost measurement found the scoped tgt module gate red (11
+errors); bifurcation proved it pre-existing on tgt's own blessed
+binary (identical sets), latent since mainline-10/N3 with no full tgt
+gate since 07-17. THREE generator bugs fixed: (1) ctor
+mis-classification (`<Type>.mk` treated as a suffix fn → ii_subset's
+kp_value mis-dispatched to Chaining); (2) dite-encoded
+Prop-connective (∨/∧) recursion guards the named TERM set can't
+decompose — TERM_DITE_OR/AND sets (simp_all?-named; OR gains
+not_false_eq_true for the self-rewrite-to-¬False wall) + shared
+companion_close_tail() across all companion templates + inline Div
+leg; (3) mono-companion fun_induction template gets TERM_DITE_PROP.
+**The whole tgt defs layer elaborates again** (ladder no longer falls
+back — scoped gate 1m37 vs 5m+). Battery: units 432+7/0, tactus-core
+gate 291/0+54+198/0 (bridge live 166/166 — the b67 emitter
+fingerprint correctly invalidated on rebuild), probes 9/11/13/14/17/
+37/38 ✓, e2e 829/2, golden byte-stable. **Residual: 11 errors in 3
+recursive proof fns (lemma_inverse_word_element,
+lemma_runtime_word_view_subrange/append) — N3 script-form closer
+class** (context-axiom instantiation gap + let-wrapped/wrong-axiom
+apply legs; paths (a) N3 script-author work, (b) S2c fn-level
+overrides — Danielle's call; findings doc has the goal-level
+evidence). **Port to `tactus/source` needed** (tgt's check.sh binary
+carries the same bugs).
+
 **2026-08-02: milestone B1 (b67 caching) DONE —
 `board/bootstrap-67-w4b-cert-bridge-caching.md` (completion record).**
 Cert + bridge content-keyed caching landed (D1–D5): cert writers

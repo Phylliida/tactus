@@ -1,18 +1,25 @@
 # HANDOFF — milestone B2 (b68 bridge default flip) — 2026-08-02
 
-**For the next session: milestone B1 (b67 caching) is COMPLETE. What
-remains per the endgame map is B2 (the b68 bridge default flip), then
-E (W8 authority flip + trust shrink).** Everything you need is here;
-the ordered program map is `DESIGN-bootstrap-endgame.md` (milestones +
-policy P1–P4), the queue header is `NEXT.md`, per-brick detail is
-`board/*.md`. B1's full record (design review + cost table + findings)
-is `board/bootstrap-67-w4b-cert-bridge-caching.md`. (This file replaces
+**For the next session: milestone B1 (b67 caching) is COMPLETE, and
+the tgt runtime-module gate failure it surfaced is DIAGNOSED with the
+defs layer REPAIRED (`00827513`; findings doc
+`FINDINGS-tgt-runtime-module-gate.md`). What remains per the endgame
+map is B2 (the b68 bridge default flip), then E (W8 authority flip +
+trust shrink). Open decision for Danielle: the class-3 residual (11
+errors in 3 recursive proof fns — N3 script-form closer class) wants
+either N3 script-author work or S2c fn-level overrides, and the
+decreasing_by fixes need porting to `tactus/source`.** Everything you
+need is here; the ordered program map is `DESIGN-bootstrap-endgame.md`
+(milestones + policy P1–P4), the queue header is `NEXT.md`, per-brick
+detail is `board/*.md`. B1's full record (design review + cost table +
+findings) is `board/bootstrap-67-w4b-cert-bridge-caching.md`. (This file replaces
 the milestone-B handoff; history lives in git.)
 
 ## Where you are
 
 - Worktree `/home/bepis/prog/verus-cad/tactus-bootstrap`, branch
-  `bootstrap`, clean tree. HEAD = `3fdf6fd5`.
+  `bootstrap`, clean tree. HEAD = `7b9b0cbc` (FINDINGS doc; the
+  decreasing_by fixes are `00827513`).
 - The mirror model: `tactus-core/lib.rs` (verified BY the worktree
   binary). The trusted serializer:
   `source/lean_verify/src/sst_serialize.rs` (+ `sst_to_lean.rs`,
