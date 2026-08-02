@@ -25,5 +25,10 @@ cost story justifies it:
 **Done when:** a plain `--lean-backend` package run bridge-checks every
 serializable fn by default; failure is a verification error; suite green
 (including the red-path pin); bootstrap-09 closed with writeup.
+A-coverage is confirmed on the SCOPED tgt modules (probe11 census:
+every serializable fn bridges or is loudly tagged, zero unclassified
+failures) — Danielle 2026-08-01 removed the one full-crate tgt
+acceptance run (no full tgt gates; scoped per-module emits are the
+accepted path).
 
 **Blocked by:** bootstrap-67.
