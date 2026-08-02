@@ -1,9 +1,9 @@
 ---
 title: "W4b — cert + bridge caching (content-keyed, warm-run skip) + cost numbers on fixture and tgt"
-status: todo
+status: done
 claimed_by:
 created: 2026-07-16T17:15:00Z
-updated: 2026-07-16T17:15:00Z
+updated: 2026-08-02T00:00:00Z
 ---
 
 ## Description
@@ -146,3 +146,91 @@ invalidates once, then hits behave as before (same binary); (b)
 binary, fine for the pins; (c) the fingerprint over-invalidates on ANY
 relink (unrelated code changes included) — safe direction, and "one
 re-verify per rebuilt binary" is the ladder precedent's honest price.
+
+---
+
+## Completion record (2026-08-02, one session)
+
+Landed as designed (D1–D5), no deviations:
+
+- **D1** `emitter_fingerprint()` — `VARGO_BUILD_VERSION` + FNV-1a of
+  `current_exe` bytes (`lean_verify::project`).
+- **D2** `-V cache` base gains `emitter:{fingerprint}` (verifier.rs) —
+  P3(b) closed. (Side effect, intended: first run after the rebuild
+  re-verified the Z3-path queries once; pkg/lean layers unaffected.)
+- **D3** cert writers content-compare — verified live: a byte-identical
+  re-emission preserves cert mtime (fixture, new binary vs old certs).
+- **D4** per-cert bridge pass markers (`Bridge_<leaf>.verified`) —
+  verified live on tactus-core (below).
+- **D5** probe11 run.sh mechanism note corrected.
+- Unit pins: 4 new (key determinism/sensitivity, marker discipline,
+  fingerprint shape, write-if-changed mtime preservation).
+
+### Cost numbers (all serialized runs; worktree binary)
+
+tactus-core gate (`-V cache`, 291 fns, 166 obligation certs):
+
+| run | wall | bridge note |
+|---|---|---|
+| warm, no bridge (baseline) | 34.7s | — |
+| warm + bridge, markers cold | 2m16.7s | 166 passed, 0 failed, 0 cached |
+| warm + bridge, markers warm | **35.2s / 34.5s** | 0 passed, 0 failed, **166 cached** |
+| warm + bridge, 1 marker deleted | 35.4s | 1 passed, 165 cached |
+| warm + bridge, mass content invalidation (vocab-hash header flip) | 2m21.1s | 166 passed, 0 cached |
+| cold + bridge (rm -rf out) | 10m35.1s | 166 passed, 0 failed, 0 cached |
+
+Cold baseline (no bridge) is ~10 min per the standing HANDOFF recipe —
+cold bridge marginal ≈ +35s. Post-cold warm runs re-engage every layer
+(224 pkg cached, 166 bridge cached, gate 54, discharge 198/0) and run
+~1m30s under post-cold system load with an identical cache profile;
+the same-regime ±bridge comparison (the flip-critical number) is the
+pair above.
+
+**Flip target met: warm bridge overhead ≈ 0.5s (~1.4% of the 34.7s
+baseline; target was within ~10%).** Live-bridging marginal cost ≈ 102s
+per full 166-cert corpus (~0.6s/cert) — paid only on real content
+change.
+
+Fixture: warm emit+cert ≈ 2.5s, certs byte-stable (golden diff clean),
+mtimes preserved. The fixture's in-gate bridge does not run — its 11
+pre-existing per-fn errors skip the package gate (documented class,
+verdict-neutral); fixture bridging remains probe9's external runner
+(green).
+
+tgt (`--verify-module runtime`, scoped per the no-full-gates
+constraint): cold module gate 1m48.7s with bridge / 1m51.3s without —
+but the module gate is currently RED (11 errors) under the worktree
+binary, so the in-gate bridge never executes on tgt today.
+
+### Findings for Danielle
+
+1. **tgt runtime-module gate drift (pre-existing, NOT b67-caused).**
+   `TactusDefs_lib_exec__word_numbering` "simp_all made no progress" ×4
+   (exec + spec defs parts), `Seq.drop_first_len_lt` unify failure in
+   `TactusDefs_lib__ii_subset`, `lemma_inverse_word_element`
+   tactus_auto failures. Reproduces identically without
+   `--tactus-bridge`; b67's diff touches only cache keys / cert writes /
+   the bridge step. The accepted tgt path (probe11 scoped
+   `--emit-lean` + external bridge) is green. This looks like
+   worktree-binary vs tgt drift accumulated since the last tgt gate —
+   worth its own brick if tgt gates ever resume; under the standing
+   constraint it only means the in-gate bridge has no tgt subject
+   today.
+2. **Cert perturbation composition (by construction, verified).** A
+   hand-edit to an on-disk cert does not produce a bridge red: the gate
+   re-emits certs from SST before bridging, and D3's content-compare
+   rewrites only on a real diff. The honest red channel is
+   emission-side drift (serializer/vocab change), which flips the
+   marker key by construction — exercised via the vocab-hash header
+   flip (166 live) and single-marker deletion (1 live). The deliberate-
+   perturbed-cert e2e red pin is B2 scope (needs an emission-side hook).
+3. The bridge note's third column is now `cached`; B2's standing
+   trust-inventory line can read straight from it.
+
+### Battery
+
+units 432+7/0; tactus-core gate 291/0 + pkg gate 54 + Link discharge
+198/0 (re-run 7× across the measurements); probes 9 (ALL CLASSIFIED),
+11 (ALL CLASSIFIED), 13 (22 classes PASS), 14 ✓, 17 ✓, 37 ✓, 38 ✓;
+golden byte-stable; e2e 829/2 (the 2 = documented pre-existing
+flat_combine/tutorial_fifo standing baseline).
