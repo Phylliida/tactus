@@ -1,5 +1,35 @@
 # NEXT — bootstrap work queue (2026-07-21; superseded 2026-07-24)
 
+**2026-08-02: milestone B1 (b67 caching) DONE —
+`board/bootstrap-67-w4b-cert-bridge-caching.md` (completion record).**
+Cert + bridge content-keyed caching landed (D1–D5): cert writers
+content-compare (byte-identical re-emissions keep mtime); per-cert
+bridge pass markers (`Bridge_<leaf>.verified`, keyed on module text +
+core-olean hash + toolchain + emitter fingerprints, island-marker
+discipline); `emitter_fingerprint()` closes P3(b) — the `-V cache`
+base now keys the emitter/closer binary. **Flip target MET: warm
+tactus-core gate + bridge = 35s vs 34.7s baseline (~1.4%), all 166
+obligations cache-served; cold+bridge 10m35s.** probe11's stale `-V
+cache` mechanism note corrected (empirical: the tactus route never
+consults the Z3 verdict cache). Battery: units 432+7/0, gate 291/0 +
+54 + discharge 198/0, probes 9/11/13/14/17/37/38 ✓, e2e 829/2,
+golden byte-stable. Findings on the card: tgt runtime-module gate is
+currently RED under the worktree binary (pre-existing drift, NOT
+b67 — in-gate bridge has no tgt subject today; probe11's external
+path stays the tgt lane), and on-disk cert hand-edits don't red the
+bridge (re-emission overwrites; the red channel is emission-side
+drift, which flips marker keys by construction). b68's full-crate tgt
+acceptance run REMOVED (Danielle 2026-08-01: scoped probe11 census
+is the A-coverage path).
+**NEXT: B2 = b68 (the bridge default flip —
+`board/bootstrap-68-w4c-bridge-default-flip.md`). Gate conditions
+status: P3(b) DONE + cost story DONE (b67); remaining = the flip
+itself + red-path e2e pin + trust-inventory gate line + P2
+(hoist-mixed-shadow MIX detector confirm-loud) + P3(a) stmts-olean
+staleness fix + regen pin.** Then milestone E (W8 authority flip +
+trust shrink — the N2 `branch_isvariant_of` detector is the last
+named trusted predicate on the cert path).
+
 **2026-07-31 late pm: stage 2 (F4 poison derivation) LANDED, both
 eras, one session — completion record on the b80 card.** The poison
 mark is DERIVED reference-side now (`poisoned_props(c)` over
