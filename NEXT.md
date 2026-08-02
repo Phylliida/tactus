@@ -21,10 +21,11 @@ fingerprint correctly invalidated on rebuild), probes 9/11/13/14/17/
 recursive proof fns (lemma_inverse_word_element,
 lemma_runtime_word_view_subrange/append) — N3 script-form closer
 class** (context-axiom instantiation gap + let-wrapped/wrong-axiom
-apply legs; paths (a) N3 script-author work, (b) S2c fn-level
-overrides — Danielle's call; findings doc has the goal-level
-evidence). **Port to `tactus/source` needed** (tgt's check.sh binary
-carries the same bugs).
+apply legs). **Danielle 2026-08-02: HOLD — these will be addressed by
+the Z3-tactic-recreation arc (different branch); the underlying
+script-author gaps are real and worth fixing eventually.**
+**Port to `tactus/source` needed** (tgt's check.sh binary carries
+the same bugs).
 
 **2026-08-02: milestone B1 (b67 caching) DONE —
 `board/bootstrap-67-w4b-cert-bridge-caching.md` (completion record).**

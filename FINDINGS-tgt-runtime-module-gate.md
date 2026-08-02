@@ -93,6 +93,12 @@ Paths forward (Danielle's call):
   for the 3 fns — sanctioned residue path, but couples to emitted hyp names
   and adds 3 bespoke scripts.
 
+**Danielle 2026-08-02: HOLD on the class-3 fixes** — they will be
+addressed by the Z3-tactic-recreation arc (nonlinear etc., in a
+different branch). The tactus-side bugs in this class are still worth
+fixing eventually (the script-author gaps above are real machinery
+gaps, just not urgent).
+
 ## Port note
 
 Fixes live in `tactus-bootstrap/source` (commit 00827513). tgt's check.sh
