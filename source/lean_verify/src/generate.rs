@@ -2967,12 +2967,75 @@ static STMTS_OLEAN_MEMO: std::sync::OnceLock<
         String, std::sync::Arc<std::sync::OnceLock<Result<(), String>>>>>,
 > = std::sync::OnceLock::new();
 
+/// P3(a)/b68: content key tying a built olean to the exact source it
+/// was built from — {module `.lean` content, Lean toolchain, prelude}.
+/// FNV-1a, matching `vocab_hash` / `core_olean_hash` /
+/// `bridge_cache_key` style; the `w4c1` tag versions the scheme.
+/// The prelude dir's name is content-addressed, so its path string
+/// stands in for a prelude fingerprint.
+fn olean_srckey(lean_content: &str, prelude_dir: &Path) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut mix = |piece: &str, h: &mut u64| {
+        for b in piece.as_bytes() {
+            *h ^= *b as u64;
+            *h = h.wrapping_mul(0x100000001b3);
+        }
+        // Component separator (FNV over concatenation would be ambiguous).
+        *h ^= 0xff;
+        *h = h.wrapping_mul(0x100000001b3);
+    };
+    mix("w4c1", &mut h);
+    mix(lean_content, &mut h);
+    mix(crate::project::toolchain_fingerprint(), &mut h);
+    mix(&prelude_dir.to_string_lossy(), &mut h);
+    format!("fnv1a:{:016x}", h)
+}
+
+/// Path of an olean's freshness marker: `<olean>.srckey`, holding the
+/// `olean_srckey` of the source the olean was built from.
+fn srckey_path(olean: &Path) -> PathBuf {
+    let mut p = olean.as_os_str().to_owned();
+    p.push(".srckey");
+    PathBuf::from(p)
+}
+
+/// Cross-run freshness for a built olean (P3(a)): the olean exists AND
+/// its srckey marker matches the current `.lean` content — the marker
+/// is written only after a successful build, so a match means the
+/// olean was provably built from this exact source. Bare existence is
+/// NOT sufficient: an interrupted run leaves a fresh `.lean` beside a
+/// stale olean, and existence-only trust turns that skew into a
+/// misleading Type-mismatch/sorry cascade downstream (FINDINGS §4).
+fn olean_fresh(olean: &Path, lean_path: &Path, prelude_dir: &Path) -> bool {
+    if !olean.exists() {
+        return false;
+    }
+    let (Ok(content), Ok(marker)) = (
+        std::fs::read_to_string(lean_path),
+        std::fs::read_to_string(srckey_path(olean)),
+    ) else {
+        return false;
+    };
+    marker == olean_srckey(&content, prelude_dir)
+}
+
+/// Island-marker discipline for olean freshness (P3(a)): after a
+/// successful build, record the source key; before any live build the
+/// caller removes the marker, so a crashed or failed run leaves no
+/// stale trust.
+fn record_olean_built(olean: &Path, lean_path: &Path, prelude_dir: &Path) {
+    if let Ok(content) = std::fs::read_to_string(lean_path) {
+        let _ = std::fs::write(srckey_path(olean), olean_srckey(&content, prelude_dir));
+    }
+}
+
 /// Ensure ONE stmt module's olean exists (M5d-2; the `.lean` was
 /// written by the partition build, which emission always runs first).
 /// Returns whether the olean was already built this process (reused).
 /// `may_skip` (M5e): the module's `.lean` content is unchanged AND
-/// the defs it imports had no breaking rebuild — its existing olean
-/// is still valid, so priming the memo without a lean run is sound.
+/// the defs it imports had no breaking rebuild — and (P3(a)) the
+/// olean's srckey marker proves it was built from exactly this
+/// content — so priming the memo without a lean run is sound.
 fn ensure_stmt_olean(
     module: &str,
     defs: &crate::crate_defs::CrateDefs,
@@ -2984,15 +3047,23 @@ fn ensure_stmt_olean(
     let pre = cell.get().is_some();
     let skipped = std::cell::Cell::new(false);
     cell.get_or_init(|| {
-        if may_skip && defs.dir.join(format!("{}.olean", module)).exists() {
+        let lean_path = defs.dir.join(format!("{}.lean", module));
+        let olean_path = defs.dir.join(format!("{}.olean", module));
+        if may_skip && olean_fresh(&olean_path, &lean_path, prelude_dir) {
             skipped.set(true);
             return Ok(());
         }
+        // Marker removed before the live run: a failed build leaves no
+        // stale trust (island-marker discipline).
+        let _ = std::fs::remove_file(srckey_path(&olean_path));
         let base_path = format!("{}:{}", prelude_dir.display(), defs.dir.display());
         let mut failures: Vec<(String, String)> = Vec::new();
         run_lean(&defs.dir, module, true, &base_path, &mut failures);
         match failures.pop() {
-            None => Ok(()),
+            None => {
+                record_olean_built(&olean_path, &lean_path, prelude_dir);
+                Ok(())
+            }
             Some((_, out)) => Err(format!("stmt olean build failed ({}):\n{}", module, out)),
         }
     }).clone().map(|()| pre || skipped.get())
@@ -3154,7 +3225,11 @@ pub fn prime_lean_driver(
     // fall back).
     let mut wide: Vec<String> = vec![defs.module_name.clone()];
     wide.extend(stmt_list.iter()
-        .filter(|(m, _)| defs.dir.join(format!("{m}.olean")).exists())
+        .filter(|(m, _)| olean_fresh(
+            &defs.dir.join(format!("{m}.olean")),
+            &defs.dir.join(format!("{m}.lean")),
+            &prelude_dir,
+        ))
         .map(|(m, _)| (*m).clone()));
     crate::driver_client::add_snapshot_all("wide", &wide);
     // Search-ladder variant: pkg files whose closers needed the search
@@ -3219,12 +3294,15 @@ fn check_proof_fn_via_package(
             let cacheable = !changed
                 && stmt_modules.iter().all(|(_, ch)| !ch)
                 && !defs.breaking
-                && olean.exists();
+                && olean_fresh(&olean, &path, &prelude_dir);
             if cacheable {
                 record_pkg_olean_built(&path);
                 PKG_CACHED_VERDICTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(CheckResult::Success { warnings: vec![] });
             }
+            // Marker removed before the live run (island discipline): a
+            // failed rebuild leaves no stale trust.
+            let _ = std::fs::remove_file(srckey_path(&olean));
             for (m, ch) in &stmt_modules {
                 let may_skip = !ch && !defs.breaking;
                 if let Err(e) = ensure_stmt_olean(m, &defs, &prelude_dir, may_skip) {
@@ -3237,6 +3315,7 @@ fn check_proof_fn_via_package(
             let result = run_lean_json(&pkg_dir, &leaf, true, &base_path);
             if matches!(&result, Ok(r) if r.success) {
                 record_pkg_olean_built(&path);
+                record_olean_built(&olean, &path, &prelude_dir);
             }
             Some(format_lean_check_result(result, proof_fn, &path, &source_map))
         }
@@ -3247,10 +3326,11 @@ fn check_proof_fn_via_package(
                     return Some(CheckResult::Error(e));
                 }
             }
+            let olean = path.with_extension("olean");
             let cacheable = !changed
                 && stmt_modules.iter().all(|(_, ch)| !ch)
                 && !defs.breaking
-                && path.with_extension("olean").exists();
+                && olean_fresh(&olean, &path, &prelude_dir);
             let cell = memo_cell(&MUTUAL_CHECK_MEMO, &path);
             let verdict = cell.get_or_init(|| {
                 if cacheable {
@@ -3258,6 +3338,9 @@ fn check_proof_fn_via_package(
                         success: true, diagnostics: vec![],
                     });
                 }
+                // Marker removed before the live run (island
+                // discipline): a failed rebuild leaves no stale trust.
+                let _ = std::fs::remove_file(srckey_path(&olean));
                 let pkg_dir = path.parent().expect("pkg file has a parent");
                 // One `--json -o` pass; diagnostics stored on success
                 // too, so members can surface own-region WARNINGS
@@ -3285,6 +3368,7 @@ fn check_proof_fn_via_package(
             };
             if verdict.success {
                 record_pkg_olean_built(&path);
+                record_olean_built(&olean, &path, &prelude_dir);
                 let warnings: Vec<String> = verdict.diagnostics.iter()
                     .filter(|d| d.severity == "warning" && d.data.contains("sorry"))
                     .filter(|d| own_region(d))
@@ -3408,9 +3492,18 @@ type StmtPartition =
 /// Partition memo: one build + N file writes per scope per process.
 /// `None` = a previous attempt failed (fail once, warn once), same
 /// semantics as the defs memo. Keyed by the scope-bearing stmts name.
+/// Per-key `OnceLock` (the `memo_cell` pattern, P3(a)/b68): the
+/// per-fn worker pool's first wave requests the partition from dozens
+/// of threads at once — the old check-then-act (lookup, build, insert)
+/// let every thread build concurrently and the LAST insert won. Each
+/// build computes its own content-changed flags, and the last finisher
+/// always sees files already fresh (all `false`), so genuinely-changed
+/// stmt modules ended up with `may_skip=true` and stale oleans were
+/// trusted. Build-once gives every consumer the one build's accurate
+/// flags.
 static STMT_PARTITION_MEMO: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<
-        String, Option<std::sync::Arc<StmtPartition>>>>,
+        String, std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<StmtPartition>>>>>>,
 > = std::sync::OnceLock::new();
 
 /// Build + write the crate's Stmts module: `import <defs module>` plus a
@@ -3429,11 +3522,11 @@ fn stmt_partition_for(
     defs: &crate::crate_defs::CrateDefs,
 ) -> Option<std::sync::Arc<StmtPartition>> {
     let key = stmts_module_name(defs);
-    let memo = STMT_PARTITION_MEMO.get_or_init(Default::default);
-    if let Some(hit) = memo.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
-        return hit.clone();
-    }
-    let entry = match build_stmt_partition(krate, crate_name, tactic_bodies, defs) {
+    let cell = memo_cell(&STMT_PARTITION_MEMO, &key);
+    // `get_or_init` blocks concurrent callers until the one build
+    // completes — no concurrent full-partition rewrites, no
+    // last-insert-wins flag corruption (P3(a)).
+    cell.get_or_init(|| match build_stmt_partition(krate, crate_name, tactic_bodies, defs) {
         Ok(part) => Some(std::sync::Arc::new(part)),
         Err(e) => {
             eprintln!(
@@ -3443,9 +3536,7 @@ fn stmt_partition_for(
             );
             None
         }
-    };
-    memo.lock().unwrap_or_else(|p| p.into_inner()).insert(key, entry.clone());
-    entry
+    }).clone()
 }
 
 /// Build + write ONE stmt module per emittable proof fn (M5d-2): each
@@ -3869,10 +3960,17 @@ pub fn check_package(
     }
     let pkg_dir = lean_out_root().join(sanitize(crate_name)).join("pkg");
     for leaf in &leafs {
-        if pkg_olean_built(&pkg_dir.join(format!("{}.lean", leaf))) {
+        let lean_path = pkg_dir.join(format!("{}.lean", leaf));
+        if pkg_olean_built(&lean_path) {
             reused += 1;
         } else {
+            let before = failures.len();
             run_lean(&pkg_dir, leaf, true, &base_path, &mut failures);
+            if failures.len() == before {
+                record_olean_built(
+                    &lean_path.with_extension("olean"), &lean_path, &prelude_dir,
+                );
+            }
         }
     }
     let link_path = format!("{}:{}", base_path, pkg_dir.display());
@@ -5710,12 +5808,15 @@ fn check_exec_fn_via_package(
             let cacheable = !changed
                 && stmt_modules.iter().all(|(_, ch)| !ch)
                 && !defs.breaking
-                && olean.exists();
+                && olean_fresh(&olean, &path, &prelude_dir);
             if cacheable {
                 record_pkg_olean_built(&path);
                 PKG_CACHED_VERDICTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(CheckResult::Success { warnings: vec![] });
             }
+            // Marker removed before the live run (island discipline): a
+            // failed rebuild leaves no stale trust.
+            let _ = std::fs::remove_file(srckey_path(&olean));
             for (m, ch) in &stmt_modules {
                 let may_skip = !ch && !defs.breaking;
                 if let Err(e) = ensure_stmt_olean(m, &defs, &prelude_dir, may_skip) {
@@ -5732,6 +5833,7 @@ fn check_exec_fn_via_package(
             // an ungated sorry.)
             if matches!(&result, Ok(r) if r.success) {
                 record_pkg_olean_built(&path);
+                record_olean_built(&olean, &path, &prelude_dir);
             }
             // assume(P)-site warnings: same collection as the island
             // path (`emit_exec_fn`) — the pkg route previously dropped
