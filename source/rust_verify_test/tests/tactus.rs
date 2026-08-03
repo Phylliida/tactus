@@ -13650,6 +13650,108 @@ test_verify_one_file_with_options! {
     } => Ok(())
 }
 
+// P3(a)/b68 regen pin: a fresh `TactusStmts_*.lean` beside a STALE
+// olean must force a rebuild — never silent existence-trust. Pre-fix,
+// two mechanisms produced the skew: a partition-memo race (concurrent
+// first-wave builds; the last insert's all-`false` changed flags won)
+// and the existence-only skip in `ensure_stmt_olean` (an interrupted
+// run leaves exactly this state; FINDINGS §4's misleading cascade
+// followed). This test manufactures the skew directly: run 1 builds
+// the v1 olean (+ srckey marker), the on-disk stmt `.lean` is then
+// replaced with the EXACT v2 render (captured from a second tree, so
+// run 2's partition genuinely sees no content change and takes the
+// `may_skip` path), and run 2 must still REBUILD the olean — the
+// srckey mismatch is the only freshness signal left. Pre-fix (no
+// markers, existence-only skip) the olean bytes stay v1's and the
+// marker assertion fails; post-fix the rebuild flips them.
+#[test]
+fn test_p3a_stmts_olean_skew_forces_rebuild() {
+    let deps_dir = std::env::current_exe().unwrap();
+    let deps_dir = deps_dir.parent().unwrap();
+    let target_dir = deps_dir.parent().unwrap();
+    let test_binary = std::env::args().next().unwrap();
+    let test_binary = std::path::PathBuf::from(test_binary);
+    let test_binary = test_binary.file_name().unwrap().to_str().unwrap().to_string();
+    let mk_dir = |suffix: &str| {
+        let parent = target_dir.join("test_inputs");
+        std::fs::create_dir_all(&parent).unwrap();
+        let dir = parent.join(format!("{test_binary}-test_p3a_skew_{suffix}"));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    };
+    let dir_a = mk_dir("a");
+    let dir_b = mk_dir("b");
+    let mk_code = |ensures: &str| format!(
+        "{}{}\nverus! {{\nspec fn double(n: nat) -> nat {{ n + n }}\n\nproof fn lemma_a(n: nat) ensures {} by {{ unfold double; omega }}\n}}\n",
+        FEATURE_PRELUDE, USE_PRELUDE, ensures,
+    );
+    let v1 = mk_code("double(n) >= 0");
+    let v2 = mk_code("double(n) + 0 >= 0");
+    let options: &[&str] = &["--lean-backend", "tactus-package-check"];
+    let run_in = |dir: &std::path::Path, code: &str| {
+        let entry = dir.join("test.rs");
+        std::fs::write(&entry, code).unwrap();
+        let out = run_verus(options, dir, &entry, false, false);
+        assert!(
+            out.status.success(),
+            "verus run failed in {}:\n{}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    };
+    let find_stmt = |dir: &std::path::Path| -> std::path::PathBuf {
+        let crate_dir = dir.join("tactus-lean").join("test_crate");
+        let mut found: Vec<String> = std::fs::read_dir(&crate_dir)
+            .unwrap_or_else(|e| panic!("no crate dir {}: {}", crate_dir.display(), e))
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("TactusStmts_") && n.ends_with("__test_crate__lemma_a.lean"))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found.len(), 1,
+            "exactly one stmt module for lemma_a in {}", crate_dir.display(),
+        );
+        crate_dir.join(&found[0])
+    };
+
+    run_in(&dir_a, &v1);
+    run_in(&dir_b, &v2);
+    let stmt_a = find_stmt(&dir_a);
+    let stmt_b = find_stmt(&dir_b);
+    let olean_a = stmt_a.with_extension("olean");
+    let srckey_a = stmt_a.with_extension("olean.srckey");
+    let srckey_b = stmt_b.with_extension("olean.srckey");
+    let olean_v1 = std::fs::read(&olean_a).unwrap();
+    let srckey_v1 = std::fs::read_to_string(&srckey_a)
+        .expect("run 1 writes the srckey marker after a successful olean build");
+
+    // The skew: fresh v2 `.lean` beside the stale v1 olean (+marker).
+    std::fs::copy(&stmt_b, &stmt_a).unwrap();
+
+    run_in(&dir_a, &v2);
+    let olean_v2 = std::fs::read(&olean_a).unwrap();
+    assert_ne!(
+        olean_v1, olean_v2,
+        "stmt olean must be REBUILT when the on-disk `.lean` is newer than \
+         the build it came from (P3(a) staleness hole)"
+    );
+    let srckey_v2 = std::fs::read_to_string(&srckey_a)
+        .expect("the rebuild rewrites the srckey marker");
+    assert_ne!(srckey_v1, srckey_v2, "marker tracks the new content");
+    assert_eq!(
+        srckey_v2,
+        std::fs::read_to_string(&srckey_b).unwrap(),
+        "same source + toolchain + prelude ⇒ same content key as the clean v2 build"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
 // M5 headline: mutual tactic proof fns FAIL island verification
 // (forward references — pinned by the 8-error observation in
 // DESIGN-emit-module.md §M3.5) but VERIFY under package-check, where

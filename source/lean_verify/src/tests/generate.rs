@@ -278,3 +278,96 @@ fn emitter_fingerprint_stable_and_shaped() {
     assert_eq!(fp1, fp2, "memoized per process");
     assert!(fp1.contains(":fnv1a:"), "version:fnv1a:<hash> shape, got {}", fp1);
 }
+
+// ── P3(a)/b68: partition build-once + olean srckey freshness ────────
+
+/// F1 pin: `stmt_partition_for` builds the partition ONCE per scope
+/// per process even under a concurrent first wave — every caller
+/// shares the one build's Arc. The pre-fix check-then-act memo let
+/// every worker thread build concurrently (the trace showed ~50
+/// builds in one tactus-core run); the last insert won, and its
+/// all-`false` changed flags sent genuinely-changed stmt modules down
+/// the `may_skip` path, leaving fresh `TactusStmts_*.lean` beside
+/// stale oleans forever.
+#[test]
+fn stmt_partition_builds_once_under_concurrency() {
+    let defs = crate::crate_defs::CrateDefs {
+        module_name: "TactusDefs_p3a_unit".to_string(),
+        scope: "p3a_unit".to_string(),
+        breaking: false,
+        covers_exec: true,
+        dir: std::env::temp_dir().join(format!("tactus_p3a_part_{}", std::process::id())),
+        cmds: Vec::new(),
+    };
+    let krate = empty_krate();
+    let bodies = std::collections::HashMap::new();
+    let (defs, krate, bodies) = (&defs, &krate, &bodies);
+    let results = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| s.spawn(move || stmt_partition_for(krate, "p3a_unit", bodies, defs)))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
+    });
+    assert!(results.iter().all(|r| r.is_some()), "partition build succeeds");
+    let first = results[0].as_ref().unwrap();
+    assert!(
+        results.iter().all(|r| std::sync::Arc::ptr_eq(r.as_ref().unwrap(), first)),
+        "every concurrent caller must share the ONE build's partition"
+    );
+    // A later serial caller gets the same build (memo hit).
+    let again = stmt_partition_for(krate, "p3a_unit", bodies, defs);
+    assert!(std::sync::Arc::ptr_eq(&again.unwrap(), first));
+}
+
+/// F2 pin: an olean is fresh iff its srckey marker proves it was built
+/// from the CURRENT source content. Bare existence is NOT trust — the
+/// interrupted-run skew (fresh `.lean`, stale olean) must force a
+/// rebuild, not a silent skip (FINDINGS §4's misleading cascade).
+#[test]
+fn olean_srckey_freshness_contract() {
+    let dir =
+        std::env::temp_dir().join(format!("tactus_p3a_srckey_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lean = dir.join("M.lean");
+    let olean = dir.join("M.olean");
+    let prelude = std::path::Path::new("/tactus-p3a-test-prelude");
+    std::fs::write(&lean, "theorem a : True := by triv").unwrap();
+    std::fs::write(&olean, b"olean-bytes").unwrap();
+    // Existence alone is NOT freshness (the P3(a) hole).
+    assert!(!olean_fresh(&olean, &lean, prelude));
+    // After a successful build the marker makes it fresh...
+    record_olean_built(&olean, &lean, prelude);
+    assert!(olean_fresh(&olean, &lean, prelude));
+    // ...and any source change invalidates it (the skew detector).
+    std::fs::write(&lean, "theorem a : True := by triv\n-- touched\n").unwrap();
+    assert!(!olean_fresh(&olean, &lean, prelude));
+    // Re-recording after a rebuild restores freshness.
+    record_olean_built(&olean, &lean, prelude);
+    assert!(olean_fresh(&olean, &lean, prelude));
+    // Marker removed before a live run (island discipline) → not
+    // fresh even with the content unchanged.
+    std::fs::remove_file(srckey_path(&olean)).unwrap();
+    assert!(!olean_fresh(&olean, &lean, prelude));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The srckey covers everything an olean depends on: content,
+/// toolchain, and the prelude — distinct inputs give distinct keys,
+/// and the separator keeps concatenation-ambiguous inputs apart.
+#[test]
+fn olean_srckey_components() {
+    let prelude_a = std::path::Path::new("/prelude-a");
+    let prelude_b = std::path::Path::new("/prelude-b");
+    assert_ne!(
+        olean_srckey("text", prelude_a), olean_srckey("text", prelude_b),
+        "prelude fingerprint is part of the key"
+    );
+    assert_ne!(
+        olean_srckey("ab", prelude_a), olean_srckey("a\nb", prelude_a),
+        "content is part of the key"
+    );
+    assert!(
+        olean_srckey("text", prelude_a).starts_with("fnv1a:"),
+        "scheme-tagged key, got {}", olean_srckey("text", prelude_a)
+    );
+}
