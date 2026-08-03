@@ -321,6 +321,20 @@ pub fn run_verus(
     import_vstd: bool,
     json_errors: bool,
 ) -> std::process::Output {
+    run_verus_with_env(options, test_dir, entry_file, import_vstd, json_errors, &[])
+}
+
+/// `run_verus` with extra environment for the child (e.g. the b68
+/// bridge pins' `$TACTUS_CORE_OUT` / `$TACTUS_BRIDGE_PERTURB`) — the
+/// process-global env is not test-safe under parallel runs.
+pub fn run_verus_with_env(
+    options: &[&str],
+    test_dir: &std::path::Path,
+    entry_file: &std::path::PathBuf,
+    import_vstd: bool,
+    json_errors: bool,
+    extra_env: &[(&str, &std::path::Path)],
+) -> std::process::Output {
     if std::env::var("VERUS_IN_VARGO").is_err() {
         panic!("not running in vargo, read the README for instructions");
     }
@@ -435,6 +449,8 @@ pub fn run_verus(
             verus_args.push("--tactus-emit-module".to_string());
         } else if *option == "tactus-package-check" {
             verus_args.push("--tactus-package-check".to_string());
+        } else if *option == "tactus-no-bridge" {
+            verus_args.push("--tactus-no-bridge".to_string());
         } else if *option == "tactus-bridge" {
             verus_args.push("--tactus-bridge".to_string());
         } else {
@@ -531,6 +547,9 @@ pub fn run_verus(
     // `TACTUS_LEAN_OUT` to a per-test dir gives each test its
     // own output tree.
     child.env("TACTUS_LEAN_OUT", test_dir.join("tactus-lean"));
+    for (k, v) in extra_env {
+        child.env(k, v);
+    }
     // Inherit the cached LEAN_PATH so the rust_verify subprocess'
     // `lean_verify::check_lean_file` skips `lake env` (avoids
     // configuration-lock contention under parallel test runs).

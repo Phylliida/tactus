@@ -411,6 +411,46 @@ pub fn census_reset() {
     }
 }
 
+/// The W4c trust-inventory segment (b68): (census-excluded fn count,
+/// one-line "tag×n, …" breakdown, tag-asc for determinism). The gate
+/// note's bridge line appends it — the per-run trust inventory the
+/// flip exists to print.
+pub fn census_excluded_summary() -> (u64, String) {
+    if let Ok(m) = CERT_REJECTIONS.lock() {
+        let total: u64 = m.values().sum();
+        let tags = m
+            .iter()
+            .map(|(t, n)| format!("{}×{}", t, n))
+            .collect::<Vec<_>>()
+            .join(", ");
+        (total, tags)
+    } else {
+        (0, String::new())
+    }
+}
+
+/// W4c red-path pin (b68): `TACTUS_BRIDGE_PERTURB=<substring>` marks
+/// matching fns for a deliberate two-goal swap at emission — the only
+/// way to exercise the bridge-fail channel in-harness (the gate
+/// re-emits certs from SST every run, so an on-disk cert edit never
+/// reaches the bridge). Loud when it matches; test-only hook, never
+/// set in production.
+fn bridge_perturb_matches(fn_short: &str) -> bool {
+    static KNOB: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let knob = KNOB.get_or_init(|| {
+        std::env::var("TACTUS_BRIDGE_PERTURB").ok().filter(|v| !v.is_empty())
+    });
+    match knob {
+        Some(pat) if fn_short.contains(pat.as_str()) => {
+            eprintln!(
+                "tactus: TACTUS_BRIDGE_PERTURB active — perturbing emitted goals of `{fn_short}` (test-only hook)"
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
 // ── Leaf interner ───────────────────────────────────────────────────
 
 /// Insertion-ordered text → id table. Ids are assigned in
@@ -693,6 +733,10 @@ struct Serializer<'a> {
     /// monotone along a walk path and snapshot per If-branch.
     flet_forced: bool,
     poison_forced: bool,
+    /// W4c red-path pin (b68): set when `TACTUS_BRIDGE_PERTURB` matches
+    /// this fn — `goal_list` swaps the first two goals so the emitted
+    /// cert provably drifts from refWp and the bridge fails. Test-only.
+    perturb_goals: bool,
 }
 
 impl<'a> Serializer<'a> {
@@ -4520,6 +4564,14 @@ impl<'a> Serializer<'a> {
                 terms.push(self.goal_data(shape));
             }
         }
+        // W4c red-path pin (b68): deliberate drift injection. The gate
+        // re-emits certs from SST every run, so an on-disk edit never
+        // reaches the bridge — the red channel needs an emission-side
+        // hook. Two goals are the minimum for a swap to change the
+        // list (the e2e pin uses an assert + postcondition fn).
+        if self.perturb_goals && terms.len() >= 2 {
+            terms.swap(0, 1);
+        }
         let mut term = format!("{}.GoalList.Nil", NS);
         for t in terms.iter().rev() {
             term = format!("{}.GoalList.Cons {} {}", NS, box_(t), box_(&term));
@@ -4565,6 +4617,10 @@ fn serialize<'a>(
     goal_shapes: &[Option<GoalShape>],
 ) -> Sr<CertBody> {
     let mut s: Serializer<'a> = Serializer::default();
+
+    // W4c red-path pin (b68): test-only drift injection, off unless the
+    // TACTUS_BRIDGE_PERTURB env knob names this fn.
+    s.perturb_goals = bridge_perturb_matches(short_name(&fn_sst.x.name.path));
 
     // Wrap-mode mirror (endgame A2): the SHARED closer gate — a user
     // `tactus_tactic` / proof-block prefix means production never
