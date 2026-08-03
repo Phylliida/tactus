@@ -6,6 +6,203 @@ created: 2026-07-16T17:15:00Z
 updated: 2026-07-16T17:15:00Z
 ---
 
+## Design review (2026-08-03, pre-implementation — the b67/b80 model)
+
+Scope of this addendum: gate condition **P3(a)** (stmts-olean
+staleness) — now DIAGNOSED end-to-end with a deterministic repro —
+plus a scope correction on **P2** (the `hoist-mixed-shadow` detector
+does not exist yet; the tag lives only in a doc comment). The flip
+itself + red-path pin + trust-inventory line follow after these land.
+
+### P3(a) — diagnosis (reproduced 5/5)
+
+**Repro (deterministic).** Perturb the `seq_size_unfolds` pin
+statement in tactus-core (`== 2` → `== 1 + 1`: semantically equal, so
+`by { decide }` still closes), run a NORMAL warm tactus-core gate
+(no interruption, no `--emit-lean`):
+
+- `TactusStmts_lib_exec__lib__seq_size_unfolds.lean` is rewritten
+  fresh (new content);
+- its `.olean` is **NOT rebuilt** (stale, previous day's content);
+- the gate reports **291/0 green**, package gate "kernel-verified".
+
+strace: **zero** `lean` spawns for ANY `TactusStmts_*` module in the
+whole run, while the fn's own pkg module gets its `--json -o` rebuild.
+So the stale stmt olean is trusted indefinitely — the exact FINDINGS
+§4 state, produced by an ordinary warm gate. The misleading Link
+cascade of the original sighting needs only a downstream consumer of
+the stale stmt def (seq_size_unfolds is a leaf pin, so this repro
+stays quietly green instead — which is worse: silent).
+
+**Root cause (env-gated instrumentation, `TACTUS_DEBUG_OLEAN`).**
+`stmt_partition_for`'s memo is check-then-act: lookup, build, insert,
+with NO build-once discipline. The verifier's per-fn worker pool (64
+threads on this machine) starts ~50 package emissions concurrently;
+every one of them misses the memo before the first insert. The trace
+shows **~50 `build_stmt_partition` runs in ONE process**, each
+re-rendering and tracked-writing ALL 26 stmt modules and computing
+its own content-changed flags. The first finishers see the real diff
+(`changed=true`); every later finisher sees files already fresh
+(`changed=false`) — and the memo keeps the **last** insert. The
+authoritative partition therefore carries `changed=false` for
+genuinely-changed modules. Every downstream consumer — the per-fn
+`cacheable` shortcuts, the per-fn `ensure_stmt_olean` loops, and the
+crate-end gate's ensure loop — then computes
+`may_skip = !ch && !defs.breaking = true`, so `ensure_stmt_olean`
+takes its existence-only skip branch and the stale olean stands.
+
+(The ~50 concurrent full-partition rewrites are also pure I/O churn:
+~1300 tracked file writes per run where 26 would do.)
+
+**Sibling cross-run hole (same acceptance criterion).** Even with the
+race repaired, the skip condition is "content unchanged + olean
+exists" — it cannot tell that an olean predates the `.lean` beside
+it. Any run that dies (or errors) between emission and olean build
+leaves exactly the skew, and the NEXT run skips the rebuild → the
+misleading Type-mismatch/sorry cascade at Link, pointing everywhere
+except the cause. The pkg-layer `cacheable` shortcut has the same
+existence-only trust for pkg oleans (no race exposure there — one
+writer per pkg file — but the same interrupt skew).
+
+**The defs layer already solves both halves correctly**, two
+different ways, both first-class idioms here: marker ordering
+(`build_olean` writes the source only AFTER the olean rename
+succeeds) and content-keyed sidecar markers (island `.verified`,
+`Bridge_<leaf>.verified`, prelude marker).
+
+### P3(a) — fix design (frozen)
+
+- **F1 (race repair): per-key build-once for the stmt partition
+  memo.** Swap `STMT_PARTITION_MEMO`'s check-then-act for the
+  codebase's own `memo_cell` per-key `OnceLock` pattern (already used
+  for `STMTS_OLEAN_MEMO` / `MUTUAL_CHECK_MEMO`): the first caller
+  builds; other threads block on the `OnceLock`; every consumer
+  shares the ONE build's accurate changed flags. Fail-once/warn-once
+  semantics preserved (the `None` is cached inside the closure, same
+  as today). No API change.
+- **F2 (skew detection): content-keyed olean freshness markers**
+  (island/bridge-marker discipline):
+  - After a successful stmt olean build, write
+    `TactusStmts_<…>.olean.srckey` = FNV-1a of {module `.lean`
+    content, `toolchain_fingerprint()`, prelude fingerprint}; the
+    marker is REMOVED before any live build and written only on
+    success (a crash leaves no stale trust). `ensure_stmt_olean`'s
+    skip branch becomes "olean exists AND srckey matches the current
+    `.lean` content" instead of bare existence. `defs.breaking`
+    stays as the defs-side condition (append-only defs rebuilds
+    remain skippable, per the M5e design).
+  - Same for pkg oleans: `pkg/<leaf>.olean.srckey` keyed on the pkg
+    `.lean` content + toolchain/prelude; the `cacheable` check
+    consults it in place of bare `olean.exists()`.
+  - The driver "wide" snapshot filter (existence-only today) consults
+    the stmt srckey — the driver is opt-in, but the filter must not
+    reintroduce the hole for `TACTUS_DRIVER=1` runs.
+- **F3 (pins):**
+  - F1 unit pin (lean_verify): call `stmt_partition_for` concurrently
+    from N threads, count `build_stmt_partition` invocations
+    (instrumented via a test hook) — exactly 1, all threads share the
+    result. Deterministic (does not rely on winning a race).
+  - F2 regen pin (lean_verify or e2e, whichever is cheaper in-harness):
+    hand-craft the skew — fresh `TactusStmts_*.lean` + stale/absent
+    srckey — then assert the gate/olean-ensure REBUILDS (marker
+    mismatch forces a live build) and writes a matching marker.
+    Pre-fix behavior: skipped (existence-only trust).
+
+**Sequencing:** F1+F2+F3 in one landing (same two functions, one
+review unit), then P2 (below), then the flip + trust-inventory line
++ red-path pin.
+
+**Not taken (considered):** defs-style marker ordering for stmts/pkg
+(write the `.lean` only after the olean succeeds). It would require
+restructuring emission (pending-file writes, build-dir elaboration)
+and breaks the pkg failure path, whose `--json` span-mapped
+diagnostics read the canonical `.lean`. The sidecar marker achieves
+the same invariant without touching the write architecture. An
+mtime-based check rejected for the same reason the codebase moved to
+content keys everywhere (cp/touch fragility; b67 D3's precedent).
+
+### P2 — scope correction: the `hoist-mixed-shadow` detector is ABSENT
+
+The handoff/endgame notes describe it as "tagged but unhit — confirm
+it's loud". Grep says otherwise: the string `hoist-mixed-shadow`
+occurs exactly once in the tree, in the `bound_names` doc comment
+(sst_serialize.rs) — there is NO detection site. A user hitting the
+MIX case today (shadow freshening while wrap-free, wrap-forcer later
+on the same walk path) gets an **unclassified bridge mismatch** — a
+hard error under the flip (O7), not a named census tag. P2 therefore
+requires IMPLEMENTING the detector, not just confirming it:
+
+- **D1:** at the two wrap-forcing sites (`flet_forced` /
+  `poison_forced` assignments in sst_serialize.rs), if `rename_env`
+  is non-empty (a freshened shadow is live on this path), reject
+  `Err("hoist-mixed-shadow")` — the census counts it loud instead of
+  a bridge drift. Coarse-but-predictable (rejects even if the
+  freshened name never reaches a later goal); per-If-branch snapshot
+  discipline is already how these flags behave. Corpus census stays
+  0 (nothing regresses).
+- **D2:** a synthetic fixture fn that forces the MIX shape, pinned to
+  census-reject with the tag (loudness pin), plus the tag added to the
+  b68 card's closed tag table.
+
+Both are pre-flip gate conditions (P2 + P3), so the landing order is:
+**P3(a) F1–F3 → P2 D1–D2 → flip + trust-inventory line + red-path
+pin** (each its own commit, battery green per landing).
+
+## Completion record — P3(a) + P2 (2026-08-03)
+
+**P3(a) LANDED (F1–F3).** F1: `stmt_partition_for` moved to the
+per-key `OnceLock` `memo_cell` pattern — build-once per scope per
+process; first-wave workers block instead of racing ~50 full-partition
+builds whose last insert carried all-`false` changed flags. F2:
+`<olean>.srckey` markers (FNV-1a of {`.lean` content, toolchain fp,
+prelude dir}) with island-marker discipline (removed before a live
+build, written only on success); `ensure_stmt_olean`'s skip, both pkg
+`cacheable` checks, the Mutual path, the gate's pkg leaf loop, and the
+driver "wide" snapshot filter all consult `olean_fresh` instead of
+bare existence. F3: pins — `stmt_partition_builds_once_under_concurrency`
+(8 threads, one shared Arc), `olean_srckey_freshness_contract` +
+`olean_srckey_components` (lean_verify units), and e2e
+`test_p3a_stmts_olean_skew_forces_rebuild` (manufactures the fresh-
+`.lean`/stale-olean skew with the exact v2 render so the partition
+sees no change; pre-fix the olean is never rebuilt, post-fix the
+srckey mismatch forces it). `*.srckey` gitignored in tactus-core (local
+freshness cache; oleans stay the tracked artifact). **Validated:**
+migration run (no markers anywhere) rebuilt all oleans once, 2m31s,
+green; next warm run 35.2s ≡ pre-fix baseline, 0 oleans rebuilt, 224
+pkg cached; a statement perturbation now rebuilds exactly the affected
+stmt olean + marker (pre-fix: never). One-time migration cost stands
+for every existing out-tree (first run rebuilds everything, writes
+markers).
+
+**P2 LANDED (D1–D2).** The detector did not exist — implemented per
+the addendum: `mark_flet_forced` / `mark_poison_forced` reject
+`Err("hoist-mixed-shadow")` when `rename_env` is live at the forcing
+site (18 call sites now `?`-propagate; both init sites have empty
+`rename_env` by construction). Validated BOTH directions on
+`mix_trip2` (rebind a taken name while wrap-free, Bool residue, then
+`assert(b)` forcing wrap later on the path): detector ON →
+`not serialized: hoist-mixed-shadow`, census counts it, fn still
+verifies; detector NEUTERED (temporary experiment binary) → cert
+emits and the bridge proves `goals_eq … = 1` FALSE — the class is
+genuinely unbridgeable, so the rejection is sound, not a false
+positive. Permanent tripwire: fixture F27 `mix_trip2` emits no cert
+(census shows `1 hoist-mixed-shadow`); if the detector breaks, a
+non-closing cert appears and probe9 goes red CLOSE-BROKE. Unit pin
+`hoist_mixed_shadow_detected`. D2's planned fixture-census pin is
+realized by the probe9 tripwire rather than a census-line assertion
+(nothing in the tree pins census lines today; the CLOSE-BROKE channel
+is the standing one).
+
+**Battery (both landings):** units 436+7/0; tactus-core gate 291/0 +
+54 + Link discharge 198/0 (repeated across migration/warm/perturbation
+runs); e2e 829/2 (documented pre-existing pair); probes
+9/11/13/14/17/37/38 ✓; fixture golden byte-stable.
+
+**Remaining for the flip itself:** the `--tactus-bridge` default flip
+(bridge failure = verification error), the trust-inventory gate line,
+and the red-path e2e pin (emission-side hook — hand-editing an on-disk
+cert does not red the bridge, per the b67 finding).
+
 ## Description
 
 The W4 default flip itself (umbrella bootstrap-09), once bootstrap-67's cache +
