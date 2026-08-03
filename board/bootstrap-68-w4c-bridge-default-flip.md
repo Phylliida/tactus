@@ -1,9 +1,9 @@
 ---
 title: "W4c — flip the kernel bridge on by default in package mode; close bootstrap-09"
-status: todo
+status: done
 claimed_by:
 created: 2026-07-16T17:15:00Z
-updated: 2026-07-16T17:15:00Z
+updated: 2026-08-03T00:00:00Z
 ---
 
 ## Design review (2026-08-03, pre-implementation — the b67/b80 model)
