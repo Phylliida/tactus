@@ -371,6 +371,7 @@ pub fn parse_args_with_imports(
     const OPT_TACTUS_ISLANDS: &str = "tactus-islands";
     const OPT_TACTUS_EMIT_CERT: &str = "tactus-emit-cert";
     const OPT_TACTUS_BRIDGE: &str = "tactus-bridge";
+    const OPT_TACTUS_NO_BRIDGE: &str = "tactus-no-bridge";
 
     /// M6.5 default flip: package-check is the default under
     /// --lean-backend (islands remain the automatic per-fn fallback);
@@ -380,6 +381,14 @@ pub fn parse_args_with_imports(
         matches.opt_present(OPT_TACTUS_PACKAGE_CHECK)
             || (matches.opt_present(OPT_LEAN_BACKEND)
                 && !matches.opt_present(OPT_TACTUS_ISLANDS))
+    }
+    /// W4c default flip (b68): the refWp↔production bridge runs by
+    /// default whenever the package gate runs; `--tactus-no-bridge`
+    /// opts out (dev loops). The old `--tactus-bridge` flag is now
+    /// the default and stays accepted for compatibility.
+    fn tactus_bridge_resolved(matches: &getopts::Matches) -> bool {
+        (matches.opt_present(OPT_TACTUS_BRIDGE) || tactus_package_check_resolved(matches))
+            && !matches.opt_present(OPT_TACTUS_NO_BRIDGE)
     }
     const OPT_LEAN_BACKEND: &str = "lean-backend";
 
@@ -582,7 +591,12 @@ pub fn parse_args_with_imports(
     opts.optflag(
         "",
         OPT_TACTUS_BRIDGE,
-        "Tactus bootstrap W4a: additionally run the refWp<->production `decide` bridge over emitted obligation certs INSIDE the package gate (implies --tactus-emit-cert). Opt-in and verdict-neutral; needs tactus-core's out/lib oleans via $TACTUS_CORE_OUT (bootstrap-38)",
+        "Tactus bootstrap W4c: run the refWp<->production `decide` bridge over emitted obligation certs INSIDE the package gate (implies --tactus-emit-cert). Default ON in package mode since W4c (b68); a bridge failure is a verification error. Needs tactus-core's out/lib oleans via $TACTUS_CORE_OUT (else a loud skip note)",
+    );
+    opts.optflag(
+        "",
+        OPT_TACTUS_NO_BRIDGE,
+        "Tactus bootstrap W4c: opt out of the default in-gate refWp<->production bridge (dev loops)",
     );
     opts.optflag(
         "",
@@ -810,11 +824,12 @@ pub fn parse_args_with_imports(
             || tactus_package_check_resolved(&matches),
         tactus_emit_module: matches.opt_present(OPT_TACTUS_EMIT_MODULE),
         tactus_package_check: tactus_package_check_resolved(&matches),
-        // W4a: --tactus-bridge implies cert emission (the bridge consumes
-        // the emitted cert files).
+        // W4a/W4c: the bridge implies cert emission (it consumes the
+        // emitted cert files); W4c makes the bridge default-on in
+        // package mode, so cert emission follows the resolved bit.
         tactus_emit_cert: matches.opt_present(OPT_TACTUS_EMIT_CERT)
-            || matches.opt_present(OPT_TACTUS_BRIDGE),
-        tactus_bridge: matches.opt_present(OPT_TACTUS_BRIDGE),
+            || tactus_bridge_resolved(&matches),
+        tactus_bridge: tactus_bridge_resolved(&matches),
         lean_backend: matches.opt_present(OPT_LEAN_BACKEND),
         time: matches.opt_present(OPT_TIME) || matches.opt_present(OPT_TIME_EXPANDED),
         time_expanded: matches.opt_present(OPT_TIME_EXPANDED),

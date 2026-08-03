@@ -203,6 +203,132 @@ runs); e2e 829/2 (documented pre-existing pair); probes
 and the red-path e2e pin (emission-side hook — hand-editing an on-disk
 cert does not red the bridge, per the b67 finding).
 
+## Design review — the flip itself (2026-08-03, pre-implementation)
+
+Survey of the flip surface (all line-anchored during the P3(a) work):
+
+- `config.rs`: `tactus_bridge: matches.opt_present(OPT_TACTUS_BRIDGE)`;
+  `tactus_emit_cert` already folds in `|| OPT_TACTUS_BRIDGE` (the
+  bridge consumes certs). Package check is default under
+  `--lean-backend` (`tactus_package_check_resolved`).
+- `verifier.rs::run_package_gate`: `report.failures` non-empty → one
+  verification error per (module, output) — the error channel the
+  bridge failure must join. The `bridge_note` prints as a bare note.
+- `generate.rs::check_package`: the bridge runs only when
+  `failures.is_empty()` (no piling onto a red gate — keep).
+- `generate.rs::run_bridge_step`: returns the one-line note; per-cert
+  pass/cached/fail counted, `local_failures` (lean output) currently
+  discarded. The W4b content-keyed pass cache makes cached PASSes
+  sound by construction.
+
+### Frozen design
+
+1. **Default rule.** Bridge on iff `tactus_package_check_resolved` AND
+   NOT `--tactus-no-bridge` (new opt-out flag, for dev loops).
+   `--tactus-bridge` stays accepted (compat; now the default).
+   `tactus_emit_cert` resolution folds in the resolved bridge bit
+   (bridge consumes certs). `--emit-lean` runs never reach the gate,
+   so probe11/fixture emit recipes are inert to the flip.
+2. **Failure channel.** `run_bridge_step` returns a structured
+   `BridgeStep { checked, passed, cached, failed: Vec<(leaf, output)>,
+   note }` — lean output captured per failing leaf (today discarded).
+   `check_package` appends each `(leaf, output)` to
+   `PackageGateReport.failures` with the O7 wording ("goal drift
+   against reference"), so verifier.rs's existing failures loop turns
+   each into a verification error attributed at the fn. Census-
+   rejected fns emit no cert → never bridge subjects (mix_trip2 et
+   al. stay non-errors, per policy P2). A write-failure of the bridge
+   module itself also enters `failed` (io, with its message).
+3. **Unavailability ≠ failure.** No `TACTUS_CORE_OUT` / missing core
+   oleans stays a loud skip NOTE (wording updated: no longer
+   "opt-in…"), never an error — otherwise every e2e package test and
+   every no-core user run reds. This is the one non-error bridge
+   outcome post-flip; it is loud and it names the remedy.
+4. **Trust-inventory line.** The gate note's bridge segment becomes
+   the standing line: "N obligations bridge-checked against tactus-core
+   (P passed, F failed, C cached) [core-olean H]; M fns census-excluded
+   (tags: tag×n, …)" — M and the tags from the cert census
+   (`CERT_REJECTIONS`, compact one-line form via a new
+   `census_excluded_summary()` in sst_serialize). Printed only when the
+   bridge actually ran (not on skip).
+5. **Red-path pin.** New env knob `TACTUS_BRIDGE_PERTURB=<substring>`,
+   checked at the goals-assembly site in `sst_serialize::emit_cert`:
+   for fns whose leaf name contains the substring, swap the first two
+   goals of the emitted `cert_<leaf>_goals` (fn must have ≥2 goals —
+   the pin uses an assert + postcondition). Emission-side by
+   construction (re-emission overwrites on-disk edits — the b67
+   gotcha), deterministic, and loud (`eprintln` when the knob is set,
+   documented test-only). The e2e test runs a green package crate with
+   the knob set → expects failure with the O7 error naming the fn;
+   the same crate with the knob unset stays green.
+6. **Existing test update.** `test_bridge_opt_in_verdict_neutral`
+   becomes the default-on coverage: bridge runs by default, loudly
+   skips without core oleans, verdict still neutral; a second test
+   pins `--tactus-no-bridge` restoring the pre-flip surface (no bridge
+   note at all).
+
+**Decisions taken under principles 1–6 (flag if you disagree):**
+opt-out flag name `--tactus-no-bridge` (mirrors existing `--no-*`
+negations); the perturb knob is an env var, not a flag (matches the
+`TACTUS_*` knob convention; a test-only hook shouldn't widen the
+public CLI surface); unavailability-stays-a-note (predictability: a
+missing optional dependency must not red otherwise-green runs).
+
+**Not taken:** surfacing bridge failures at per-fn check time (the
+bridge is a crate-end gate artifact — certs only exist crate-wide
+there; per-fn surfacing would need a second bridge run); making the
+pass cache failure-aware (the content key already covers every input
+to the verdict — a cached PASS is sound, and failures are never
+cached).
+
+## Completion record — the flip (2026-08-03)
+
+All six design points landed as frozen, no deviations:
+
+1. **Default rule** — `tactus_bridge_resolved` (config.rs): on iff
+   package-check resolves, off via `--tactus-no-bridge`;
+   `--tactus-bridge` stays accepted. Cert emission follows the
+   resolved bit. Confirmed inert under `--emit-lean` (the gate is
+   skipped at verifier.rs:3484 — fixture/probe11 recipes untouched).
+2. **Failure channel** — `BridgeStep { note, failed }`;
+   `run_bridge_step` captures lean output per failing leaf;
+   `check_package` maps each to `cert <leaf> (goal drift against
+   reference)` in `PackageGateReport.failures` → verification errors
+   via the existing verifier.rs loop.
+3. **Unavailability ≠ failure** — skip notes updated (no more
+   "opt-in" wording); pinned by `test_bridge_default_on_skip_note`.
+4. **Trust-inventory line** — live on tactus-core: "166 obligations
+   bridge-checked against tactus-core (166 passed, 0 failed, 0 cached)
+   [core-olean fnv1a:…]; 174 fns census-excluded (tags:
+   call-unit-dest×32, rawvir-arm-pat×65, rawvir-block×4,
+   rawvir-ctor×38, rawvir-dt-struct×5, rawvir-field-pat×8,
+   rawvir-readplace-nonlocal×5, typ-specfn×17)".
+5. **Red-path pin** — `TACTUS_BRIDGE_PERTURB=<substring>` swaps the
+   first two goals at `goal_list` (loud eprintln when matched);
+   `test_bridge_red_pin` drives it against the repo's tracked
+   tactus-core oleans: control run green with the live bridge
+   (1 passed, 0 failed), perturbed run red with the O7 error naming
+   `red_pin_drift`. Harness gained `run_verus_with_env` (per-child
+   env; the process-global env is not parallel-test-safe).
+6. **Test updates** — `test_bridge_opt_in_verdict_neutral` replaced by
+   `test_bridge_default_on_skip_note` + `test_bridge_no_bridge_opt_out`
+   (stderr-pinned); the P3(a) regen pin landed earlier in the file.
+
+**Battery:** units 436+7/0; tactus-core gate WITH default-on bridge
+291/0 + 54 + 198/0-pending, 166 obligations bridge-checked live
+(0 cached — emitter-fingerprint invalidation from the rebuild, the
+b67 mechanism working as designed), 2m11s; e2e 829/2 (+3 new tests
+green); probes 9/11/13/14/17/37/38 ✓; fixture golden byte-stable.
+
+**B2 gate conditions — final status:** P2 (detector implemented +
+pinned, corpus population 0) ✓; P3(a) (race repair + srckey markers +
+pins) ✓; P3(b) (emitter fingerprint, b67) ✓; cost story (~1.4% warm,
+b67) ✓; A-coverage (scoped probe11 census, all classified) ✓.
+**Milestone B (b67+b68) is DONE.** bootstrap-09 (W4) closes with this
+card. Next per the endgame: milestone E (W8 authority flip + trust
+shrink — the N2 `branch_isvariant_of` detector is the last named
+trusted predicate on the cert path).
+
 ## Description
 
 The W4 default flip itself (umbrella bootstrap-09), once bootstrap-67's cache +

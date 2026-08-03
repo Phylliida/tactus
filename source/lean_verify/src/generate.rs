@@ -3850,12 +3850,14 @@ pub struct PackageGateReport {
     pub skipped_sccs: Vec<String>,
     /// (module leaf, lean output) per failed elaboration.
     pub failures: Vec<(String, String)>,
-    /// W4a (bootstrap-38): the in-gate refWp↔production bridge. `None`
-    /// when `--tactus-bridge` is off (no bridge run) or when tactus-core
-    /// oleans could not be located (a loud note instead of a verdict);
-    /// `Some` carries a one-line summary the gate prints verbatim. The
-    /// bridge is INFORMATIONAL in W4a — its outcome never enters
-    /// `failures` and so never becomes a verification error.
+    /// W4c (b68): the in-gate refWp↔production bridge, default-on in
+    /// package mode. `None` when the bridge is off
+    /// (`--tactus-no-bridge`), when tactus-core oleans could not be
+    /// located (a loud skip note instead of a verdict), or when the
+    /// gate is already red; `Some` carries the standing trust-inventory
+    /// line the gate prints verbatim. Bridge FAILURES enter `failures`
+    /// (as `cert <leaf> (goal drift against reference)`) and become
+    /// verification errors — the note itself is informational.
     pub bridge_note: Option<String>,
     /// Link-discharge L1 census: per-fn closed theorems emitted
     /// (zero-spine class) / proof fns pending (woven premises).
@@ -3976,11 +3978,22 @@ pub fn check_package(
     let link_path = format!("{}:{}", base_path, pkg_dir.display());
     let link_mod = link_module_name(&defs);
     run_lean(&pkg_dir, &link_mod, false, &link_path, &mut failures);
-    // W4a (bootstrap-38): the in-gate refWp↔production bridge, opt-in via
-    // `--tactus-bridge`. Verdict-neutral — its outcome is a note, not a
-    // `failures` entry, so it cannot change the gate's error count in W4a.
+    // W4c (b68): the in-gate refWp↔production bridge — default-on in
+    // package mode (`--tactus-no-bridge` opts out). A cert that exists
+    // and fails to close IS a verification error (O7 "goal drift
+    // against reference"); census-rejected fns emit no cert and are
+    // never bridge subjects. Runs only on an otherwise-clean gate (no
+    // piling onto a red gate). Unavailable core oleans stay a loud
+    // skip note, never an error.
     let bridge_note = if bridge_enabled() && failures.is_empty() {
-        Some(run_bridge_step(crate_name, &base_path))
+        let step = run_bridge_step(crate_name, &base_path);
+        for (leaf, out) in step.failed {
+            failures.push((
+                format!("cert {} (goal drift against reference)", leaf),
+                out,
+            ));
+        }
+        Some(step.note)
     } else {
         None
     };
@@ -4033,6 +4046,18 @@ fn bridge_cache_hit(marker: &Path, key: &str) -> bool {
     std::fs::read_to_string(marker).ok().as_deref() == Some(key)
 }
 
+/// W4c (b68): the in-gate bridge's structured result. `failed` carries
+/// (leaf, lean output) per non-closing bridge module — these become
+/// verification errors at the fn (O7 "goal drift against reference"),
+/// ending the W4a era where a bridge FAIL was a bare note.
+struct BridgeStep {
+    /// The one-line summary the gate prints verbatim (skip or
+    /// trust-inventory line).
+    pub note: String,
+    /// Per-leaf (name, lean output) for bridges that did not close.
+    pub failed: Vec<(String, String)>,
+}
+
 /// W4a (bootstrap-38): elaborate the refWp↔production `decide` bridge over
 /// every emitted obligation cert, INSIDE the package gate. This is the
 /// external probe `run.sh` logic (probe9/probe11) promoted in-process: for
@@ -4055,22 +4080,29 @@ fn bridge_cache_hit(marker: &Path, key: &str) -> bool {
 /// re-elaborated only when its content key (module text + core hash +
 /// toolchain + emitter binary) has no `.verified` marker on disk.
 ///
-/// Returns the one-line summary the gate prints verbatim.
-fn run_bridge_step(crate_name: &str, base_path: &str) -> String {
+/// Returns the structured result: the one-line note (skip reason or
+/// trust-inventory line) plus per-leaf failures for the error channel.
+fn run_bridge_step(crate_name: &str, base_path: &str) -> BridgeStep {
     let core_out = match std::env::var("TACTUS_CORE_OUT") {
         Ok(d) if !d.is_empty() => PathBuf::from(d),
         _ => {
-            return "bridge skipped: $TACTUS_CORE_OUT unset (opt-in \
-                    --tactus-bridge needs tactus-core's out/lib oleans)"
-                .to_string();
+            return BridgeStep {
+                note: "bridge skipped: $TACTUS_CORE_OUT unset (the in-gate \
+                       bridge needs tactus-core's out/lib oleans)"
+                    .to_string(),
+                failed: Vec::new(),
+            };
         }
     };
     if !core_out.join("TactusDefs_lib_exec.olean").exists() {
-        return format!(
-            "bridge skipped: {} has no TactusDefs_lib_exec.olean \
-             (build tactus-core, or point $TACTUS_CORE_OUT at its out/lib)",
-            core_out.display(),
-        );
+        return BridgeStep {
+            note: format!(
+                "bridge skipped: {} has no TactusDefs_lib_exec.olean \
+                 (build tactus-core, or point $TACTUS_CORE_OUT at its out/lib)",
+                core_out.display(),
+            ),
+            failed: Vec::new(),
+        };
     }
     let core_hash = core_olean_hash(&core_out);
 
@@ -4088,7 +4120,10 @@ fn run_bridge_step(crate_name: &str, base_path: &str) -> String {
     // Bridge modules land beside the pkg modules, in their own subdir.
     let bridge_dir = lean_out_root().join(sanitize(crate_name)).join("bridge");
     if std::fs::create_dir_all(&bridge_dir).is_err() {
-        return format!("bridge skipped: could not create {}", bridge_dir.display());
+        return BridgeStep {
+            note: format!("bridge skipped: could not create {}", bridge_dir.display()),
+            failed: Vec::new(),
+        };
     }
     // tactus-core oleans FIRST so `TactusDefs_lib_exec` + `lib.*` resolve.
     let bridge_path = format!("{}:{}", core_out.display(), base_path);
@@ -4096,13 +4131,14 @@ fn run_bridge_step(crate_name: &str, base_path: &str) -> String {
     let mut checked = 0usize;
     let mut passed = 0usize;
     let mut cached = 0usize;
-    let mut failed_names: Vec<String> = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
     for cert in &certs {
         let leaf = cert
             .file_name()
             .and_then(|s| s.to_str())
             .map(|s| s.trim_end_matches(".cert.lean"))
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string();
         if leaf.is_empty() {
             continue;
         }
@@ -4138,8 +4174,8 @@ fn run_bridge_step(crate_name: &str, base_path: &str) -> String {
             continue;
         }
         let _ = std::fs::remove_file(&marker);
-        if write_lean_file_tracked(&bridge_dir.join(format!("{}.lean", module)), &text).is_err() {
-            failed_names.push(leaf.to_string());
+        if let Err(e) = write_lean_file_tracked(&bridge_dir.join(format!("{}.lean", module)), &text) {
+            failed.push((leaf, format!("bridge module write failed: {}", e)));
             continue;
         }
         let mut local_failures: Vec<(String, String)> = Vec::new();
@@ -4148,20 +4184,35 @@ fn run_bridge_step(crate_name: &str, base_path: &str) -> String {
             passed += 1;
             let _ = std::fs::write(&marker, &key);
         } else {
-            failed_names.push(leaf.to_string());
+            let out = local_failures
+                .iter()
+                .map(|(_, o)| o.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            failed.push((leaf, out));
         }
     }
 
-    let failed = checked - passed - cached;
+    // W4c (b68): the standing trust-inventory line — bridge verdicts
+    // plus the census-excluded fns (loud by tag), the per-run record
+    // the flip exists to print.
+    let (excluded, tags) = crate::sst_serialize::census_excluded_summary();
     let mut note = format!(
         "{} obligations bridge-checked against tactus-core ({} passed, {} failed, {} cached) \
          [core-olean {}]",
-        checked, passed, failed, cached, core_hash,
+        checked, passed, failed.len(), cached, core_hash,
     );
-    if !failed_names.is_empty() {
-        note.push_str(&format!("; failed: {}", failed_names.join(", ")));
+    note.push_str(&format!("; {} fns census-excluded", excluded));
+    if !tags.is_empty() {
+        note.push_str(&format!(" (tags: {})", tags));
     }
-    note
+    if !failed.is_empty() {
+        note.push_str(&format!(
+            "; failed: {}",
+            failed.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    BridgeStep { note, failed }
 }
 
 /// FNV-1a over the sorted `.olean` files in `dir` (name + bytes). A

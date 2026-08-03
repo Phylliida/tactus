@@ -2740,10 +2740,11 @@ impl Verifier {
         // literal). Emission-only; consulted inside `emit_cert` at the
         // `exec_fn_theorems_to_ast` snapshot point.
         lean_verify::sst_serialize::set_cert_emit_enabled(self.args.tactus_emit_cert);
-        // Bootstrap W4a: run the refWp↔production `decide` bridge over
-        // emitted obligation certs inside the package gate. Opt-in
-        // (`--tactus-bridge`, which also turned on cert emission above);
-        // verdict-neutral (the bridge outcome is a gate note).
+        // Bootstrap W4c (b68): the refWp↔production `decide` bridge over
+        // emitted obligation certs inside the package gate — default-on
+        // in package mode (`--tactus-no-bridge` opts out). A bridge
+        // failure is a verification error; unavailability (no
+        // $TACTUS_CORE_OUT) is a loud skip note.
         lean_verify::generate::set_bridge_enabled(self.args.tactus_bridge);
 
         let time_verify_sequential_start = Instant::now();
@@ -3426,9 +3427,9 @@ impl Verifier {
                             report.discharge_detail,
                         )).to_any());
                     }
-                    // W4a: the in-gate refWp↔production bridge (opt-in
-                    // --tactus-bridge). Informational in W4a — a note only,
-                    // never an error (W4c flips bridge FAIL → error).
+                    // W4c (b68): the in-gate bridge's trust-inventory
+                    // line (green runs only — bridge failures are
+                    // `failures` entries and print as errors below).
                     if let Some(bridge) = &report.bridge_note {
                         reporter.report_now(&note_bare(format!(
                             "tactus: {}", bridge,

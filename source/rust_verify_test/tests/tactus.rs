@@ -13628,26 +13628,132 @@ test_verify_one_file_with_options! {
     } => Ok(())
 }
 
-// W4a (bootstrap-38): `--tactus-bridge` is opt-in and VERDICT-NEUTRAL. The
-// package gate additionally runs the refWp↔production `decide` bridge over
-// emitted obligation certs (the exec fn below emits one). With no
-// `$TACTUS_CORE_OUT` in the test env the in-gate bridge loudly SKIPS — and
-// the gate verdict is unchanged. An opt-in flag must never perturb the
-// pass/fail result; the bridge-FAIL→error flip is W4c, not W4a.
-test_verify_one_file_with_options! {
-    #[test] test_bridge_opt_in_verdict_neutral ["tactus-package-check", "tactus-bridge"] => verus_code! {
-        spec fn double(n: nat) -> nat { n + n }
+// W4c (b68): the in-gate bridge is DEFAULT-ON in package mode. With no
+// `$TACTUS_CORE_OUT` in the test env the bridge loudly SKIPS (a note,
+// never an error — unavailability must not red an otherwise-green run);
+// `--tactus-no-bridge` opts out (no bridge note at all). Both pinned
+// against the raw stderr.
+fn w4c_flip_test_dir(suffix: &str) -> std::path::PathBuf {
+    let deps_dir = std::env::current_exe().unwrap();
+    let deps_dir = deps_dir.parent().unwrap();
+    let target_dir = deps_dir.parent().unwrap();
+    let test_binary = std::path::PathBuf::from(std::env::args().next().unwrap());
+    let test_binary = test_binary.file_name().unwrap().to_str().unwrap().to_string();
+    let parent = target_dir.join("test_inputs");
+    std::fs::create_dir_all(&parent).unwrap();
+    let dir = parent.join(format!("{test_binary}-{suffix}"));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    std::fs::create_dir(&dir).unwrap();
+    dir
+}
 
-        proof fn lemma_a(n: nat) ensures double(n) >= 0 by { unfold double; omega }
+#[test]
+fn test_bridge_default_on_skip_note() {
+    let dir = w4c_flip_test_dir("bridge_default_on");
+    let code = format!(
+        "{}{}\nverus! {{\nproof fn lemma_a(n: nat) ensures n + 0 == n by {{ omega }}\n}}\n",
+        FEATURE_PRELUDE, USE_PRELUDE,
+    );
+    let entry = dir.join("test.rs");
+    std::fs::write(&entry, &code).unwrap();
+    let out = run_verus(&["--lean-backend"], &dir, &entry, false, false);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "run failed:\n{}", stderr);
+    assert!(
+        stderr.contains("bridge skipped: $TACTUS_CORE_OUT unset"),
+        "default-on bridge loudly skips without core oleans; stderr:\n{}",
+        stderr,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
-        pub fn add_capped(x: u64, y: u64) -> (r: u64)
-            requires x < 1000, y < 1000,
-            ensures r == x + y,
-        {
-            let s = x + y;
-            s
-        }
-    } => Ok(())
+#[test]
+fn test_bridge_no_bridge_opt_out() {
+    let dir = w4c_flip_test_dir("bridge_no_bridge");
+    let code = format!(
+        "{}{}\nverus! {{\nproof fn lemma_a(n: nat) ensures n + 0 == n by {{ omega }}\n}}\n",
+        FEATURE_PRELUDE, USE_PRELUDE,
+    );
+    let entry = dir.join("test.rs");
+    std::fs::write(&entry, &code).unwrap();
+    let out =
+        run_verus(&["--lean-backend", "tactus-no-bridge"], &dir, &entry, false, false);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "run failed:\n{}", stderr);
+    assert!(
+        !stderr.contains("bridge"),
+        "--tactus-no-bridge opts out entirely (no bridge note); stderr:\n{}",
+        stderr,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// W4c (b68) red-path pin: a deliberately perturbed cert MUST turn the
+// run red. The gate re-emits certs from SST every run, so an on-disk
+// edit never reaches the bridge — the pin drives the emission-side
+// hook `TACTUS_BRIDGE_PERTURB` (swap the first two goals of the named
+// fn's cert). The control (no knob) bridges green against the repo's
+// tracked tactus-core oleans. Both runs use the default-on bridge.
+#[test]
+fn test_bridge_red_pin() {
+    let deps_dir = std::env::current_exe().unwrap();
+    let repo_root = deps_dir
+        .parent().unwrap() // deps
+        .parent().unwrap() // release
+        .parent().unwrap() // target
+        .parent().unwrap() // source
+        .parent().unwrap() // repo root
+        .to_path_buf();
+    let core_out = repo_root.join("tactus-core").join("out").join("lib");
+    if !core_out.join("TactusDefs_lib_exec.olean").exists() {
+        eprintln!(
+            "test_bridge_red_pin: skipping — {} missing (build tactus-core first)",
+            core_out.join("TactusDefs_lib_exec.olean").display(),
+        );
+        return;
+    }
+    let code = format!(
+        "{}{}\nverus! {{\nproof fn lemma_a(n: nat) ensures n + 0 == n by {{ omega }}\n\npub fn red_pin_drift(x: u64) -> (r: u64)\n    requires x < 1000,\n    ensures r == x + 1,\n{{\n    let s = x + 1;\n    assert(s > x);\n    s\n}}\n}}\n",
+        FEATURE_PRELUDE, USE_PRELUDE,
+    );
+    // Control: live bridge, no perturbation → green, trust-inventory
+    // line printed.
+    let dir_ok = w4c_flip_test_dir("bridge_red_ok");
+    let entry = dir_ok.join("test.rs");
+    std::fs::write(&entry, &code).unwrap();
+    let out = run_verus_with_env(
+        &["--lean-backend"], &dir_ok, &entry, false, false,
+        &[("TACTUS_CORE_OUT", core_out.as_path())],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "control run failed:\n{}", stderr);
+    assert!(
+        stderr.contains("obligations bridge-checked against tactus-core")
+            && stderr.contains("0 failed"),
+        "control run bridge-checks green; stderr:\n{}", stderr,
+    );
+    // Red: the perturb knob drifts the emitted cert → the bridge fails
+    // → verification error naming the leaf (O7 "goal drift against
+    // reference").
+    let dir_red = w4c_flip_test_dir("bridge_red_red");
+    let entry = dir_red.join("test.rs");
+    std::fs::write(&entry, &code).unwrap();
+    let perturb = std::path::Path::new("red_pin_drift");
+    let out = run_verus_with_env(
+        &["--lean-backend"], &dir_red, &entry, false, false,
+        &[("TACTUS_CORE_OUT", core_out.as_path()), ("TACTUS_BRIDGE_PERTURB", perturb)],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(!out.status.success(), "perturbed cert must red the run; stderr:\n{}", stderr);
+    assert!(
+        stderr.contains("goal drift against reference")
+            && stderr.contains("red_pin_drift"),
+        "the error names the drifted cert; stderr:\n{}", stderr,
+    );
+    let _ = std::fs::remove_dir_all(&dir_ok);
+    let _ = std::fs::remove_dir_all(&dir_red);
 }
 
 // P3(a)/b68 regen pin: a fresh `TactusStmts_*.lean` beside a STALE
