@@ -1,25 +1,24 @@
-# HANDOFF — milestone B2 (b68 bridge default flip) — 2026-08-02
+# HANDOFF — milestone B COMPLETE (b68 bridge default flip) — 2026-08-03
 
-**For the next session: milestone B1 (b67 caching) is COMPLETE, and
-the tgt runtime-module gate failure it surfaced is DIAGNOSED with the
-defs layer REPAIRED (`00827513`; findings doc
-`FINDINGS-tgt-runtime-module-gate.md`). What remains per the endgame
-map is B2 (the b68 bridge default flip), then E (W8 authority flip +
-trust shrink). Open decision for Danielle: the class-3 residual (11
-errors in 3 recursive proof fns — N3 script-form closer class) wants
-either N3 script-author work or S2c fn-level overrides, and the
-decreasing_by fixes need porting to `tactus/source`.** Everything you
-need is here; the ordered program map is `DESIGN-bootstrap-endgame.md`
-(milestones + policy P1–P4), the queue header is `NEXT.md`, per-brick
-detail is `board/*.md`. B1's full record (design review + cost table +
-findings) is `board/bootstrap-67-w4b-cert-bridge-caching.md`. (This file replaces
-the milestone-B handoff; history lives in git.)
+**For the next session: milestone B (b67 caching + b68 flip) is DONE —
+the kernel bridge is default-on in package mode and milestone B closes
+bootstrap-09 (W4). What remains per the endgame map: row 11b (A6-full,
+the ∀-binder telescope arm that retires the `assert-forall` census
+tag — now unblocked, "post-flip" per Q4), milestone F gap-work
+(prelude hygiene / vstd-as-package / dual-backend differential), and
+milestone E (W8 authority flip, b13) which is GATED ON THE B SOAK
+(default-on across the corpus, two weeks, zero unclassified drift —
+the soak started 2026-08-03).** The ordered program map is
+`DESIGN-bootstrap-endgame.md` (milestones + policy P1–P4), the queue
+header is `NEXT.md`, per-brick detail is `board/*.md`. B2's full
+record (both design reviews + completion records + the P3(a) race
+diagnosis) is `board/bootstrap-68-w4c-bridge-default-flip.md`.
 
 ## Where you are
 
 - Worktree `/home/bepis/prog/verus-cad/tactus-bootstrap`, branch
-  `bootstrap`, clean tree. HEAD = `7b9b0cbc` (FINDINGS doc; the
-  decreasing_by fixes are `00827513`).
+  `bootstrap`, clean tree. HEAD = `85e7b0cd` (the flip; P2 detector
+  `d6b2b367`; P3(a) race+markers `7f6dc814`).
 - The mirror model: `tactus-core/lib.rs` (verified BY the worktree
   binary). The trusted serializer:
   `source/lean_verify/src/sst_serialize.rs` (+ `sst_to_lean.rs`,
@@ -30,75 +29,83 @@ the milestone-B handoff; history lives in git.)
 ## State (all green at handoff)
 
 - tactus-core gate **291/0** + package gate 54 modules + Link discharge
-  **198/0-pending** — now routinely run WITH `--tactus-bridge`:
-  **166 obligations bridge-checked (166 cached warm / 166 live cold)**.
-- probe9 **33/33 CLOSE**, probe11 **11/11 CLOSE** — zero honest-fails
-  corpus-wide. probe13 **22 classes**, probes 14/17/37/38 ✓, lean_verify
-  units **432+7/0**, golden byte-stable, e2e **829/2** (the 2 =
-  documented pre-existing examples pair flat_combine/tutorial_fifo).
+  **198/0-pending** — bridge now DEFAULT-ON: **166 obligations
+  bridge-checked** live (166 passed, 0 failed; 0 cached on a rebuilt
+  binary — the b67 emitter fingerprint invalidates correctly; warm
+  all-cached ≈ b67's 1.4%). The gate note carries the standing
+  trust-inventory line: "…; 174 fns census-excluded (tags:
+  call-unit-dest×32, rawvir-arm-pat×65, rawvir-block×4, rawvir-ctor×38,
+  rawvir-dt-struct×5, rawvir-field-pat×8, rawvir-readplace-nonlocal×5,
+  typ-specfn×17)".
+- probe9 33/33 + probe11 11/11 CLOSE — zero honest-fails corpus-wide;
+  the fixture's `mix_trip2` (F27) census-rejects `hoist-mixed-shadow`
+  (the P2 MIX detector — implemented this session; it had never
+  existed). probes 13 (22 classes)/14/17/37/38 ✓, lean_verify units
+  **436+7/0**, golden byte-stable, e2e **829/2** (the 2 = documented
+  pre-existing examples pair flat_combine/tutorial_fifo).
 - probe20 **deferred** (vendored old-shape tgt defcerts; regenerate
   with the tgt-slice emit when tgt work resumes — Danielle's
   constraint: **NO full tgt gate runs**; probe11's scoped per-module
   emits are the accepted lighter path).
 - The cert path has exactly ONE named trusted predicate left — the N2
-  `branch_isvariant_of` detector (W7-adjacent; the E-milestone
-  trust-shrink target). The poison mark is derived reference-side.
+  `branch_isvariant_of` detector (the milestone-E trust-shrink
+  target). The poison mark is derived reference-side.
 
-## B1 deliverables now in the tree (b67, `c1133ddb` + `3fdf6fd5`)
+## B2 deliverables now in the tree
 
-- Cert writers content-compare (M5e pattern): byte-identical
-  re-emission keeps mtime.
-- Per-cert bridge pass cache: `Bridge_<leaf>.verified` markers keyed on
-  {bridge module text, `core_olean_hash`, toolchain fingerprint,
-  emitter fingerprint}; island-marker discipline (removed before live
-  run, written only on success). Gate note: "N obligations
-  bridge-checked against tactus-core (P passed, F failed, C cached)
-  [core-olean H]".
-- `emitter_fingerprint()` (`lean_verify::project`): VARGO_BUILD_VERSION
-  + FNV-1a of current_exe bytes. Mixed into the `-V cache` base —
-  **P3(b) DONE** (a rebuilt binary no longer reuses old Z3 verdicts).
-- Warm bridge overhead ≈ 1.4% (35s vs 34.7s); cold+bridge 10m35s.
-  **B2 gate condition 3 (cost story) DONE.**
+- **P3(a)**: stmts-olean staleness REPAIRED — it was a *race*:
+  `stmt_partition_for`'s check-then-act memo let the 64-thread first
+  wave run ~50 concurrent full-partition builds; the last insert
+  carried all-false changed flags, so genuinely-changed stmt modules
+  skipped olean rebuilds on ordinary warm gates (5/5 repro). F1 =
+  per-key `OnceLock` build-once (memo_cell pattern); F2 =
+  `<olean>.srckey` markers (FNV-1a of {`.lean` content, toolchain,
+  prelude}) with island-marker discipline consulted by every skip
+  path (stmt ensure, pkg cacheable ×3, gate leaf loop, driver wide
+  filter); F3 = unit pins + e2e
+  `test_p3a_stmts_olean_skew_forces_rebuild`. `*.srckey` gitignored.
+  One-time migration: first post-flip run on an existing out-tree
+  rebuilds every olean once (~2.5 min on tactus-core).
+- **P2**: `mark_flet_forced` / `mark_poison_forced` reject
+  `Err("hoist-mixed-shadow")` when `rename_env` is live at the forcing
+  site. Validated both directions (neutered detector → cert emits and
+  bridge proves goals_eq false — genuinely unbridgeable).
+- **The flip**: `tactus_bridge_resolved` (config.rs) — on iff
+  package-check resolves, `--tactus-no-bridge` opts out. Bridge
+  failure = verification error (`cert <leaf> (goal drift against
+  reference)`). Unavailability (no `$TACTUS_CORE_OUT`) = loud skip
+  note, never an error. Red-path pin: `TACTUS_BRIDGE_PERTURB`
+  (emission-side two-goal swap, loud, test-only) + `test_bridge_red_pin`
+  (control green / perturbed red). Inert under `--emit-lean` (gate
+  skipped at verifier.rs:3484).
 
-## Next task: B2 = b68 (`board/bootstrap-68-w4c-bridge-default-flip.md`)
+## Next task candidates (Danielle picks)
 
-Flip `--tactus-bridge` on by default in package mode; bridge failure =
-verification error at the fn (census-rejected honest-fails stay
-non-errors); gate note gains the standing trust-inventory line: "N
-obligations bridge-checked against tactus-core, M fns census-excluded
-(tags: …)". Red-path pin: one e2e test where a deliberately perturbed
-cert turns the run red.
-
-**B2 gate conditions — status:**
-
-1. **P2** — every honest-fail class is a fixed arm or a loud census
-   tag; unclassified drift = hard error (O7 "goal drift against
-   reference"). Mostly there: zero honest-fails corpus-wide; the
-   remaining known gap is the `hoist-mixed-shadow` MIX detector
-   (population 0, tagged but unhit — confirm it's loud).
-2. **P3** — (a) stmts-olean staleness (a fresh `TactusStmts_*.lean`
-   without a rebuilt olean → misleading Type-mismatch/sorry cascade;
-   fix the rebuild logic, pin with a regen test) — **OPEN**;
-   (b) emitter-binary fingerprint in the cache key — **DONE (b67)**.
-3. B1 cost story — **DONE** (~1.4% warm overhead).
-4. A-coverage — **amended** (Danielle 2026-08-01): scoped tgt modules
-   via the probe11 census (every serializable fn bridges or is loudly
-   tagged, zero unclassified failures); the full-crate tgt acceptance
-   run is REMOVED (no full tgt gates).
-
-Design-review BEFORE implementing (the b67/b80 addendum model);
-Danielle's principles 1–6 apply.
+- **Row 11b (A6-full)** — the ∀-binder telescope arm: model
+  `assert forall` skolem binders in the stage-A telescope, retiring
+  the `assert-forall` census tag (b68 scaffolding, never permanent).
+  Card it first (step-0 evidence from the two
+  `lemma_runtime_word_view_*` fns; the census population is exactly
+  those 2 on tgt). Medium size.
+- **Milestone F gap-work** — prelude hygiene (definitionalize
+  `Tactus.index`/`Tactus.hasResolved`), vstd-as-package, dual-backend
+  differential runner.
+- **Milestone E (b13, W8 authority flip)** — BLOCKED on the soak:
+  bridge default-on across the corpus for two weeks of active dev
+  with zero unclassified drift errors (started 2026-08-03).
+- **Ops**: port the decreasing_by fixes (`00827513`) to
+  `tactus/source` (tgt's check.sh binary carries the same bugs);
+  class-3 residual (11 errors in 3 recursive proof fns) stays HELD
+  for the Z3-tactic-recreation arc (Danielle 2026-08-02).
 
 ## Recipes (all verified)
 
 - tactus-core gate (from `tactus-bootstrap/`):
   `TACTUS_LEAN_OUT=$PWD/tactus-core/out ./source/target-verus/release/verus --crate-type=lib --lean-backend -V cache tactus-core/lib.rs`
-  (~35s warm, ~10 min cold. Vocab/pin-statement edits: `rm -rf
-  tactus-core/out` first — warm stmts oleans false-red the Link, the
-  P3(a) class.)
-- tactus-core gate WITH in-gate bridge (the b67 measurement config):
-  same + `TACTUS_CORE_OUT=$PWD/tactus-core/out/lib --tactus-bridge`
-  (~35s warm all-cached, ~2m17s warm live-bridge, 10m35s cold).
+  (~35s warm, ~10 min cold. The bridge now runs by default — loudly
+  skips without `TACTUS_CORE_OUT`; add
+  `TACTUS_CORE_OUT=$PWD/tactus-core/out/lib` for the live bridge,
+  ~2m11s warm live-bridge.)
 - Rebuild binary:
   `cd source && PATH="$PWD/../tools/vargo/target/release:$PATH" vargo build --release`
   (vstd 1531/0).
@@ -129,13 +136,12 @@ Danielle's principles 1–6 apply.
   — the in-gate bridge NEVER runs on the fixture. In-gate bridge
   subjects = green crates (tactus-core today). tgt's runtime-module
   gate is currently RED under the worktree binary (pre-existing drift,
-  see the b67 card findings) — the in-gate bridge has no tgt subject;
-  probe11's external runner is the tgt lane.
+  see FINDINGS-tgt-runtime-module-gate.md) — the in-gate bridge has no
+  tgt subject; probe11's external runner is the tgt lane.
 - **Hand-editing an on-disk cert does not red the bridge** — the gate
-  re-emits certs from SST before bridging (content-compare writes only
-  on real diffs). The red channel is emission-side drift, which flips
-  marker keys by construction. B2's perturbed-cert red pin needs an
-  emission-side hook, not a file edit.
+  re-emits certs from SST before bridging. The red channel is
+  emission-side drift — the e2e pin uses `TACTUS_BRIDGE_PERTURB` for
+  exactly this reason.
 - probe runners must GLOB `~/.cache/tactus/prelude-*` (a pinned single
   prelude dir goes stale-red).
 - Nested `match` in spec fns breaks the one-line Lean emission (inner
@@ -158,6 +164,9 @@ Danielle's principles 1–6 apply.
   updating it + its unit pins.
 - `by { decide }` pins can't take the threaded poison set as a free
   variable — pass `LeafList::Nil` explicitly.
+- **The tactus-core out/ tree is git-tracked INCLUDING oleans** — a
+  gate run can dirty `lib_exec.ladder` (run-dependent hash); revert
+  it before committing unless the change is intentional.
 
 ## Danielle's standing principles
 
@@ -167,5 +176,5 @@ Rust), 5 predictability over special cases, 6 invest more work for
 cleaner code. Constraints: no full tgt gates; coder agents don't
 work well for implementation — do it yourself; commit freely in the
 worktree (small commits per logical landing); design-review BEFORE
-implementing anything non-trivial (the b67/b80 addenda on the cards
-are the model).
+implementing anything non-trivial (the b67/b80/b68 addenda on the
+cards are the model).

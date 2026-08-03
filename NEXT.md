@@ -1,5 +1,41 @@
 # NEXT — bootstrap work queue (2026-07-21; superseded 2026-07-24)
 
+**2026-08-03: milestone B2 (b68 bridge default flip) DONE — MILESTONE B
+(b67+b68) COMPLETE; bootstrap-09 (W4) CLOSED.** Full record + design
+reviews on `board/bootstrap-68-w4c-bridge-default-flip.md`. THREE
+landings, one session, battery green at each: **(1) P3(a)**
+(`7f6dc814`): the stmts-olean staleness was a *memo race*, not just a
+missing check — the 64-thread first wave raced ~50 concurrent
+full-partition builds and the last insert's all-false changed flags
+silently trusted stale oleans on ORDINARY warm gates (reproduced 5/5,
+strace-shown). Fixed via the per-key `OnceLock` memo pattern (F1) +
+content-keyed `.olean.srckey` freshness markers for stmt/pkg oleans
+with island-marker discipline (F2) + unit/e2e pins (F3); warm gate
+35.2s ≡ baseline, one-time migration rebuild per tree. **(2) P2**
+(`d6b2b367`): the `hoist-mixed-shadow` detector did NOT exist (the tag
+was a doc comment) — implemented at both wrap-forcer sites; validated
+both directions on fixture F27 `mix_trip2` (neutered detector → cert
+emits and bridge proves goals_eq = 1 FALSE, i.e. genuinely
+unbridgeable; detector on → loud census rejection, fn verifies).
+**(3) The flip** (`85e7b0cd`): bridge default-on in package mode
+(`--tactus-no-bridge` opts out), bridge failure = verification error
+at the fn (O7 "goal drift against reference"), unavailability = loud
+skip note, gate note gains the standing trust-inventory line (on
+tactus-core: 166 obligations bridge-checked, 174 fns census-excluded,
+all tags named). Red-path pin: `TACTUS_BRIDGE_PERTURB` emission-side
+hook + `test_bridge_red_pin` (control green / perturbed red). Battery:
+units 436+7/0, gate 291/0+54+198/0 with default-on bridge (166 live),
+e2e 829/2, probes 9/11/13/14/17/37/38 ✓, golden byte-stable.
+**NEXT per the endgame map: row 11b (A6-full — the ∀-binder telescope
+arm that kills the `assert-forall` tag; the tag was b68 scaffolding,
+never permanent) or milestone F gap-work (prelude hygiene / vstd
+package / dual-backend differential). Milestone E (W8 authority flip,
+b13) is gated on the B SOAK — default-on across the corpus, two weeks,
+zero unclassified drift; the soak started today.** Also standing: port
+the decreasing_by fixes (`00827513`) to `tactus/source`; class-3
+residual stays HELD for the Z3-tactic-recreation arc (Danielle
+2026-08-02).
+
 **2026-08-02 pm: tgt runtime-module gate DIAGNOSED + defs layer
 REPAIRED (`00827513`, findings doc `FINDINGS-tgt-runtime-module-gate.md`).**
 The b67 cost measurement found the scoped tgt module gate red (11
