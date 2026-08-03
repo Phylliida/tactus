@@ -665,9 +665,11 @@ struct Serializer<'a> {
     /// HOISTED goal: wrap-mode goals keep source names (goal-position
     /// lets shadow textually). So freshening is gated on `wrap_forced`
     /// (below): freshen iff the current prefix is wrap-free. (The MIX
-    /// case — wrap-free at the shadow, a wrap-forcer later — emits the
-    /// freshened name into wrap goals that production renders plain:
-    /// documented honest-fail, census `hoist-mixed-shadow`.)
+    /// case — wrap-free at the shadow, a wrap-forcer later — would
+    /// emit the freshened name into wrap goals that production renders
+    /// plain: DETECTED at the wrap-forcer sites (`mark_flet_forced` /
+    /// `mark_poison_forced`) and census-rejected loud,
+    /// `hoist-mixed-shadow`, endgame P2/b68.)
     bound_names: std::collections::HashSet<String>,
     /// The active shadow renames (source name → freshened name), from
     /// `fresh_let_name` on a taken let dest. Applied to every
@@ -1012,14 +1014,31 @@ impl<'a> Serializer<'a> {
 
     /// Mark the walk prefix as wrap-forcing from a plain FLet (typ-less
     /// or poison-collapsed let): persists through query scopes.
-    fn mark_flet_forced(&mut self) {
+    ///
+    /// MIX detector (endgame P2, b68): if a freshened shadow is live on
+    /// this path (`rename_env` non-empty — a taken name was re-bound
+    /// while wrap-free), production renders LATER wrap-mode goals with
+    /// the SOURCE name (textual shadowing) while this mirror's
+    /// `apply_renames` emits the freshened one — the documented
+    /// `hoist-mixed-shadow` honest-fail. Reject loud so the census
+    /// names the class instead of an unclassified bridge drift (O7).
+    fn mark_flet_forced(&mut self) -> Sr<()> {
+        if !self.rename_env.is_empty() {
+            return Err("hoist-mixed-shadow".to_string());
+        }
         self.flet_forced = true;
+        Ok(())
     }
 
     /// Mark the walk prefix as wrap-forcing from a poisoned hyp:
-    /// stripped by query scopes (they drop outer hyps).
-    fn mark_poison_forced(&mut self) {
+    /// stripped by query scopes (they drop outer hyps). Same MIX
+    /// detector as `mark_flet_forced`.
+    fn mark_poison_forced(&mut self) -> Sr<()> {
+        if !self.rename_env.is_empty() {
+            return Err("hoist-mixed-shadow".to_string());
+        }
         self.poison_forced = true;
+        Ok(())
     }
 
     /// Snapshot/restore discipline for branchy walks (If arms,
@@ -1204,7 +1223,7 @@ impl<'a> Serializer<'a> {
         let c_lx = self.apply_renames(&c_lx_raw);
         let cp = self.hyp_poison(&c_lx);
         if cp == 1 {
-            self.mark_poison_forced();
+            self.mark_poison_forced()?;
         }
         let nc = self.leaves.intern(pp_expr(&LExpr::not(c_lx.clone())));
         // F4: register the ¬cond prop's deep (the eq prop's deep is
@@ -1335,7 +1354,7 @@ impl<'a> Serializer<'a> {
         let eq_inner = LExpr::eq(lhs, app);
         let eq_poison = self.hyp_poison(&eq_inner);
         if eq_poison == 1 {
-            self.mark_poison_forced();
+            self.mark_poison_forced()?;
         }
         let loc = crate::obligation_naming::format_rust_loc(&cond.span);
         let marked = LExpr::span_mark(
@@ -1397,7 +1416,7 @@ impl<'a> Serializer<'a> {
                 if hp == 1 {
                     // Poison forces wrap from here (production collapses;
                     // the reference DERIVES the collapse from the deep).
-                    self.mark_flet_forced();
+                    self.mark_flet_forced()?;
                 }
                 let ty_leaf = self.typ_leaf(&typ);
                 let (en, ep) = self.eq_leaves(lname, rhs_lx);
@@ -1412,7 +1431,7 @@ impl<'a> Serializer<'a> {
             }
             None => {
                 // Typ-less let: plain FLet — forces wrap from here.
-                self.mark_flet_forced();
+                self.mark_flet_forced()?;
                 Ok(format!("({}.StmData.Assign {} {})", NS, dest, rhs_leaf))
             }
         }
@@ -1447,7 +1466,7 @@ impl<'a> Serializer<'a> {
             let eq_lx = LExpr::eq(LExpr::var(dest_name.clone()), dv_lx.clone());
             let hp = self.hyp_poison(&eq_lx);
             if hp == 1 {
-                self.mark_flet_forced();
+                self.mark_flet_forced()?;
             }
             self.guard_no_poison(hp, "call dest-let eq prop")?;
             let ty_leaf = self.typ_leaf(dest_typ);
@@ -2933,7 +2952,7 @@ impl<'a> Serializer<'a> {
                 let hp = self.hyp_poison(&hyp_lx);
                 if hp == 1 {
                     // A poisoned hyp forces whole-goal wrap from here.
-                    self.mark_poison_forced();
+                    self.mark_poison_forced()?;
                 }
                 let hyp = self.leaves.intern(pp_expr(&hyp_lx));
                 // F4: register the prop's deep for the poison derivation.
@@ -2966,7 +2985,7 @@ impl<'a> Serializer<'a> {
                 let e_lx = self.apply_renames(&e_lx_raw);
                 let hp = self.hyp_poison(&e_lx);
                 if hp == 1 {
-                    self.mark_poison_forced();
+                    self.mark_poison_forced()?;
                 }
                 let id = self.leaves.intern(pp_expr(&e_lx));
                 // F4: register the prop's deep for the poison derivation.
@@ -3195,7 +3214,7 @@ impl<'a> Serializer<'a> {
                 let cond_inner = self.apply_renames(&cond_inner_raw);
                 let cp = self.hyp_poison(&cond_inner);
                 if cp == 1 {
-                    self.mark_poison_forced();
+                    self.mark_poison_forced()?;
                 }
                 // F4: register both cond props' deeps for the poison
                 // derivation (c and ¬c share the mention set).
@@ -3446,7 +3465,7 @@ impl<'a> Serializer<'a> {
                         let hyp_lx = self.apply_renames(&hyp_lx_raw);
                         let hp = self.hyp_poison(&hyp_lx);
                         if hp == 1 {
-                            self.mark_poison_forced();
+                            self.mark_poison_forced()?;
                         }
                         let hyp = self.leaves.intern(pp_expr(&hyp_lx));
                         // F4: register the prop's deep for the poison derivation.
@@ -3709,7 +3728,7 @@ impl<'a> Serializer<'a> {
                     let cond_inner = self.apply_renames(&cond_inner_raw);
                     let cp = self.hyp_poison(&cond_inner);
                     if cp == 1 {
-                        self.mark_poison_forced();
+                        self.mark_poison_forced()?;
                     }
                     // F4: register both cond props' deeps (c, ¬c — same
                     // mention set).
@@ -3877,7 +3896,7 @@ impl<'a> Serializer<'a> {
                 if let Some(rest) = rest {
                     let hp = self.hyp_poison(&rest);
                     if hp == 1 {
-                        self.mark_poison_forced();
+                        self.mark_poison_forced()?;
                     }
                     // F4: no SST source for this prop's deep — a real mention rejects loud.
                     self.guard_no_poison(hp, "call-post rest hyp")?;
@@ -3890,7 +3909,7 @@ impl<'a> Serializer<'a> {
                 if let Some(eb) = e_bound {
                     let hp = self.hyp_poison(&eb);
                     if hp == 1 {
-                        self.mark_poison_forced();
+                        self.mark_poison_forced()?;
                     }
                     // F4: no SST source for this prop's deep — a real mention rejects loud.
                     self.guard_no_poison(hp, "call-post e_bound hyp")?;
@@ -3926,7 +3945,7 @@ impl<'a> Serializer<'a> {
                 if let Some(e) = ens {
                     let hp = self.hyp_poison(&e);
                     if hp == 1 {
-                        self.mark_poison_forced();
+                        self.mark_poison_forced()?;
                     }
                     // F4: no SST source for this prop's deep — a real mention rejects loud.
                     self.guard_no_poison(hp, "call-post ens hyp")?;
@@ -3939,7 +3958,7 @@ impl<'a> Serializer<'a> {
                 if let Some(rb) = ret_bound {
                     let hp = self.hyp_poison(&rb);
                     if hp == 1 {
-                        self.mark_poison_forced();
+                        self.mark_poison_forced()?;
                     }
                     // F4: no SST source for this prop's deep — a real mention rejects loud.
                     self.guard_no_poison(hp, "call-post ret_bound hyp")?;
@@ -3963,7 +3982,7 @@ impl<'a> Serializer<'a> {
             if let Some(b) = &m.bound {
                 let hp = self.hyp_poison(b);
                 if hp == 1 {
-                    self.mark_poison_forced();
+                    self.mark_poison_forced()?;
                 }
                 // F4: no SST source for this prop's deep — a real mention rejects loud.
                 self.guard_no_poison(hp, "call-post mut bound hyp")?;
@@ -3983,7 +4002,7 @@ impl<'a> Serializer<'a> {
         // the mut-preamble/attr cases. Loop bodies restore the flag at
         // body end (post-loop frames drop body frames).
         if !leaves.mut_args.is_empty() {
-            self.mark_flet_forced();
+            self.mark_flet_forced()?;
         }
         Ok(format!("({}.StmData.Call {} {})", NS, box_(&reqs), box_(&post)))
     }
@@ -4233,7 +4252,7 @@ impl<'a> Serializer<'a> {
         .map_err(|reason| format!("leaf-render: {}", reason))?;
         let cond_poison = self.hyp_poison(&self.apply_renames(&cond_inner_raw));
         if cond_poison == 1 {
-            self.mark_poison_forced();
+            self.mark_poison_forced()?;
         }
         // F4: register the deeps for every cond-flavored prop (the
         // shared bit covers all five — c / ¬c / ¬¬c / the break guard
@@ -4558,7 +4577,7 @@ fn serialize<'a>(
         // Freshening runs only inside `hoist_all`; an attr fn's goals
         // never hoist. (A proof-block-only fn's goals DO hoist, so its
         // freshening stays live — b77 proof_block_fn evidence.)
-        s.mark_flet_forced();
+        s.mark_flet_forced()?;
     }
 
     // Assert-forall skolem map (endgame A6-short) — built EXACTLY as
@@ -4724,7 +4743,7 @@ fn serialize<'a>(
         // Every goal of a mut-param fn wraps (production's hoist bail),
         // so the shadow-freshening never runs — same off-switch as the
         // attr-fn case (`rename_frame_vars` only runs inside hoist_all).
-        s.mark_flet_forced();
+        s.mark_flet_forced()?;
     }
 
     // Shadow-mirror seed (bootstrap-74 slice 2 Round D): production's

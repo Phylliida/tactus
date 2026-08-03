@@ -442,4 +442,26 @@ pub fn count_to_len(v: &Vec<u64>) -> (r: usize)
     i
 }
 
+// F27 (b68, endgame P2): the hoist-mixed-shadow tripwire — a taken name
+// re-bound while wrap-free (`i` freshens to `i_hoist1` in hoisted
+// goals), then a Bool residue (`b`) plus a poisoned hyp (`assert(b)`)
+// forcing wrap LATER on the same path. Production renders the wrap
+// goals with the SOURCE name (textual shadowing); the mirror would
+// emit the freshened one — unbridgeable by construction (validated:
+// with the detector neutered the cert emits and the bridge proves
+// goals_eq = 0). The serializer DETECTS the MIX at the wrap-forcer
+// and census-rejects `hoist-mixed-shadow` — this fn emits NO cert, so
+// probe9 stays green; if the detector ever breaks, a non-closing
+// mix_trip2.cert.lean appears and probe9 goes red (CLOSE-BROKE).
+pub fn mix_trip2(x: u64) -> (r: u64)
+    requires x < 1000,
+    ensures r <= x + 2,
+{
+    let i = x;
+    let i = i + 1;
+    let b = i < 2000;
+    assert(b);
+    i
+}
+
 } // verus!

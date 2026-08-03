@@ -1529,3 +1529,24 @@ fn write_if_changed_skips_byte_identical_rewrite() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "bbb");
     let _ = std::fs::remove_file(&path);
 }
+
+/// P2/b68: the MIX case — a freshened shadow live on the walk path
+/// when a wrap-forcer fires — census-rejects `hoist-mixed-shadow`
+/// loud instead of drifting into an unclassified bridge mismatch (O7).
+#[test]
+fn hoist_mixed_shadow_detected() {
+    // No live rename: forcing is fine.
+    let mut s = Serializer::default();
+    assert!(s.mark_flet_forced().is_ok());
+    let mut s = Serializer::default();
+    assert!(s.mark_poison_forced().is_ok());
+    // A freshened shadow live on the path (a taken name re-bound while
+    // wrap-free): both forcers reject with the census tag.
+    let mut s = Serializer::default();
+    s.rename_env.insert(
+        "i".to_string(),
+        crate::lean_name::LeanName::synthetic("i_hoist1".to_string()),
+    );
+    assert_eq!(s.mark_flet_forced(), Err("hoist-mixed-shadow".to_string()));
+    assert_eq!(s.mark_poison_forced(), Err("hoist-mixed-shadow".to_string()));
+}
