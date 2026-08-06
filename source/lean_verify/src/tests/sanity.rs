@@ -235,6 +235,13 @@ fn extract_prelude_names_recognises_current_prelude() {
     assert!(names.contains("isize_hi"));
     // syntax-introduced tactic names.
     assert!(names.contains("tactus_first"));
+    // Dotted declarations (`opaque Tactus.hasResolved …`,
+    // `noncomputable def Tactus.index …`) contribute their HEAD segment
+    // (the extractor truncates at `.`) — pin it so a prelude-form change
+    // that drops the Tactus.* declarations fails loudly here.
+    assert!(names.contains("Tactus"),
+        "expected `Tactus` (head of the Tactus.* declarations) in extracted \
+         prelude names; got {:?}", names);
     // macro-introduced tactic names.
     assert!(names.contains("tactus_auto"));
     assert!(names.contains("tactus_usize_bound"));
@@ -267,12 +274,13 @@ fn extract_prelude_names_handles_each_form() {
             axiom my_axiom : Nat
             def my_def : Int := 0
             noncomputable def my_ncdef : Int := 1
+            opaque my_opaque : Prop
             syntax "my_syntax" : tactic
             macro "my_macro" : tactic => `(tactic| skip)
             elab "my_elab" : tactic => do return
         "#;
     let names = extract_prelude_names(synthetic);
-    for expected in &["my_axiom", "my_def", "my_ncdef",
+    for expected in &["my_axiom", "my_def", "my_ncdef", "my_opaque",
                       "my_syntax", "my_macro", "my_elab"] {
         assert!(names.contains(*expected),
             "expected `{}` in {:?}", expected, names);

@@ -547,8 +547,10 @@ fn extract_prelude_names(prelude: &str) -> HashSet<String> {
         if line.starts_with("--") || line.is_empty() { continue; }
 
         // axiom NAME : …  /  def NAME …  /  noncomputable def NAME …
+        // /  opaque NAME …
         let after_kw = line.strip_prefix("axiom ")
             .or_else(|| line.strip_prefix("noncomputable def "))
+            .or_else(|| line.strip_prefix("opaque "))
             .or_else(|| line.strip_prefix("def "));
         if let Some(rest) = after_kw {
             let name: String = rest.chars()
