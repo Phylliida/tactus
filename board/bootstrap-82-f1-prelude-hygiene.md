@@ -164,6 +164,22 @@ exercisers are the e2e tactus.rs tests + probe11's tgt lane.
 
 ## Risks
 
+- **R0 (SURFACED, fixed same-day): cold-prelude rebuild races across
+  verifier threads.** First gate run after the prelude-text bump went
+  230-fns red with "failed to create file 'TactusDefs.olean'". Root
+  cause: `build_module`'s build dir is pid-unique but the gate's ~64
+  verifier threads share ONE pid; with the new `prelude-<hash>` dir
+  absent, the whole first wave saw not-fresh and entered
+  `build_module` concurrently in the SAME `build-<pid>-TactusDefs`
+  dir, and the first finisher's `remove_dir_all(build)` deleted the
+  cwd of the others' still-running `lean`. Latent since the pid-unique
+  build dir; never bitten because prelude-text bumps are rare (last
+  was N2, 2026-07-03) and every other rebuild trigger leaves the
+  prelude hash alone. Fix: process-wide `REBUILD_LOCK` Mutex in
+  `ensure_prelude_olean` + freshness re-check under the lock
+  (cross-process builders need no lock — distinct pids, identical
+  content). Validated by the cold-prelude gate rerun below.
+
 - **R1 (S3/S5): `opaque` elaboration — DE-RISKED pre-card (2026-08-06,
   scratch probe on the pinned v4.25.0 toolchain).** All three
   redeclarations elaborate: both `opaque` forms (incl. the two-type-
