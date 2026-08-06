@@ -1,28 +1,32 @@
-# HANDOFF — row 11b (A6-full) COMPLETE; milestone A FULLY CLOSED — 2026-08-06
+# HANDOFF — row 11b (A6-full) COMPLETE incl. review round; milestone A FULLY CLOSED — 2026-08-06
 
 **For the next session: b81 (the ∀-binder telescope arm, endgame row
-11b) is DONE — the `assert-forall` census tag is retired and milestone
-A (A1–A7 coverage arms) is now FULLY CLOSED. What remains per the
-endgame map: milestone F gap-work (prelude hygiene / vstd-as-package /
-dual-backend differential — three independent small bricks, pick up in
-gap sessions) and milestone E (W8 authority flip, b13) which is GATED
-ON THE B SOAK (bridge default-on across the corpus, two weeks of active
-dev, zero unclassified drift — the soak started 2026-08-03).** The
-ordered program map is `DESIGN-bootstrap-endgame.md` (milestones +
-policy P1–P4), the queue header is `NEXT.md`, per-brick detail is
-`board/*.md`. b81's full record (design + both eras' completion notes)
-is `board/bootstrap-81-a6full-forall-binder-telescope.md`.
+11b) is DONE — design, two-era landing, skeptic review round, and
+retrospective all complete (`board/bootstrap-81-a6full-forall-binder-
+telescope.md` carries all four records). The `assert-forall` census
+tag is retired and milestone A (A1–A7 coverage arms) is FULLY CLOSED.
+What remains per the endgame map: milestone F gap-work (prelude
+hygiene / vstd-as-package / dual-backend differential — three
+independent small bricks, pick up in gap sessions) and milestone E
+(W8 authority flip, b13), GATED ON THE B SOAK (bridge default-on
+across the corpus, two weeks of active dev, zero unclassified drift —
+soak started 2026-08-03).** The ordered program map is
+`DESIGN-bootstrap-endgame.md` (milestones + policy P1–P4, row 11b now
+marked DONE), the queue header is `NEXT.md`, per-brick detail is
+`board/*.md`.
 
 ## Where you are
 
 - Worktree `/home/bepis/prog/verus-cad/tactus-bootstrap`, branch
-  `bootstrap`. HEAD = era-1 `0f311a66` + the era-2 landing commit (see
-  `git log`). The mirror model: `tactus-core/lib.rs` (verified BY the
-  worktree binary). The trusted serializer:
-  `source/lean_verify/src/sst_serialize.rs` (+ `sst_to_lean.rs`,
-  `expr_shared.rs`, `to_lean_sst_expr.rs`, `typed_expr.rs`).
-- Memory: `memory/project_tactus_bootstrap_program.md` in the verus-cad
-  parent (do NOT commit there).
+  `bootstrap`. HEAD ≈ `8045b915` (b81 review round) + `a37a6e73`
+  (retrospective) + `19dc24a0` (poems). The mirror model:
+  `tactus-core/lib.rs` (verified BY the worktree binary). The trusted
+  serializer: `source/lean_verify/src/sst_serialize.rs` (+
+  `sst_to_lean.rs`, `expr_shared.rs`, `to_lean_sst_expr.rs`,
+  `typed_expr.rs`).
+- Memory: `memory/project_tactus_bootstrap_program.md` in the
+  verus-cad parent (do NOT commit there) — updated through the
+  retrospective's 5 process changes.
 
 ## State (all green at handoff)
 
@@ -30,26 +34,22 @@ is `board/bootstrap-81-a6full-forall-binder-telescope.md`.
   **205/0-pending** — bridge default-on: **172 obligations
   bridge-checked** live (172 passed, 0 failed; the b67 emitter
   fingerprint invalidates correctly on every binary rebuild). Gate note
-  trust-inventory line: 175 fns census-excluded (tags:
-  call-unit-dest×33, rawvir-arm-pat×65, rawvir-block×4, rawvir-ctor×38,
-  rawvir-dt-struct×5, rawvir-field-pat×8, rawvir-readplace-nonlocal×5,
-  typ-specfn×17) — **all unmodelable-construct tags; no
-  modeled-but-unmirrored tags remain** (`assert-forall` retired).
-- probe9 37/37 (incl. F28/F29 assert-forall subjects + F30
-  `forall_leading_prefix` + F31 `forall_nested_shadow` from the review
-  round) + probe11 **13/13** (incl. both `lemma_runtime_word_view_*`
-  fns, certified and bridge-closed on their first live run) — zero
-  honest-fails corpus-wide. probe13 **27 classes** (+3 scope-binder
-  kills +2 review-round kills: `scope_exit_name_drift`,
-  `scope_dedup_rebind`), probes 14/17/37/38 ✓, lean_verify units
-  **437+7/0**, golden re-vendored (pure @rust: line drift), e2e
-  **829/2** (documented pre-existing examples pair
-  flat_combine/tutorial_fifo). probe9 has a subject-population pin now
-  (35 expected subjects + mix_trip2 documented-absent) — same class as
-  probe11's b78 S5 pin.
-- probe20 stays deferred (vendored old-shape tgt defcerts; no tgt
-  gates — Danielle's constraint; probe11's scoped per-module emits are
-  the accepted lighter path).
+  trust-inventory: 175 fns census-excluded (tags: call-unit-dest×33,
+  rawvir-arm-pat×65, rawvir-block×4, rawvir-ctor×38, rawvir-dt-struct×5,
+  rawvir-field-pat×8, rawvir-readplace-nonlocal×5, typ-specfn×17) —
+  **all unmodelable-construct tags; no modeled-but-unmirrored tags
+  remain** (`assert-forall` retired, population 0 by deletion).
+- probe9 **37/37** (with a subject-population pin now — 35 expected
+  subjects + mix_trip2 documented-absent `hoist-mixed-shadow`, the
+  b78 S5 masking class closed on the fixture lane too) + probe11
+  **13/13** (incl. both `lemma_runtime_word_view_*` fns, certified and
+  bridge-closed on their first live run) — zero honest-fails
+  corpus-wide. probe13 **27 classes**, probes 14/17/37/38 ✓,
+  lean_verify units **437+7/0**, golden re-vendored, e2e **829/2**
+  (documented pre-existing pair flat_combine/tutorial_fifo).
+- probe20 stays deferred (vendored old-shape tgt defcerts; NO tgt
+  gates — Danielle's constraint; probe11's scoped per-module emits
+  are the accepted lighter path).
 - The cert path's ONE named trusted predicate remains the N2
   `branch_isvariant_of` detector (the milestone-E trust-shrink
   target).
@@ -67,15 +67,53 @@ is `board/bootstrap-81-a6full-forall-binder-telescope.md`.
   `already_bound` dedup: DeadEnd scope binders + Loop mod-var binders
   + N2 IfCtor field binders, bundled into `branch_state`/
   `restore_branch`, restored at loop exit and DeadEnd exit.
+- **The review round's real bug:** `hyp_ordinal` also restores at
+  DeadEnd exit — production's `_h_hoist_k` numbering is PER-GOAL-PATH
+  (the scope's discarded hyps don't count on post-scope paths);
+  latent pre-b81, surfaced by F30, pinned by probe13
+  `scope_exit_name_drift`.
 - New model lemmas: `frame_append_fnil_right` (right identity, NOT
-  definitional — `frame_append` recurses on its first arg), 4 missing
-  `u_fapp_*` per-ctor unfolds, `u_mvf_nil_nil`,
-  `deadend_scope_binder_pin` (the D-column field-shape pin).
-- Fixture: F28 `forall_int_skolem` (Int, NoBound, mid-proposition ∀ —
-  the tgt shape) + F29 `forall_u64_skolem` (u64, Bound, leading-prefix
-  named-binder rendering) + `bumpi`/`bump` trigger helpers.
+  definitional), 4 missing `u_fapp_*` per-ctor unfolds,
+  `u_mvf_nil_nil`, `deadend_scope_binder_pin` (the D-column
+  field-shape pin).
+- Fixture: F28 `forall_int_skolem` (Int, NoBound, mid-proposition),
+  F29 `forall_u64_skolem` (u64, Bound, mid-proposition — bound hyp
+  renders TWICE: Bound entry + has_typ Assume duplicate), F30
+  `forall_leading_prefix` (skolem as named theorem binders), F31
+  `forall_nested_shadow` (the dedup: outer scope binds {j,k} —
+  collect walks INTO nested scopes — inner dedups to Nil).
+  Trigger helpers `bumpi`/`bump` (arithmetic-only assert-forall
+  bodies fail Verus trigger inference).
 - probe13 classes: `scope_binder_drop` / `scope_bound_drop` /
-  `scope_binder_typ_flip` (all baseline=1, kill=0).
+  `scope_binder_typ_flip` / `scope_dedup_rebind` /
+  `scope_exit_name_drift` (all baseline=1, kill=0).
+
+## Process changes from the retrospective (apply to the NEXT card)
+
+1. **Subject matrix at CARD time, over production-behavior
+   dimensions** (not vocabulary dimensions — b81's R1/R2 were the
+   missing rows of {leading, past-latch} × {flat, nested} ×
+   {NoBound, Bound}).
+2. **Per-path state audit at card time for any construct that
+   DISCARDS path state** — enumerate bound_names, forall_bound_names,
+   rename_env, flet_forced, poison_forced, hyp_ordinal (per-path) vs
+   emit_ordinal (global, correctly not restored). **Open audit item:**
+   `let_binder_typs` is written monotonically (call-dest lets) with
+   NO branch/scope restore while production's OblCtx ledger is cloned
+   per path — pre-existing, unconfirmed, no corpus subject; audit it
+   at the next arm that touches let-records.
+3. **Era-0 subject-first for vocabulary arms** (fixture subject
+   before the serializer arm; era 1 validates the rejection, era 2
+   the close; first live subject probes ELABORATION separately from
+   drift).
+4. **Review round is in Done-when** — the post-landing skeptic review
+   is 3-for-3 on real bugs (b77, b78, b81); it is where interaction
+   bugs live.
+5. **Recursive proof fns copy the nearest existing one's shape
+   FIRST** (attributes + u_*-unfolds-in-arm + closer string — the
+   rec_1 eq-lemma gap means no `rw` on height/Box-recursive spec fns;
+   see `holds_close_e_wrap` as the template and
+   reference_tactus_proof_authoring_idioms).
 
 ## Next task candidates (Danielle picks)
 
@@ -89,12 +127,12 @@ is `board/bootstrap-81-a6full-forall-binder-telescope.md`.
   the brick is a runner + CI-shaped report). All independent, small.
 - **Milestone E (b13, W8 authority flip)** — BLOCKED on the soak
   (started 2026-08-03; two weeks of default-on dev with zero
-  unclassified drift). After 11b the soak's census is cleaner than
-  ever (no modeled-but-unmirrored tags).
+  unclassified drift). After 11b the census is cleaner than ever
+  (no modeled-but-unmirrored tags).
 - **Ops**: port the decreasing_by fixes (`00827513`) to
   `tactus/source` (tgt's check.sh binary carries the same bugs);
-  class-3 residual (11 errors in 3 recursive proof fns) stays HELD for
-  the Z3-tactic-recreation arc (Danielle 2026-08-02).
+  class-3 residual (11 errors in 3 recursive proof fns) stays HELD
+  for the Z3-tactic-recreation arc (Danielle 2026-08-02).
 
 ## Recipes (all verified)
 
@@ -117,20 +155,25 @@ is `board/bootstrap-81-a6full-forall-binder-telescope.md`.
   `/home/bepis/prog/verus-cad/tactus-group-theory/src/lib.rs`,
   `--emit-lean --tactus-emit-cert`, no `-V cache`, into
   `probe-w0/probe11_w3_tgt/out`, ~80s each).
+- Per-goal bridge debugging (b81 review round recipe): copy the cert,
+  append a `gl_nth` accessor + `lib.goal_eq (gl_nth N (lib.ref_wp …))
+  (gl_nth N …_goals) = 1 := by decide` per goal to find WHICH goal
+  diverges; then `#reduce gl_nth N …` both sides and text-diff to find
+  WHERE (Box'd nodes print as `{ deref := … }`).
 - Units: `cd source && VERUS_IN_VARGO=1 cargo test --release -p lean_verify`
   (vargo rejects `-p lean_verify`).
 - e2e: `cd source && vargo test -p rust_verify_test --release`
   (~15 min; expect 829/2 — the 2 = documented pre-existing
   flat_combine/tutorial_fifo).
 
-## Gotchas (all bitten; b81 additions first)
+## Gotchas (all bitten; newest first)
 
 - **The `hyp_ordinal` walk counter is PER-GOAL-PATH, not global** —
   production's `split_leading_binders` numbers each goal's Hyp frames
   1-based after the base binders, so any construct that DISCARDS hyps
   from the path (DeadEnd scopes today) must restore the ordinal at
-  exit (the b81 review round's real catch: latent pre-b81, surfaced by
-  F30's post-scope named ∀-fact; pinned by probe13
+  exit (the b81 review round's real catch: latent pre-b81, surfaced
+  by F30's post-scope named ∀-fact; pinned by probe13
   `scope_exit_name_drift`). The If arms already do this via
   `branch_state`; the DeadEnd arm now mirrors it.
 - **Vocabulary ctor fields of list type are `Box<…>` — `box_()` the
@@ -197,5 +240,6 @@ Rust), 5 predictability over special cases, 6 invest more work for
 cleaner code. Constraints: no full tgt gates; coder agents don't
 work well for implementation — do it yourself; commit freely in the
 worktree (small commits per logical landing); design-review BEFORE
-implementing anything non-trivial (the b67/b80/b68/b81 addenda on the
-cards are the model).
+implementing anything non-trivial, skeptic review AFTER landing
+(both are in Done-when now); poem breaks whenever — they're part of
+the work.
