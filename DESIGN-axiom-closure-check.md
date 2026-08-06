@@ -97,8 +97,9 @@ elab "#tactus_check_axioms" thm:ident "[" expected:ident,* "]" : command => do
   let env ← getEnv
   let axioms ← liftCoreM <| collectAxioms thm.getId
   let core : NameSet := .ofList [``propext, ``Classical.choice, ``Quot.sound]
-  let prelude : NameSet := .ofList [`arch_word_bits, `arch_word_bits_valid,
-    `Tactus.heightLt, `Tactus.index, `Tactus.hasResolved]
+  -- post-b82: just the arch pair (the three Tactus.* names are a
+  -- def/two opaques now and never appear in closures)
+  let prelude : NameSet := .ofList [`arch_word_bits, `arch_word_bits_valid]
   let allowed := expected.getElems.foldl (init := core.union prelude)
     fun s e => s.insert e.getId
   for ax in axioms do
@@ -149,7 +150,7 @@ developers bisecting the checker itself is acceptable.)
 | Axiom | Status | Rationale |
 |---|---|---|
 | `propext`, `Classical.choice`, `Quot.sound` | **allowed** | Lean's classical base; Mathlib rests on these; `Classical.epsilon` (our `choose`) needs `choice` |
-| prelude 5 (`arch_word_bits`, `arch_word_bits_valid`, `Tactus.heightLt`, `Tactus.index`, `Tactus.hasResolved`) | **allowed, shrink over time** | see §4 hygiene |
+| prelude 2 (`arch_word_bits`, `arch_word_bits_valid`) | **allowed — the standing honest platform assumption** | `Tactus.heightLt`/`index`/`hasResolved` definitionalized 2026-08-06 (b82: def + 2 opaques); see §4 hygiene |
 | per-file dependency axioms | **allowed iff listed in `expected`** | island-mode modularity; disappears in package mode |
 | `sorryAx` | **hard error** | never legitimate in emitted output |
 | `Lean.ofReduceBool` / `Lean.trustCompiler` | **policy knob — see below** | extends TCB to the Lean compiler + native execution |
@@ -176,17 +177,20 @@ emission site, and converts an invisible trust extension into an inventoried one
 1. **`sanity.rs` always-on.** Currently `debug_assertions`-gated. It's an AST walk —
    negligible against a Lean elaboration. Promote to release builds; keep the
    panic-vs-error decision consistent with other codegen invariant violations.
-2. **Prelude axiom hygiene.** Investigate definitionalizing:
-   - `Tactus.index` — plausibly `def` via bounds-check + `Classical.arbitrary`
-     fallback (the `[Nonempty α]` binder is already there);
-   - `Tactus.hasResolved` — if no emitted facts constrain it beyond existence, an
-     `opaque` def of an unspecified `Prop` family is conservative over the kernel in
-     a way an `axiom` is not (any interpretation works ⇒ no consistency risk);
-   - `Tactus.heightLt` — audit what's assumed *about* it (well-foundedness for
-     `decreasing_by`?); those companion facts, if any, are the real trust, not the
-     symbol.
-   Each one removed shrinks the §3 table. `arch_word_bits` (+ validity) is the one
-   pair that's *honestly* an axiom — platform width is a genuine assumption.
+2. **Prelude axiom hygiene — DONE 2026-08-06 (b82, card
+   `board/bootstrap-82-f1-prelude-hygiene.md`).** All three investigated
+   symbols definitionalized:
+   - `Tactus.index` — `noncomputable def` via bounds-check +
+     `Classical.choice` fallback (the `[Nonempty α]` binder kept);
+   - `Tactus.hasResolved` — `opaque` Prop family (no emitted facts
+     constrain it beyond existence; any interpretation works ⇒ no
+     consistency risk, and no axiom in any closure);
+   - `Tactus.heightLt` — companion audit came back EMPTY (no
+     well-foundedness assumption, no companion facts; the SST cert path
+     never emits it) ⇒ also `opaque`.
+   The §3 table now stands at the `arch_word_bits` pair — the one
+   pair that's *honestly* an axiom (platform width is a genuine
+   assumption).
 3. **CI grep belt-and-suspenders:** no literal `sorry`/`admit` tokens in emitted
    `.lean` files. Subsumed semantically by the `sorryAx` check but costs one line.
 

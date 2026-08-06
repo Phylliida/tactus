@@ -31,7 +31,7 @@ type. Two confirmed exploitable shapes:
 
 ```lean
 axiom seq.Seq.index (A : Type) (self : seq.Seq A) (i : Int) : A   -- generated (vstd spec fn)
-axiom Tactus.index {α : Type u} {n : Nat} (a : Vector α n) (i : Int) : α   -- prelude static
+axiom Tactus.index {α : Type u} {n : Nat} (a : Vector α n) (i : Int) : α   -- prelude static (pre-b82 form; b82 made it a [Nonempty α]-bracketed noncomputable def)
 ```
 
 `(Seq.index Empty (Seq.empty Empty) 0).elim : False` elaborates

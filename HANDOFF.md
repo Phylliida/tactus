@@ -1,52 +1,65 @@
-# HANDOFF — row 11b (A6-full) COMPLETE incl. review round; milestone A FULLY CLOSED — 2026-08-06
+# HANDOFF — b82 (F1 prelude hygiene) COMPLETE incl. review round; the `arch_word_bits` pair is now the ONLY tactus prelude axiom — 2026-08-06
 
-**For the next session: b81 (the ∀-binder telescope arm, endgame row
-11b) is DONE — design, two-era landing, skeptic review round, and
-retrospective all complete (`board/bootstrap-81-a6full-forall-binder-
-telescope.md` carries all four records). The `assert-forall` census
-tag is retired and milestone A (A1–A7 coverage arms) is FULLY CLOSED.
-What remains per the endgame map: milestone F gap-work (prelude
-hygiene / vstd-as-package / dual-backend differential — three
-independent small bricks, pick up in gap sessions) and milestone E
-(W8 authority flip, b13), GATED ON THE B SOAK (bridge default-on
-across the corpus, two weeks of active dev, zero unclassified drift —
-soak started 2026-08-03).** The ordered program map is
-`DESIGN-bootstrap-endgame.md` (milestones + policy P1–P4, row 11b now
-marked DONE), the queue header is `NEXT.md`, per-brick detail is
+**For the next session: b82 (milestone F, brick 1 of 3) is DONE —
+design, landing, cold+warm gate validation, full battery, skeptic
+review round (`board/bootstrap-82-f1-prelude-hygiene.md` carries the
+card + completion record + review). `Tactus.index` → `noncomputable
+def` (N2 bracket retained), `Tactus.hasResolved`/`Tactus.heightLt` →
+`opaque` Prop families; the closure-check base list shrinks to the
+classical core + the arch pair + the compiled-execution licenses —
+the endgame's prelude-hygiene end state is REACHED. Also landed: the
+cold-prelude rebuild thread-race fix (REBUILD_LOCK in
+`ensure_prelude_olean`; latent since the pid-unique build dir, first
+bitten by this brick's prelude bump — 230 fns red before the fix,
+cold-validated green after). What remains per the endgame map:
+milestone F's two sibling bricks (vstd-as-package; dual-backend
+differential runner — independent, small) and milestone E (W8
+authority flip, b13), GATED ON THE B SOAK (bridge default-on across
+the corpus, two weeks of active dev, zero unclassified drift — soak
+started 2026-08-03).** The ordered program map is
+`DESIGN-bootstrap-endgame.md` (milestones + policy P1–P4, row 13 F1
+now marked DONE), the queue header is `NEXT.md`, per-brick detail is
 `board/*.md`.
 
 ## Where you are
 
 - Worktree `/home/bepis/prog/verus-cad/tactus-bootstrap`, branch
-  `bootstrap`. HEAD ≈ `8045b915` (b81 review round) + `a37a6e73`
-  (retrospective) + `19dc24a0` (poems). The mirror model:
-  `tactus-core/lib.rs` (verified BY the worktree binary). The trusted
-  serializer: `source/lean_verify/src/sst_serialize.rs` (+
+  `bootstrap`. HEAD ≈ `902fb99b` (b82 race fix + gate-validated out/
+  tree) + `781d8862` (card R0 record) + `95230d45` (b82 D1–D5a). The
+  mirror model: `tactus-core/lib.rs` (verified BY the worktree
+  binary). The trusted serializer: `source/lean_verify/src/sst_serialize.rs` (+
   `sst_to_lean.rs`, `expr_shared.rs`, `to_lean_sst_expr.rs`,
   `typed_expr.rs`).
 - Memory: `memory/project_tactus_bootstrap_program.md` in the
-  verus-cad parent (do NOT commit there) — updated through the
-  retrospective's 5 process changes.
+  verus-cad parent (do NOT commit there) — updated through b82.
 
 ## State (all green at handoff)
 
 - tactus-core gate **298/0** + package gate 54 modules + Link discharge
   **205/0-pending** — bridge default-on: **172 obligations
-  bridge-checked** live (172 passed, 0 failed; the b67 emitter
-  fingerprint invalidates correctly on every binary rebuild). Gate note
+  bridge-checked** live (172 passed, 0 failed; validated WARM and
+  COLD-prelude after the b82 prelude bump). Gate note
   trust-inventory: 175 fns census-excluded (tags: call-unit-dest×33,
   rawvir-arm-pat×65, rawvir-block×4, rawvir-ctor×38, rawvir-dt-struct×5,
   rawvir-field-pat×8, rawvir-readplace-nonlocal×5, typ-specfn×17) —
   **all unmodelable-construct tags; no modeled-but-unmirrored tags
   remain** (`assert-forall` retired, population 0 by deletion).
+- **Prelude trust surface: the `arch_word_bits` pair is the ONLY tactus
+  prelude axiom** (b82). `Tactus.index` is a `noncomputable def`
+  (bounds-check + `Classical.choice` fallback, `[Nonempty α]` bracket
+  retained), `Tactus.hasResolved`/`Tactus.heightLt` are `opaque` Prop
+  families; the closure-check base list = classical core + arch pair +
+  ofReduceBool/trustCompiler. probe37's closure printout shows the
+  adequacy leaves resting on `[propext]` alone.
 - probe9 **37/37** (with a subject-population pin now — 35 expected
   subjects + mix_trip2 documented-absent `hoist-mixed-shadow`, the
   b78 S5 masking class closed on the fixture lane too) + probe11
-  **13/13** (incl. both `lemma_runtime_word_view_*` fns, certified and
-  bridge-closed on their first live run) — zero honest-fails
+  **13/13** (incl. both `lemma_runtime_word_view_*` fns, re-closed
+  against the b82 prelude after the scoped regen) — zero honest-fails
   corpus-wide. probe13 **27 classes**, probes 14/17/37/38 ✓,
-  lean_verify units **437+7/0**, golden re-vendored, e2e **829/2**
-  (documented pre-existing pair flat_combine/tutorial_fifo).
+  lean_verify units **437+7/0**, golden byte-stable under the b82
+  prelude (certs import the prelude, no re-vendor needed), e2e
+  **829/2** (documented pre-existing pair flat_combine/tutorial_fifo).
 - probe20 stays deferred (vendored old-shape tgt defcerts; NO tgt
   gates — Danielle's constraint; probe11's scoped per-module emits
   are the accepted lighter path).
@@ -54,41 +67,42 @@ marked DONE), the queue header is `NEXT.md`, per-brick detail is
   `branch_isvariant_of` detector (the milestone-E trust-shrink
   target).
 
-## What b81 landed (the short version)
+## What b82 landed (the short version)
 
-- `StmData::DeadEnd(BinderList, ParamBoundList, body)` — the
-  assert-forall skolem ∀-binders (production's `Wp::Scope` /
-  `push_mod_var_frames`) transcribed by the serializer's DeadEnd arm
-  (SAME `collect_assert_by_vars_in` detection, now constructive) and
-  wrapped reference-side via the Loop arm's `mod_var_frames`
-  (FBind + optional bound FHyp). `wp_stm_sound` absorbed the frame
-  change with zero statement changes.
-- `forall_bound_names` (serializer) mirrors production's
-  `already_bound` dedup: DeadEnd scope binders + Loop mod-var binders
-  + N2 IfCtor field binders, bundled into `branch_state`/
-  `restore_branch`, restored at loop exit and DeadEnd exit.
-- **The review round's real bug:** `hyp_ordinal` also restores at
-  DeadEnd exit — production's `_h_hoist_k` numbering is PER-GOAL-PATH
-  (the scope's discarded hyps don't count on post-scope paths);
-  latent pre-b81, surfaced by F30, pinned by probe13
-  `scope_exit_name_drift`.
-- New model lemmas: `frame_append_fnil_right` (right identity, NOT
-  definitional), 4 missing `u_fapp_*` per-ctor unfolds,
-  `u_mvf_nil_nil`, `deadend_scope_binder_pin` (the D-column
-  field-shape pin).
-- Fixture: F28 `forall_int_skolem` (Int, NoBound, mid-proposition),
-  F29 `forall_u64_skolem` (u64, Bound, mid-proposition — bound hyp
-  renders TWICE: Bound entry + has_typ Assume duplicate), F30
-  `forall_leading_prefix` (skolem as named theorem binders), F31
-  `forall_nested_shadow` (the dedup: outer scope binds {j,k} —
-  collect walks INTO nested scopes — inner dedups to Nil).
-  Trigger helpers `bumpi`/`bump` (arithmetic-only assert-forall
-  bodies fail Verus trigger inference).
-- probe13 classes: `scope_binder_drop` / `scope_bound_drop` /
-  `scope_binder_typ_flip` / `scope_dedup_rebind` /
-  `scope_exit_name_drift` (all baseline=1, kill=0).
+- **The three prelude "allowed, shrink over time" axioms are gone.**
+  `Tactus.index` → `noncomputable def` (`if h : 0 ≤ i ∧ i.toNat < n
+  then a[i.toNat]'h.2 else Classical.choice inferInstance`; the N2
+  `[Nonempty α]` bracket retained — the soundness-hole pin still
+  blocks the Empty exploit under the def). `Tactus.hasResolved` /
+  `Tactus.heightLt` → `opaque` Prop families (unspecified-but-fixed;
+  the heightLt companion audit found ZERO — no well-foundedness
+  assumption, no companion facts; the SST cert path never emits it).
+  Closure-check base list = classical core + `arch_word_bits` pair +
+  ofReduceBool/trustCompiler. Soundness shape = model-narrowing (the
+  old axiom's model class strictly contains the new declaration's
+  model); no explicit `:= True` witnesses (commits to an
+  interpretation — banned per the card's Q2 resolution).
+- **R0: cold-prelude rebuild thread race, found by the battery and
+  fixed same-day.** `build_module`'s build dir is pid-unique but the
+  gate's ~64 verifier threads share one pid; the prelude-text bump
+  made the whole first wave see not-fresh and race in the SAME
+  `build-<pid>-TactusDefs` dir (first finisher's `remove_dir_all`
+  under the others' running lean → 230 fns red). Fix: process-wide
+  `REBUILD_LOCK` in `ensure_prelude_olean` + freshness re-check under
+  the lock. Validated by a deliberately cold-prelude gate rerun
+  (dir wiped, oleans rebuilt from scratch, zero failures).
+- **D5a:** `sanity.rs`'s prelude-name extractor learned the `opaque
+  NAME …` form (+ `my_opaque` form pin + a `Tactus`-head pin in
+  `recognises_current_prelude`).
+- **Review round verdicts:** (a) no opacity-reliant consumers
+  (model-narrowing held everywhere); (b) no opaque-vs-axiom
+  elaboration differences in the vstd boundary (tgt lane 13/13 is the
+  empirical sweep); (c) no `expected`-list entries anywhere name the
+  three symbols (subset-check semantics would make them inert anyway).
+  Detection-layer lesson: run the battery COLD (prelude dir wiped) at
+  least once after any prelude-text change.
 
-## Process changes from the retrospective (apply to the NEXT card)
+## Process changes from the b81 retrospective (apply to the NEXT card)
 
 1. **Subject matrix at CARD time, over production-behavior
    dimensions** (not vocabulary dimensions — b81's R1/R2 were the
@@ -108,7 +122,9 @@ marked DONE), the queue header is `NEXT.md`, per-brick detail is
    drift).
 4. **Review round is in Done-when** — the post-landing skeptic review
    is 3-for-3 on real bugs (b77, b78, b81); it is where interaction
-   bugs live.
+   bugs live. (b82's review found none — the battery's cold gate run
+   caught R0 first; infra-concurrency bugs are the class the
+   walk-path audits don't see.)
 5. **Recursive proof fns copy the nearest existing one's shape
    FIRST** (attributes + u_*-unfolds-in-arm + closer string — the
    rec_1 eq-lemma gap means no `rw` on height/Box-recursive spec fns;
@@ -117,18 +133,17 @@ marked DONE), the queue header is `NEXT.md`, per-brick detail is
 
 ## Next task candidates (Danielle picks)
 
-- **Milestone F gap-work** — (1) prelude hygiene: definitionalize
-  `Tactus.index`/`Tactus.hasResolved`, audit the `heightLt`
-  companions; target = `arch_word_bits` pair as the only tactus axiom.
-  (2) vstd-as-package: Boundary shrinks to imports; remaining vstd
-  axioms become the explicit, closure-checked cross-crate trust
-  surface. (3) Dual-backend differential runner: same crate through
-  Verus-Z3 and tactus, fn-by-fn verdict comparison (machinery exists;
-  the brick is a runner + CI-shaped report). All independent, small.
+- **Milestone F gap-work, 2 bricks left** — (2) vstd-as-package:
+  Boundary shrinks to imports; remaining vstd axioms become the
+  explicit, closure-checked cross-crate trust surface. (3)
+  Dual-backend differential runner: same crate through Verus-Z3 and
+  tactus, fn-by-fn verdict comparison (machinery exists; the brick is
+  a runner + CI-shaped report). Independent, small.
 - **Milestone E (b13, W8 authority flip)** — BLOCKED on the soak
   (started 2026-08-03; two weeks of default-on dev with zero
-  unclassified drift). After 11b the census is cleaner than ever
-  (no modeled-but-unmirrored tags).
+  unclassified drift). The census is cleaner than ever (no
+  modeled-but-unmirrored tags) and the prelude is down to the arch
+  pair.
 - **Ops**: port the decreasing_by fixes (`00827513`) to
   `tactus/source` (tgt's check.sh binary carries the same bugs);
   class-3 residual (11 errors in 3 recursive proof fns) stays HELD
@@ -168,6 +183,14 @@ marked DONE), the queue header is `NEXT.md`, per-brick detail is
 
 ## Gotchas (all bitten; newest first)
 
+- **Cold-prelude gates are safe post-b82, but the race exists in
+  EVERY older binary** — `build_module`'s build dir is pid-unique,
+  not thread-unique; any pre-`902fb99b` binary rebuilding a prelude
+  from scratch under a multithreaded gate can red 200+ fns with
+  "failed to create file 'TactusDefs.olean'" (transient — rerun with
+  the now-complete prelude dir, or use the new binary). Fixed via
+  `REBUILD_LOCK` in `ensure_prelude_olean` + freshness re-check under
+  the lock; validated by a deliberately cold-prelude gate rerun.
 - **The `hyp_ordinal` walk counter is PER-GOAL-PATH, not global** —
   production's `split_leading_binders` numbers each goal's Hyp frames
   1-based after the base binders, so any construct that DISCARDS hyps

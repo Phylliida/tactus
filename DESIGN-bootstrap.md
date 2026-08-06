@@ -103,7 +103,7 @@ Sizes from `source/lean_verify/src/` (25,383 lines total in the crate).
 | 5 | `lean_ast` 1,928 + `lean_pp` 931 | 2,859 | mis-printing a correct AST | R2 Bridge-D leaves pp trusted-but-tiny; Bridge-R eliminates it (§5.3) |
 | 6 | Dep ordering / same-crate axiomatization: `dep_order` 948, islands' circularity | 948 | circular axiomatization | **R1 landed** (import DAG + Link — structurally impossible) |
 | 7 | Broadcast/cross-crate/vstd axioms | — | stipulated theorems | R1 Boundary module (explicit, whitelisted) → shrinks when vstd becomes a package (R1/M-later) |
-| 8 | Prelude axioms (5: `arch_word_bits`, `arch_word_bits_valid`, `Tactus.heightLt`, `Tactus.index`, `Tactus.hasResolved`) | — | genuine axioms | closure-doc §4 hygiene: definitionalize ≥3; `arch_word_bits` pair stays (honest platform assumption) |
+| 8 | Prelude axioms (2: `arch_word_bits`, `arch_word_bits_valid`) | — | genuine axioms | **b82 landed** (closure-doc §4 hygiene): `Tactus.index`→def, `heightLt`/`hasResolved`→opaque; arch pair stays (honest platform assumption) |
 | 9 | Axiom-environment consistency (`nonempty.rs` brackets) | 516 | inconsistent env ⇒ user tactics prove False | landed (DESIGN-nonempty-axioms, model argument in DESIGN.md); brackets carry into stmt defs unchanged |
 | 10 | Tactic ladder / `tactus_auto` / Mathlib simp drift | — | *not soundness* (kernel checks); predictability/transparency | T (squeeze-and-pin) |
 | 11 | Frontend: rustc, `builtin_macros`, HIR→VIR, `ast_to_sst*`, `inline_spec`, `mut_ref_normalize` | large | shared with Verus; silent lowering bugs | trusted; R4 sketch (§7) is the only known attack; differential-vs-Verus testing mitigates |
@@ -349,9 +349,9 @@ That is the honest, achievable form of self-application.
   on shared corpora is evidence either way).
 - **vstd as a package** (R1's last row): Boundary shrinks to imports; the vstd axioms
   that remain become the explicit cross-crate trust surface, closure-checked.
-- **Prelude hygiene** (closure doc §4): definitionalize `Tactus.index`,
-  `Tactus.hasResolved`, audit `Tactus.heightLt` companions — target end state:
-  the `arch_word_bits` pair is the *only* tactus axiom.
+- **Prelude hygiene** (closure doc §4) — **DONE 2026-08-06 (b82)**: `Tactus.index`
+  → `noncomputable def`, `Tactus.hasResolved`/`Tactus.heightLt` → `opaque`;
+  end state reached: the `arch_word_bits` pair is the *only* tactus axiom.
 - **R3 — frontend:** still not a priority. rustc + `builtin_macros` + HIR→VIR remain
   trusted, as they do for Verus, CompCert-style front-gap honesty.
 
