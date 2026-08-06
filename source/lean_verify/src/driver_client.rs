@@ -224,7 +224,7 @@ fn checkin(client: DriverClient) {
 }
 
 /// Parse the leading `import X` lines of an emitted module file.
-fn header_imports(file: &Path) -> Option<Vec<String>> {
+pub(crate) fn header_imports(file: &Path) -> Option<Vec<String>> {
     let src = std::fs::read_to_string(file).ok()?;
     let mut imports = Vec::new();
     for line in src.lines() {

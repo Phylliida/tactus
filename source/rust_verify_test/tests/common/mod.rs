@@ -333,7 +333,7 @@ pub fn run_verus_with_env(
     entry_file: &std::path::PathBuf,
     import_vstd: bool,
     json_errors: bool,
-    extra_env: &[(&str, &std::path::Path)],
+    extra_env: &[(&str, &str)],
 ) -> std::process::Output {
     if std::env::var("VERUS_IN_VARGO").is_err() {
         panic!("not running in vargo, read the README for instructions");

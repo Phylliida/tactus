@@ -13633,7 +13633,7 @@ test_verify_one_file_with_options! {
 // never an error — unavailability must not red an otherwise-green run);
 // `--tactus-no-bridge` opts out (no bridge note at all). Both pinned
 // against the raw stderr.
-fn w4c_flip_test_dir(suffix: &str) -> std::path::PathBuf {
+fn tactus_e2e_test_dir(suffix: &str) -> std::path::PathBuf {
     let deps_dir = std::env::current_exe().unwrap();
     let deps_dir = deps_dir.parent().unwrap();
     let target_dir = deps_dir.parent().unwrap();
@@ -13651,7 +13651,7 @@ fn w4c_flip_test_dir(suffix: &str) -> std::path::PathBuf {
 
 #[test]
 fn test_bridge_default_on_skip_note() {
-    let dir = w4c_flip_test_dir("bridge_default_on");
+    let dir = tactus_e2e_test_dir("bridge_default_on");
     let code = format!(
         "{}{}\nverus! {{\nproof fn lemma_a(n: nat) ensures n + 0 == n by {{ omega }}\n}}\n",
         FEATURE_PRELUDE, USE_PRELUDE,
@@ -13671,7 +13671,7 @@ fn test_bridge_default_on_skip_note() {
 
 #[test]
 fn test_bridge_no_bridge_opt_out() {
-    let dir = w4c_flip_test_dir("bridge_no_bridge");
+    let dir = tactus_e2e_test_dir("bridge_no_bridge");
     let code = format!(
         "{}{}\nverus! {{\nproof fn lemma_a(n: nat) ensures n + 0 == n by {{ omega }}\n}}\n",
         FEATURE_PRELUDE, USE_PRELUDE,
@@ -13720,12 +13720,12 @@ fn test_bridge_red_pin() {
     );
     // Control: live bridge, no perturbation → green, trust-inventory
     // line printed.
-    let dir_ok = w4c_flip_test_dir("bridge_red_ok");
+    let dir_ok = tactus_e2e_test_dir("bridge_red_ok");
     let entry = dir_ok.join("test.rs");
     std::fs::write(&entry, &code).unwrap();
     let out = run_verus_with_env(
         &["--lean-backend"], &dir_ok, &entry, false, false,
-        &[("TACTUS_CORE_OUT", core_out.as_path())],
+        &[("TACTUS_CORE_OUT", core_out.to_str().unwrap())],
     );
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(out.status.success(), "control run failed:\n{}", stderr);
@@ -13737,13 +13737,12 @@ fn test_bridge_red_pin() {
     // Red: the perturb knob drifts the emitted cert → the bridge fails
     // → verification error naming the leaf (O7 "goal drift against
     // reference").
-    let dir_red = w4c_flip_test_dir("bridge_red_red");
+    let dir_red = tactus_e2e_test_dir("bridge_red_red");
     let entry = dir_red.join("test.rs");
     std::fs::write(&entry, &code).unwrap();
-    let perturb = std::path::Path::new("red_pin_drift");
     let out = run_verus_with_env(
         &["--lean-backend"], &dir_red, &entry, false, false,
-        &[("TACTUS_CORE_OUT", core_out.as_path()), ("TACTUS_BRIDGE_PERTURB", perturb)],
+        &[("TACTUS_CORE_OUT", core_out.to_str().unwrap()), ("TACTUS_BRIDGE_PERTURB", "red_pin_drift")],
     );
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(!out.status.success(), "perturbed cert must red the run; stderr:\n{}", stderr);
@@ -13772,24 +13771,8 @@ fn test_bridge_red_pin() {
 // marker assertion fails; post-fix the rebuild flips them.
 #[test]
 fn test_p3a_stmts_olean_skew_forces_rebuild() {
-    let deps_dir = std::env::current_exe().unwrap();
-    let deps_dir = deps_dir.parent().unwrap();
-    let target_dir = deps_dir.parent().unwrap();
-    let test_binary = std::env::args().next().unwrap();
-    let test_binary = std::path::PathBuf::from(test_binary);
-    let test_binary = test_binary.file_name().unwrap().to_str().unwrap().to_string();
-    let mk_dir = |suffix: &str| {
-        let parent = target_dir.join("test_inputs");
-        std::fs::create_dir_all(&parent).unwrap();
-        let dir = parent.join(format!("{test_binary}-test_p3a_skew_{suffix}"));
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir).unwrap();
-        }
-        std::fs::create_dir(&dir).unwrap();
-        dir
-    };
-    let dir_a = mk_dir("a");
-    let dir_b = mk_dir("b");
+    let dir_a = tactus_e2e_test_dir("test_p3a_skew_a");
+    let dir_b = tactus_e2e_test_dir("test_p3a_skew_b");
     let mk_code = |ensures: &str| format!(
         "{}{}\nverus! {{\nspec fn double(n: nat) -> nat {{ n + n }}\n\nproof fn lemma_a(n: nat) ensures {} by {{ unfold double; omega }}\n}}\n",
         FEATURE_PRELUDE, USE_PRELUDE, ensures,

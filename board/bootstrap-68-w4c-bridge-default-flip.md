@@ -320,6 +320,44 @@ All six design points landed as frozen, no deviations:
 b67 mechanism working as designed), 2m11s; e2e 829/2 (+3 new tests
 green); probes 9/11/13/14/17/37/38 ✓; fixture golden byte-stable.
 
+## Post-landing design-review follow-ups (2026-08-03, Danielle-requested)
+
+The review of the three landings found ONE real hole plus minor
+cleanups; all landed in this follow-up:
+
+- **R1 (the regret): pkg srckeys didn't cover their stmt imports.** A
+  pkg module references helper stmt defs BY NAME, so its text is
+  unchanged when a helper's statement changes — and Lean never
+  re-checks olean contents on load. Staged live (lemma_b → lemma_a
+  chain; interrupt-simulated fresh stmt `.lean` + stale stmt olean):
+  the stmt olean rebuilt (F2 worked) but lemma_b's pkg olean stayed
+  cached and the gate GREEN-stamped a semantically stale proof — a
+  cold tree would red where the warm tree greened. Fix: `pkg_srckey`
+  (`w4c2`) mixes the CURRENT `.lean` content of every imported
+  `TactusStmts_*` module (imports read off the artifact via
+  `driver_client::header_imports`, now pub(crate)) — the stmt's own
+  srckey FILE can't be used, it can itself be stale at decision time.
+  Helpers restructured key-based (`srckey_hash` + `stmt_srckey` /
+  `pkg_srckey` builders; `olean_fresh` / `record_olean_built` take
+  precomputed keys). Re-validated end-to-end: the staged skew now
+  rebuilds BOTH the stmt olean and the dependent pkg olean; warm
+  repeat rebuilds nothing. Unit pin `pkg_srckey_covers_stmt_imports`
+  (own-content flip, import-content flip with pkg text untouched,
+  missing import → not-fresh).
+- **R3:** `run_verus_with_env` env values `&Path` → `&str` (the
+  `Path::new("red_pin_drift")` wrap was a smell).
+- **R4:** the M5e `cacheable` comments now say srckey-proven
+  freshness, not "its olean exists".
+- **R11:** one shared `tactus_e2e_test_dir` helper for the P3(a) +
+  flip e2e pins.
+- **Considered and defended (no change):** the `TACTUS_BRIDGE_PERTURB`
+  knob lives in the trusted serializer but can only force RED (drift
+  → bridge fails → error), never green — it cannot manufacture a
+  false pass; the alternative (bridge-side text surgery) is more
+  fragile. Skip-note-per-run without core oleans stays (intended
+  loudness). `.olean.srckey` is correctly excluded from
+  `core_olean_hash`'s `*.olean` glob (extension is `srckey`).
+
 **B2 gate conditions — final status:** P2 (detector implemented +
 pinned, corpus population 0) ✓; P3(a) (race repair + srckey markers +
 pins) ✓; P3(b) (emitter fingerprint, b67) ✓; cost story (~1.4% warm,
