@@ -225,40 +225,60 @@ def Tactus.strGetChar (s : String) (i : Int) : Nat :=
 -- comparison); for opaque / cross-crate types that have no `.height`
 -- companion — notably `vstd::seq::Seq`, whose `axiom_seq_index_decreases`
 -- states `s[i]` is height-smaller than `s` — it falls back to this
--- relation. Left uninterpreted (an `axiom`, not a `def`): it carries
--- the termination fact faithfully without committing to a height model
--- for opaque types. The two operands have distinct types (`s[i] : A`
+-- relation. The two operands have distinct types (`s[i] : A`
 -- vs `s : Seq A`), hence the two type parameters.
-axiom Tactus.heightLt {α : Type u} {β : Type v} (a : α) (b : β) : Prop
+--
+-- Declared `opaque` (milestone-F prelude hygiene, b82): an unspecified
+-- but FIXED Prop family. The companion audit found nothing assumed
+-- *about* the relation (no well-foundedness, no companion facts — the
+-- SST cert path never emits it; only vstd's broadcast axioms assert
+-- specific instances *of* it as hypotheses), so any interpretation
+-- validates every use, and an opaque witness picks one without adding
+-- an axiom to the closure. Do NOT give it an explicit witness: that
+-- would commit to an interpretation (e.g. everywhere-True), which the
+-- "no assumption that it holds or fails" stance deliberately avoids.
+opaque Tactus.heightLt {α : Type u} {β : Type v} (a : α) (b : β) : Prop
 
 -- Spec-mode array indexing (`BinaryOp::Index` — `a[i]` on `[T; N]` in
 -- spec code, and vstd's `array_view` body `Seq::new(N, |i| a[i])`).
 -- `[T; N]` renders as Lean core's length-indexed `Vector α n`; the
 -- length is implicit here so the rendered call stays `Tactus.index a i`.
--- Left uninterpreted: vstd's array axioms (`lemma_array_index`,
--- `array_view` roundtrips) give it in-range meaning; out-of-range is
--- unspecified, matching Verus's treatment of spec indexing as a total
--- but unconstrained function. `[Nonempty α]`-bracketed (N2,
+--
+-- Defined (milestone-F prelude hygiene, b82 — was an uninterpreted
+-- axiom): in-range (`0 ≤ i ∧ i.toNat < n`) returns the real element,
+-- out-of-range is `Classical.choice` over the `[Nonempty α]` instance —
+-- still unspecified, matching Verus's treatment of spec indexing as a
+-- total but unconstrained function. The def realizes ONE model of the
+-- old axiom (model-narrowing): vstd's array axioms (`lemma_array_index`,
+-- `array_view` roundtrips) stay well-typed and stay consistent, and the
+-- name leaves every `#print axioms` closure. `noncomputable` because
+-- `Classical.choice` isn't code-generable (Tactus never executes the
+-- generated Lean). `[Nonempty α]`-bracketed (N2,
 -- DESIGN-nonempty-axioms.md): an unbracketed version inhabits EVERY
 -- α (the empty vector inhabits `Vector Empty 0`, so `Tactus.index
 -- (α := Empty) ⟨#[], rfl⟩ 0 : Empty` derived False — the
 -- test_soundness_hole_prelude exploit pin). Under the bracket the
--- axiom is satisfiable, matching Verus's spec-types-are-inhabited
+-- declaration is satisfiable, matching Verus's spec-types-are-inhabited
 -- guarantee where it actually holds instead of globally axiomatizing
 -- it. Generated theorems that index at a typ param carry the matching
 -- `[Nonempty]` binder (nonempty.rs Seed 3).
-axiom Tactus.index {α : Type u} [Nonempty α] {n : Nat} (a : Vector α n) (i : Int) : α
+noncomputable def Tactus.index {α : Type u} [Nonempty α] {n : Nat} (a : Vector α n) (i : Int) : α :=
+  if h : 0 ≤ i ∧ i.toNat < n then a[i.toNat]'h.2 else Classical.choice inferInstance
 
 -- `has_resolved(x)` — Verus's mutable-reference resolution predicate
 -- (`UnaryOpr::HasResolved`). For `&mut T` it states the prophetic value
 -- equals the current value; for primitives it's trivially true; for
 -- datatypes it's recursive. Tactus doesn't model resolution (it drops
 -- `assume(has_resolved(..))` synthetic statements), so the predicate is
--- rendered as an uninterpreted Prop rather than collapsed to its bare
--- argument — leaving its truth abstract keeps cross-crate axioms that
--- mention it (e.g. vstd's `axiom_vec_has_resolved`) well-typed and sound
--- (no assumption that it holds or fails). Same pattern as `heightLt`.
-axiom Tactus.hasResolved {α : Type u} (a : α) : Prop
+-- rendered as an `opaque` unspecified-but-fixed Prop (milestone-F
+-- prelude hygiene, b82 — was an axiom) rather than collapsed to its
+-- bare argument — keeping its truth abstract keeps cross-crate axioms
+-- that mention it (e.g. vstd's `axiom_vec_has_resolved`) well-typed and
+-- sound (no assumption that it holds or fails). Nothing ever PROVES a
+-- `hasResolved` goal; vstd axioms carry it purely as hypothesis, so any
+-- interpretation validates every use. Same pattern as `heightLt` — and
+-- the same ban on an explicit witness applies.
+opaque Tactus.hasResolved {α : Type u} (a : α) : Prop
 
 -- ── Axiom-closure enforcement (DESIGN-axiom-closure-check.md) ────────
 -- `#tactus_check_axioms thm [ax₁, …]` computes `thm`'s axiom closure
@@ -267,7 +287,10 @@ axiom Tactus.hasResolved {α : Type u} (a : α) : Prop
 --   • Lean's classical core (propext, Classical.choice, Quot.sound),
 --   • this prelude's own axioms (hardcoded HERE so they version with
 --     this file — the olean content-hash rebuild keeps the command
---     and the axiom set in sync by construction),
+--     and the axiom set in sync by construction). Post-b82 that set is
+--     JUST the `arch_word_bits` pair — the honest platform assumption;
+--     `Tactus.index`/`hasResolved`/`heightLt` are now a def/two opaques
+--     and never appear in any closure,
 --   • compiled-execution licenses (Lean.ofReduceBool /
 --     Lean.trustCompiler — what bv_decide's native LRAT check needs;
 --     allowed-but-inventoried, the design doc's §3 policy knob),
@@ -283,7 +306,6 @@ elab "#tactus_check_axioms" thm:ident "[" expected:ident,* "]" : command => do
     let base : List Name :=
       [``propext, ``Classical.choice, ``Quot.sound,
        `arch_word_bits, `arch_word_bits_valid,
-       `Tactus.heightLt, `Tactus.index, `Tactus.hasResolved,
        ``Lean.ofReduceBool, ``Lean.trustCompiler]
     let mut allowed : NameSet := {}
     for n in base do
