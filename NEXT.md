@@ -1,5 +1,43 @@
 # NEXT — bootstrap work queue (2026-07-21; superseded 2026-07-24)
 
+**2026-08-06: row 11b (A6-full ∀-binder telescope arm) DONE — card
+`board/bootstrap-81-a6full-forall-binder-telescope.md` (completion
+record); the `assert-forall` census tag is RETIRED.** Two-era landing
+per the frozen design. **Era 1** (`0f311a66`, model-only byte-stability
+era): `StmData::DeadEnd` 1→3 fields (`scope_binders`/`scope_bounds` —
+the Loop havoc-set shape), refWp/wp_stm/exec_safe_f thread
+`frame_append(f, mod_var_frames(...))`, `wp_stm_sound` absorbed it with
+ZERO statement changes (the b74 dispatcher payoff); needed
+`frame_append_fnil_right` (right identity — NOT definitional) + the 4
+missing `u_fapp_*` per-ctor unfolds + `u_mvf_nil_nil`, all per the
+proof-authoring idioms (rec_1 eq-lemma gap: no `rw [lib.frame_append]`
+anywhere, unfolds enter as HYPS). **Era 2** (serializer arm + tag
+deletion): the DeadEnd arm transcribes skolems (SAME
+`collect_assert_by_vars_in` detection, now constructive) with
+production's `already_bound` dedup mirrored via the new
+`forall_bound_names` walk-path set (DeadEnd + Loop mod-var + N2 IfCtor
+binders; branch_state-bundled, loop-exit restored). **Era-1 latent bug
+caught by era 2's first subjects:** the Nil/Nil emission passed the
+list slots UNBOXED (`Box<BinderList>` fields) — ill-typed-by-
+construction, invisible because NO corpus cert had a DeadEnd node (the
+2 rejected tgt fns were the only ones). F28/F29 CLOSE-BROKE on the
+elaboration error, `box_()` fixed. **Results: both tgt subjects
+(`lemma_runtime_word_view_subrange`/`append`) CERTIFY and bridge-CLOSE
+on their first live run — probe11 13/13; fixture F28 (Int, NoBound,
+mid-proposition) + F29 (u64, Bound, leading-prefix) close probe9;
+probe13 → 25 classes (3 new scope kills: binder drop / bound drop /
+typ flip).** Battery: gate 298/0 (+7 fns) + pkg 54 + discharge 205/0
++ bridge 172/172 live, units 437+7/0, probes 9/11/13/14/17/37/38 ✓,
+golden re-vendored (pure @rust: line drift), D-column pin
+`deadend_scope_binder_pin` in tactus-core. **NEXT per the endgame map:
+milestone F gap-work (prelude hygiene / vstd package / dual-backend
+differential) — milestone A is now FULLY CLOSED (A1–A7 all landed);
+milestone E (W8 authority flip, b13) remains gated on the B SOAK
+(default-on across the corpus, two weeks, zero unclassified drift;
+soak started 2026-08-03).** Also standing: port the decreasing_by
+fixes (`00827513`) to `tactus/source`; class-3 residual stays HELD for
+the Z3-tactic-recreation arc (Danielle 2026-08-02).
+
 **2026-08-06: row 11b (A6-full ∀-binder telescope arm) CARDED —
 `board/bootstrap-81-a6full-forall-binder-telescope.md`, DESIGN PROPOSED,
 awaiting Danielle's review before implementation.** Step-0 evidence

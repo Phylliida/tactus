@@ -20,7 +20,7 @@ set_option autoImplicit false
 -- leaf 6: ⟦0 ≤ e ∧ e < 18446744073709551616⟧
 -- leaf 7: ⟦h_e_bound⟧
 -- leaf 8: ⟦lib.frame_after pp f (lib.StmData.Assume 0 e) = lib.frame_append f (lib.FrameList.FHyp 0 e (Tactus.Box.mk lib.FrameList.FNil))⟧
--- leaf 9: ⟦/- @rust:tactus-core/lib.rs:6402:13 -/ lib.frame_after pp f (lib.StmData.Assume 0 e) = lib.frame_append f (lib.FrameList.FHyp 0 e (Tactus.Box.mk lib.FrameList.FNil))⟧
+-- leaf 9: ⟦/- @rust:tactus-core/lib.rs:6418:13 -/ lib.frame_after pp f (lib.StmData.Assume 0 e) = lib.frame_append f (lib.FrameList.FHyp 0 e (Tactus.Box.mk lib.FrameList.FNil))⟧
 -- leaf 10: ⟦lib.frame_after⟧
 -- leaf 11: ⟦lib.StmData⟧
 
@@ -33,7 +33,7 @@ set_option autoImplicit false
 example : lib.stm_size cert_u_fa_assume_sst = 2 := by decide
 
 -- ── production goals (N3b) ──────────────────────────────────
--- goal 0: _tactus_postcondition_u_fa_assume_at_lib_6402_13_1
+-- goal 0: _tactus_postcondition_u_fa_assume_at_lib_6418_13_1
 @[reducible] def cert_u_fa_assume_goals : lib.GoalList :=
   lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 2 3 (Tactus.Box.mk (lib.GoalData.All 4 5 (Tactus.Box.mk (lib.GoalData.All 7 6 (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.Atom 9))))))))))) (Tactus.Box.mk lib.GoalList.Nil)
 

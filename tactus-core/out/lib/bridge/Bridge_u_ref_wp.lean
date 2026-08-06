@@ -18,7 +18,7 @@ set_option autoImplicit false
 -- leaf 4: ⟦s⟧
 -- leaf 5: ⟦lib.StmData⟧
 -- leaf 6: ⟦lib.ref_wp c s = lib.wp_stm (lib.poisoned_props c) (lib.seed_frame c) s⟧
--- leaf 7: ⟦/- @rust:tactus-core/lib.rs:6382:13 -/ lib.ref_wp c s = lib.wp_stm (lib.poisoned_props c) (lib.seed_frame c) s⟧
+-- leaf 7: ⟦/- @rust:tactus-core/lib.rs:6398:13 -/ lib.ref_wp c s = lib.wp_stm (lib.poisoned_props c) (lib.seed_frame c) s⟧
 -- leaf 8: ⟦lib.ref_wp⟧
 -- leaf 9: ⟦lib.GoalList⟧
 -- leaf 10: ⟦lib.wp_stm⟧
@@ -26,7 +26,7 @@ set_option autoImplicit false
 -- leaf 12: ⟦lib.seed_frame⟧
 -- leaf 13: ⟦lib.LeafList⟧
 -- leaf 14: ⟦lib.poisoned_props⟧
--- leaf 15: ⟦tactus-core/lib.rs:6382:13⟧
+-- leaf 15: ⟦tactus-core/lib.rs:6398:13⟧
 
 @[reducible] def cert_u_ref_wp_ctx : lib.FnCtxData :=
   (lib.FnCtxData.mk lib.BinderList.Nil (lib.BinderList.Cons 0 1 (Tactus.Box.mk (lib.BinderList.Cons 4 5 (Tactus.Box.mk lib.BinderList.Nil)))) (lib.ParamBoundList.Bound 3 2 (Tactus.Box.mk (lib.ParamBoundList.NoBound (Tactus.Box.mk lib.ParamBoundList.Nil)))) lib.BinderList.Nil lib.MutParamList.Nil (lib.LeafList.Cons 6 (Tactus.Box.mk lib.LeafList.Nil)) lib.LeafList.Nil lib.PropDeepList.Nil 1)
@@ -37,7 +37,7 @@ set_option autoImplicit false
 example : lib.stm_size cert_u_ref_wp_sst = 2 := by decide
 
 -- ── production goals (N3b) ──────────────────────────────────
--- goal 0: _tactus_postcondition_u_ref_wp_at_lib_6382_13_1
+-- goal 0: _tactus_postcondition_u_ref_wp_at_lib_6398_13_1
 @[reducible] def cert_u_ref_wp_goals : lib.GoalList :=
   lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 3 2 (Tactus.Box.mk (lib.GoalData.All 4 5 (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.SpanMark 15 (Tactus.Box.mk (lib.ExprData.BinOp 0 (Tactus.Box.mk (lib.ExprData.AppN 8 (Tactus.Box.mk (lib.ExprList.Cons (Tactus.Box.mk (lib.ExprData.Atom 0)) (Tactus.Box.mk (lib.ExprList.Cons (Tactus.Box.mk (lib.ExprData.Atom 4)) (Tactus.Box.mk lib.ExprList.Nil))))))) (Tactus.Box.mk (lib.ExprData.AppN 10 (Tactus.Box.mk (lib.ExprList.Cons (Tactus.Box.mk (lib.ExprData.App 14 (Tactus.Box.mk (lib.ExprData.Atom 0)))) (Tactus.Box.mk (lib.ExprList.Cons (Tactus.Box.mk (lib.ExprData.App 12 (Tactus.Box.mk (lib.ExprData.Atom 0)))) (Tactus.Box.mk (lib.ExprList.Cons (Tactus.Box.mk (lib.ExprData.Atom 4)) (Tactus.Box.mk lib.ExprList.Nil)))))))))))))))))))) (Tactus.Box.mk lib.GoalList.Nil)
 

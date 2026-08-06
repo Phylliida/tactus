@@ -1,26 +1,24 @@
-# HANDOFF — milestone B COMPLETE (b68 bridge default flip) — 2026-08-03
+# HANDOFF — row 11b (A6-full) COMPLETE; milestone A FULLY CLOSED — 2026-08-06
 
-**For the next session: milestone B (b67 caching + b68 flip) is DONE —
-the kernel bridge is default-on in package mode and milestone B closes
-bootstrap-09 (W4). What remains per the endgame map: row 11b (A6-full,
-the ∀-binder telescope arm that retires the `assert-forall` census
-tag — now unblocked, "post-flip" per Q4), milestone F gap-work
-(prelude hygiene / vstd-as-package / dual-backend differential), and
-milestone E (W8 authority flip, b13) which is GATED ON THE B SOAK
-(default-on across the corpus, two weeks, zero unclassified drift —
-the soak started 2026-08-03).** The ordered program map is
-`DESIGN-bootstrap-endgame.md` (milestones + policy P1–P4), the queue
-header is `NEXT.md`, per-brick detail is `board/*.md`. B2's full
-record (both design reviews + completion records + the P3(a) race
-diagnosis) is `board/bootstrap-68-w4c-bridge-default-flip.md`.
+**For the next session: b81 (the ∀-binder telescope arm, endgame row
+11b) is DONE — the `assert-forall` census tag is retired and milestone
+A (A1–A7 coverage arms) is now FULLY CLOSED. What remains per the
+endgame map: milestone F gap-work (prelude hygiene / vstd-as-package /
+dual-backend differential — three independent small bricks, pick up in
+gap sessions) and milestone E (W8 authority flip, b13) which is GATED
+ON THE B SOAK (bridge default-on across the corpus, two weeks of active
+dev, zero unclassified drift — the soak started 2026-08-03).** The
+ordered program map is `DESIGN-bootstrap-endgame.md` (milestones +
+policy P1–P4), the queue header is `NEXT.md`, per-brick detail is
+`board/*.md`. b81's full record (design + both eras' completion notes)
+is `board/bootstrap-81-a6full-forall-binder-telescope.md`.
 
 ## Where you are
 
 - Worktree `/home/bepis/prog/verus-cad/tactus-bootstrap`, branch
-  `bootstrap`, clean tree. HEAD = `85e7b0cd` (the flip; P2 detector
-  `d6b2b367`; P3(a) race+markers `7f6dc814`).
-- The mirror model: `tactus-core/lib.rs` (verified BY the worktree
-  binary). The trusted serializer:
+  `bootstrap`. HEAD = era-1 `0f311a66` + the era-2 landing commit (see
+  `git log`). The mirror model: `tactus-core/lib.rs` (verified BY the
+  worktree binary). The trusted serializer:
   `source/lean_verify/src/sst_serialize.rs` (+ `sst_to_lean.rs`,
   `expr_shared.rs`, `to_lean_sst_expr.rs`, `typed_expr.rs`).
 - Memory: `memory/project_tactus_bootstrap_program.md` in the verus-cad
@@ -28,87 +26,80 @@ diagnosis) is `board/bootstrap-68-w4c-bridge-default-flip.md`.
 
 ## State (all green at handoff)
 
-- tactus-core gate **291/0** + package gate 54 modules + Link discharge
-  **198/0-pending** — bridge now DEFAULT-ON: **166 obligations
-  bridge-checked** live (166 passed, 0 failed; 0 cached on a rebuilt
-  binary — the b67 emitter fingerprint invalidates correctly; warm
-  all-cached ≈ b67's 1.4%). The gate note carries the standing
-  trust-inventory line: "…; 174 fns census-excluded (tags:
-  call-unit-dest×32, rawvir-arm-pat×65, rawvir-block×4, rawvir-ctor×38,
+- tactus-core gate **298/0** + package gate 54 modules + Link discharge
+  **205/0-pending** — bridge default-on: **172 obligations
+  bridge-checked** live (172 passed, 0 failed; the b67 emitter
+  fingerprint invalidates correctly on every binary rebuild). Gate note
+  trust-inventory line: 175 fns census-excluded (tags:
+  call-unit-dest×33, rawvir-arm-pat×65, rawvir-block×4, rawvir-ctor×38,
   rawvir-dt-struct×5, rawvir-field-pat×8, rawvir-readplace-nonlocal×5,
-  typ-specfn×17)".
-- probe9 33/33 + probe11 11/11 CLOSE — zero honest-fails corpus-wide;
-  the fixture's `mix_trip2` (F27) census-rejects `hoist-mixed-shadow`
-  (the P2 MIX detector — implemented this session; it had never
-  existed). probes 13 (22 classes)/14/17/37/38 ✓, lean_verify units
-  **436+7/0**, golden byte-stable, e2e **829/2** (the 2 = documented
-  pre-existing examples pair flat_combine/tutorial_fifo).
-- probe20 **deferred** (vendored old-shape tgt defcerts; regenerate
-  with the tgt-slice emit when tgt work resumes — Danielle's
-  constraint: **NO full tgt gate runs**; probe11's scoped per-module
-  emits are the accepted lighter path).
-- The cert path has exactly ONE named trusted predicate left — the N2
+  typ-specfn×17) — **all unmodelable-construct tags; no
+  modeled-but-unmirrored tags remain** (`assert-forall` retired).
+- probe9 35/35 (incl. NEW F28/F29 assert-forall subjects) + probe11
+  **13/13** (incl. both `lemma_runtime_word_view_*` fns, certified and
+  bridge-closed on their first live run) — zero honest-fails
+  corpus-wide. probe13 **25 classes** (+3 scope-binder kills), probes
+  14/17/37/38 ✓, lean_verify units **437+7/0**, golden re-vendored
+  (pure @rust: line drift), e2e **829/2** (documented pre-existing
+  examples pair flat_combine/tutorial_fifo).
+- probe20 stays deferred (vendored old-shape tgt defcerts; no tgt
+  gates — Danielle's constraint; probe11's scoped per-module emits are
+  the accepted lighter path).
+- The cert path's ONE named trusted predicate remains the N2
   `branch_isvariant_of` detector (the milestone-E trust-shrink
-  target). The poison mark is derived reference-side.
+  target).
 
-## B2 deliverables now in the tree
+## What b81 landed (the short version)
 
-- **P3(a)**: stmts-olean staleness REPAIRED — it was a *race*:
-  `stmt_partition_for`'s check-then-act memo let the 64-thread first
-  wave run ~50 concurrent full-partition builds; the last insert
-  carried all-false changed flags, so genuinely-changed stmt modules
-  skipped olean rebuilds on ordinary warm gates (5/5 repro). F1 =
-  per-key `OnceLock` build-once (memo_cell pattern); F2 =
-  `<olean>.srckey` markers (FNV-1a of {`.lean` content, toolchain,
-  prelude}) with island-marker discipline consulted by every skip
-  path (stmt ensure, pkg cacheable ×3, gate leaf loop, driver wide
-  filter); F3 = unit pins + e2e
-  `test_p3a_stmts_olean_skew_forces_rebuild`. `*.srckey` gitignored.
-  One-time migration: first post-flip run on an existing out-tree
-  rebuilds every olean once (~2.5 min on tactus-core).
-- **P2**: `mark_flet_forced` / `mark_poison_forced` reject
-  `Err("hoist-mixed-shadow")` when `rename_env` is live at the forcing
-  site. Validated both directions (neutered detector → cert emits and
-  bridge proves goals_eq false — genuinely unbridgeable).
-- **The flip**: `tactus_bridge_resolved` (config.rs) — on iff
-  package-check resolves, `--tactus-no-bridge` opts out. Bridge
-  failure = verification error (`cert <leaf> (goal drift against
-  reference)`). Unavailability (no `$TACTUS_CORE_OUT`) = loud skip
-  note, never an error. Red-path pin: `TACTUS_BRIDGE_PERTURB`
-  (emission-side two-goal swap, loud, test-only) + `test_bridge_red_pin`
-  (control green / perturbed red). Inert under `--emit-lean` (gate
-  skipped at verifier.rs:3484).
+- `StmData::DeadEnd(BinderList, ParamBoundList, body)` — the
+  assert-forall skolem ∀-binders (production's `Wp::Scope` /
+  `push_mod_var_frames`) transcribed by the serializer's DeadEnd arm
+  (SAME `collect_assert_by_vars_in` detection, now constructive) and
+  wrapped reference-side via the Loop arm's `mod_var_frames`
+  (FBind + optional bound FHyp). `wp_stm_sound` absorbed the frame
+  change with zero statement changes.
+- `forall_bound_names` (serializer) mirrors production's
+  `already_bound` dedup: DeadEnd scope binders + Loop mod-var binders
+  + N2 IfCtor field binders, bundled into `branch_state`/
+  `restore_branch`, restored at loop exit and DeadEnd exit.
+- New model lemmas: `frame_append_fnil_right` (right identity, NOT
+  definitional — `frame_append` recurses on its first arg), 4 missing
+  `u_fapp_*` per-ctor unfolds, `u_mvf_nil_nil`,
+  `deadend_scope_binder_pin` (the D-column field-shape pin).
+- Fixture: F28 `forall_int_skolem` (Int, NoBound, mid-proposition ∀ —
+  the tgt shape) + F29 `forall_u64_skolem` (u64, Bound, leading-prefix
+  named-binder rendering) + `bumpi`/`bump` trigger helpers.
+- probe13 classes: `scope_binder_drop` / `scope_bound_drop` /
+  `scope_binder_typ_flip` (all baseline=1, kill=0).
 
 ## Next task candidates (Danielle picks)
 
-- **Row 11b (A6-full)** — the ∀-binder telescope arm: model
-  `assert forall` skolem binders in the stage-A telescope, retiring
-  the `assert-forall` census tag (b68 scaffolding, never permanent).
-  Card it first (step-0 evidence from the two
-  `lemma_runtime_word_view_*` fns; the census population is exactly
-  those 2 on tgt). Medium size.
-- **Milestone F gap-work** — prelude hygiene (definitionalize
-  `Tactus.index`/`Tactus.hasResolved`), vstd-as-package, dual-backend
-  differential runner.
-- **Milestone E (b13, W8 authority flip)** — BLOCKED on the soak:
-  bridge default-on across the corpus for two weeks of active dev
-  with zero unclassified drift errors (started 2026-08-03).
+- **Milestone F gap-work** — (1) prelude hygiene: definitionalize
+  `Tactus.index`/`Tactus.hasResolved`, audit the `heightLt`
+  companions; target = `arch_word_bits` pair as the only tactus axiom.
+  (2) vstd-as-package: Boundary shrinks to imports; remaining vstd
+  axioms become the explicit, closure-checked cross-crate trust
+  surface. (3) Dual-backend differential runner: same crate through
+  Verus-Z3 and tactus, fn-by-fn verdict comparison (machinery exists;
+  the brick is a runner + CI-shaped report). All independent, small.
+- **Milestone E (b13, W8 authority flip)** — BLOCKED on the soak
+  (started 2026-08-03; two weeks of default-on dev with zero
+  unclassified drift). After 11b the soak's census is cleaner than
+  ever (no modeled-but-unmirrored tags).
 - **Ops**: port the decreasing_by fixes (`00827513`) to
   `tactus/source` (tgt's check.sh binary carries the same bugs);
-  class-3 residual (11 errors in 3 recursive proof fns) stays HELD
-  for the Z3-tactic-recreation arc (Danielle 2026-08-02).
+  class-3 residual (11 errors in 3 recursive proof fns) stays HELD for
+  the Z3-tactic-recreation arc (Danielle 2026-08-02).
 
 ## Recipes (all verified)
 
 - tactus-core gate (from `tactus-bootstrap/`):
-  `TACTUS_LEAN_OUT=$PWD/tactus-core/out ./source/target-verus/release/verus --crate-type=lib --lean-backend -V cache tactus-core/lib.rs`
-  (~35s warm, ~10 min cold. The bridge now runs by default — loudly
-  skips without `TACTUS_CORE_OUT`; add
-  `TACTUS_CORE_OUT=$PWD/tactus-core/out/lib` for the live bridge,
-  ~2m11s warm live-bridge.)
+  `TACTUS_LEAN_OUT=$PWD/tactus-core/out TACTUS_CORE_OUT=$PWD/tactus-core/out/lib ./source/target-verus/release/verus --crate-type=lib --lean-backend -V cache tactus-core/lib.rs`
+  (~35s warm cached-bridge, ~2m live-bridge, ~10 min cold. Loudly
+  skips the bridge without `TACTUS_CORE_OUT`.)
 - Rebuild binary:
   `cd source && PATH="$PWD/../tools/vargo/target/release:$PATH" vargo build --release`
-  (vstd 1531/0).
+  (vstd 1531/0). **If vargo says "sources have changed": `cd tools/vargo && cargo build --release` first.**
 - Fixture certs:
   `rm -rf bootstrap-fixture/out && TACTUS_LEAN_OUT=$PWD/bootstrap-fixture/out ./source/target-verus/release/verus --crate-type=lib --lean-backend --emit-lean --tactus-emit-cert bootstrap-fixture/lib.rs`
   (run FROM tactus-bootstrap/ — CWD sets the `@rust:` loc prefix).
@@ -127,21 +118,36 @@ diagnosis) is `board/bootstrap-68-w4c-bridge-default-flip.md`.
   (~15 min; expect 829/2 — the 2 = documented pre-existing
   flat_combine/tutorial_fifo).
 
-## Gotchas (all bitten)
+## Gotchas (all bitten; b81 additions first)
 
+- **Vocabulary ctor fields of list type are `Box<…>` — `box_()` the
+  slot terms.** Era 1 emitted the DeadEnd list slots unboxed; EVERY
+  era-1 cert was ill-typed-by-construction and no probe caught it
+  because no corpus cert had a DeadEnd NODE (the 2 rejected tgt fns
+  were the only DeadEnd-body subjects). The first live subject
+  CLOSE-BROKE on elaboration — check elaboration separately from goal
+  drift for a vocabulary arm's first subject.
+- **`frame_append(f, FNil) == f` is NOT definitional** (recursion on
+  the first arg) — use `frame_append_fnil_right`. And per the
+  rec_1 eq-lemma gap, never let a closer `rw [lib.frame_append]`
+  (hard elaboration abort, no `first |` backtracking): per-ctor
+  unfolds enter VCs as HYPS via `u_fapp_*` calls; recursive lemmas
+  need a custom `tactus_tactic` with the b79 termination-first
+  ordering (`cases f <;> omega` before zetaDelta simp).
+- **Arithmetic-only assert-forall bodies fail Verus trigger
+  inference** — give `#[trigger]` a cast-free spec-fn application
+  over the binder (fixture `bumpi`/`bump`). Spec-mode `+` on u64
+  promotes to int.
 - **Serialize verus invocations** — concurrent ones cause transient
   "Failed to spawn lake env lean" (memory:
   feedback_tactus_concurrent_lake_spawn).
 - **The fixture's 11 pre-existing per-fn errors skip the package gate**
   — the in-gate bridge NEVER runs on the fixture. In-gate bridge
-  subjects = green crates (tactus-core today). tgt's runtime-module
-  gate is currently RED under the worktree binary (pre-existing drift,
-  see FINDINGS-tgt-runtime-module-gate.md) — the in-gate bridge has no
-  tgt subject; probe11's external runner is the tgt lane.
+  subjects = green crates (tactus-core today). probe11's external
+  runner is the tgt lane.
 - **Hand-editing an on-disk cert does not red the bridge** — the gate
   re-emits certs from SST before bridging. The red channel is
-  emission-side drift — the e2e pin uses `TACTUS_BRIDGE_PERTURB` for
-  exactly this reason.
+  emission-side drift — the e2e pin uses `TACTUS_BRIDGE_PERTURB`.
 - probe runners must GLOB `~/.cache/tactus/prelude-*` (a pinned single
   prelude dir goes stale-red).
 - Nested `match` in spec fns breaks the one-line Lean emission (inner
@@ -151,7 +157,9 @@ diagnosis) is `board/bootstrap-68-w4c-bridge-default-flip.md`.
 - New vocabulary variants/fields: every probe's hand-rolled match over
   the datatype needs arms or Lean fills sorryAx (probe37's axiom audit
   catches it — by design); every probe gen.py splitter that parses the
-  cert literals needs its layout updated.
+  cert literals needs its layout updated. probe37's
+  `TactusLink_lib_exec.lean` is re-copied from the gate's pkg out —
+  no manual edit.
 - After deleting fields/params, grep for the removed name in ALL
   emission format strings — a format hole + stale arg compiles fine in
   Rust but emits ill-typed Lean (the clamped_inc If-node miss).
@@ -176,5 +184,5 @@ Rust), 5 predictability over special cases, 6 invest more work for
 cleaner code. Constraints: no full tgt gates; coder agents don't
 work well for implementation — do it yourself; commit freely in the
 worktree (small commits per logical landing); design-review BEFORE
-implementing anything non-trivial (the b67/b80/b68 addenda on the
+implementing anything non-trivial (the b67/b80/b68/b81 addenda on the
 cards are the model).

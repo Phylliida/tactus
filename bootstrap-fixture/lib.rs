@@ -18,6 +18,14 @@ verus! {
 // F1: plain spec fn
 pub open spec fn sq(x: nat) -> nat { x * x }
 
+// F28/F29 (b81) helpers: trigger-carrying spec fns for the
+// assert-forall bodies (arithmetic-only quantifier bodies fail
+// Verus's trigger inference; `bumpi(k)`/`bump(k)` give #[trigger] a
+// cast-free spec-fn application over the binder).
+pub open spec fn bumpi(k: int) -> int { k + 1 }
+
+pub open spec fn bump(k: u64) -> int { k + 1 }
+
 // F2: recursive spec fn, bare-Nat-param decreases (the W1.5 structural target)
 pub open spec fn tri(n: nat) -> nat
     decreases n
@@ -462,6 +470,39 @@ pub fn mix_trip2(x: u64) -> (r: u64)
     let b = i < 2000;
     assert(b);
     i
+}
+
+// F28 (b81, row 11b): assert-forall — INT skolem (ParamBoundList
+// NoBound; `has_typ(int) = True` enters as an ordinary Assume). The
+// let before the assert-forall pushes the skolem binder PAST the
+// leading-prefix latch (mid-proposition ∀ — the tgt
+// lemma_runtime_word_view_* shape): plain assert → hyps, guard
+// implication, inner assert in the by-block, ∀-fact re-enters via the
+// trailing Assume.
+proof fn forall_int_skolem(n: nat)
+    ensures n <= n + 1,
+{
+    let m = n + 1;
+    assert(n <= m);
+    assert forall|k: int| 0 <= k < (n as int) implies #[trigger] bumpi(k) <= (n as int) by {
+        assert(k <= (n as int));
+    }
+}
+
+// F29 (b81, row 11b): assert-forall — U64 skolem (ParamBoundList
+// Bound: production's push_mod_var_frames re-asserts the type bound
+// `0 ≤ k < 2^64` right after the ∀-binder). NO lets precede the
+// assert-forall, so the binder/bound pair lands in the goal's
+// LEADING PREFIX (named-theorem-binder rendering) — the D3 impl-time
+// `_h_hoist_k` ordinal check.
+proof fn forall_u64_skolem(n: u64)
+    requires n < 1000,
+    ensures n <= n + 1,
+{
+    assert(n <= n + 1);
+    assert forall|k: u64| k < n implies #[trigger] bump(k) <= (n as int) by {
+        assert(bump(k) <= (n as int));
+    }
 }
 
 } // verus!

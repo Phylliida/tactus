@@ -32,7 +32,7 @@ set_option autoImplicit false
 -- leaf 18: ⟦Tactus.Box lib.StmData⟧
 -- leaf 19: ⟦e⟧
 -- leaf 20: ⟦lib.wp_stm pp f (lib.StmData.If c cn nc ncn t e) = lib.goals_append (lib.wp_stm pp (lib.frame_append f (lib.FrameList.FHyp cn c (Tactus.Box.mk lib.FrameList.FNil))) t) (lib.wp_stm pp (lib.frame_append f (lib.FrameList.FHyp ncn nc (Tactus.Box.mk lib.FrameList.FNil))) e)⟧
--- leaf 21: ⟦/- @rust:tactus-core/lib.rs:5277:13 -/ lib.wp_stm pp f (lib.StmData.If c cn nc ncn t e) = lib.goals_append (lib.wp_stm pp (lib.frame_append f (lib.FrameList.FHyp cn c (Tactus.Box.mk lib.FrameList.FNil))) t.deref) (lib.wp_stm pp (lib.frame_append f (lib.FrameList.FHyp ncn nc (Tactus.Box.mk lib.FrameList.FNil))) e.deref)⟧
+-- leaf 21: ⟦/- @rust:tactus-core/lib.rs:5293:13 -/ lib.wp_stm pp f (lib.StmData.If c cn nc ncn t e) = lib.goals_append (lib.wp_stm pp (lib.frame_append f (lib.FrameList.FHyp cn c (Tactus.Box.mk lib.FrameList.FNil))) t.deref) (lib.wp_stm pp (lib.frame_append f (lib.FrameList.FHyp ncn nc (Tactus.Box.mk lib.FrameList.FNil))) e.deref)⟧
 -- leaf 22: ⟦lib.wp_stm⟧
 -- leaf 23: ⟦lib.GoalList⟧
 -- leaf 24: ⟦lib.StmData⟧
@@ -46,7 +46,7 @@ set_option autoImplicit false
 example : lib.stm_size cert_u_wp_if_sst = 2 := by decide
 
 -- ── production goals (N3b) ──────────────────────────────────
--- goal 0: _tactus_postcondition_u_wp_if_at_lib_5277_13_1
+-- goal 0: _tactus_postcondition_u_wp_if_at_lib_5293_13_1
 @[reducible] def cert_u_wp_if_goals : lib.GoalList :=
   lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 2 3 (Tactus.Box.mk (lib.GoalData.All 4 5 (Tactus.Box.mk (lib.GoalData.All 7 6 (Tactus.Box.mk (lib.GoalData.All 8 5 (Tactus.Box.mk (lib.GoalData.All 10 9 (Tactus.Box.mk (lib.GoalData.All 11 5 (Tactus.Box.mk (lib.GoalData.All 13 12 (Tactus.Box.mk (lib.GoalData.All 14 5 (Tactus.Box.mk (lib.GoalData.All 16 15 (Tactus.Box.mk (lib.GoalData.All 17 18 (Tactus.Box.mk (lib.GoalData.All 19 18 (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.Atom 21))))))))))))))))))))))))))) (Tactus.Box.mk lib.GoalList.Nil)
 

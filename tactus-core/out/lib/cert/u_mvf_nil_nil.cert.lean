@@ -12,7 +12,7 @@ set_option autoImplicit false
 
 -- ── leaf table ──────────────────────────────────────────────
 -- leaf 0: ⟦lib.mod_var_frames lib.BinderList.Nil lib.ParamBoundList.Nil = lib.FrameList.FNil⟧
--- leaf 1: ⟦/- @rust:tactus-core/lib.rs:6419:13 -/ lib.mod_var_frames lib.BinderList.Nil lib.ParamBoundList.Nil = lib.FrameList.FNil⟧
+-- leaf 1: ⟦/- @rust:tactus-core/lib.rs:6435:13 -/ lib.mod_var_frames lib.BinderList.Nil lib.ParamBoundList.Nil = lib.FrameList.FNil⟧
 -- leaf 2: ⟦lib.mod_var_frames⟧
 -- leaf 3: ⟦lib.FrameList⟧
 -- leaf 4: ⟦lib.ParamBoundList⟧
@@ -26,7 +26,7 @@ set_option autoImplicit false
 example : lib.stm_size cert_u_mvf_nil_nil_sst = 2 := by decide
 
 -- ── production goals (N3b) ──────────────────────────────────
--- goal 0: _tactus_postcondition_u_mvf_nil_nil_at_lib_6419_13_1
+-- goal 0: _tactus_postcondition_u_mvf_nil_nil_at_lib_6435_13_1
 @[reducible] def cert_u_mvf_nil_nil_goals : lib.GoalList :=
   lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.Atom 1))) (Tactus.Box.mk lib.GoalList.Nil)
 

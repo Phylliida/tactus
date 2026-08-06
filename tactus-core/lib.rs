@@ -5250,6 +5250,22 @@ pub proof fn u_wp_deadend(pp: LeafList, f: FrameList, bs: Box<BinderList>, bds: 
     ensures wp_stm(pp, f, StmData::DeadEnd(bs, bds, b))
         == wp_stm(pp, frame_append(f, mod_var_frames(*bs, *bds)), *b)
 {}
+
+/// b81 structural pin (the D in-model column's field-shape pin for the
+/// new DeadEnd slots): the scope-binder arm wraps each in-scope goal
+/// with the ∀-binder frame — one skolem (id 15, typ leaf 16, NoBound)
+/// over one Assert, kernel-computed end-to-end.
+proof fn deadend_scope_binder_pin()
+    ensures
+        wp_stm(LeafList::Nil, FrameList::FNil,
+            StmData::DeadEnd(
+                Box::new(BinderList::Cons(15, 16, Box::new(BinderList::Nil))),
+                Box::new(ParamBoundList::NoBound(Box::new(ParamBoundList::Nil))),
+                Box::new(StmData::Assert(RawExp::Lit(7, TypData::TyInt), 0, 0))))
+            == GoalList::Cons(
+                Box::new(GoalData::All(15, 16, Box::new(GoalData::LeafE(ExprData::Lit(7))))),
+                Box::new(GoalList::Nil))
+{}
 pub proof fn u_wp_aqnl(pp: LeafList, f: FrameList, b: Box<StmData>, tq: RawExp)
     ensures wp_stm(pp, f, StmData::AssertQueryNl(b, tq))
         == goals_append(

@@ -19,7 +19,7 @@ set_option autoImplicit false
 -- leaf 5: ⟦Tactus.Box lib.StmData⟧
 -- leaf 6: ⟦b⟧
 -- leaf 7: ⟦lib.frame_after pp f (lib.StmData.Seq a b) = lib.frame_after pp (lib.frame_after pp f a) b⟧
--- leaf 8: ⟦/- @rust:tactus-core/lib.rs:6409:13 -/ lib.frame_after pp f (lib.StmData.Seq a b) = lib.frame_after pp (lib.frame_after pp f a.deref) b.deref⟧
+-- leaf 8: ⟦/- @rust:tactus-core/lib.rs:6425:13 -/ lib.frame_after pp f (lib.StmData.Seq a b) = lib.frame_after pp (lib.frame_after pp f a.deref) b.deref⟧
 -- leaf 9: ⟦lib.frame_after⟧
 -- leaf 10: ⟦lib.StmData⟧
 
@@ -32,7 +32,7 @@ set_option autoImplicit false
 example : lib.stm_size cert_u_fa_seq_sst = 2 := by decide
 
 -- ── production goals (N3b) ──────────────────────────────────
--- goal 0: _tactus_postcondition_u_fa_seq_at_lib_6409_13_1
+-- goal 0: _tactus_postcondition_u_fa_seq_at_lib_6425_13_1
 @[reducible] def cert_u_fa_seq_goals : lib.GoalList :=
   lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 2 3 (Tactus.Box.mk (lib.GoalData.All 4 5 (Tactus.Box.mk (lib.GoalData.All 6 5 (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.Atom 8))))))))))) (Tactus.Box.mk lib.GoalList.Nil)
 

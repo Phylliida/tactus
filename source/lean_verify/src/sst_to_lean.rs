@@ -6948,9 +6948,9 @@ fn collect_assert_by_vars<'a>(
 // Split out (endgame A6-short) so the cert serializer can run the SAME
 // detection from its own `LocalDeclKind::AssertByVar` map — a DeadEnd
 // scope referencing skolems means production ∀-binds them in the goal
-// telescope, which stage A has no quantifier-binder arm for; the
-// serializer census-rejects loud (`assert-forall`) instead of emitting
-// a cert that cannot bridge.
+// telescope. The serializer's DeadEnd arm transcribes them into the
+// stage-A `scope_binders`/`scope_bounds` slots (bootstrap-81, endgame
+// row 11b — the A6-short `assert-forall` census tag is retired).
 pub(crate) fn collect_assert_by_vars_in<'a>(
     stm: &Stm,
     assert_by_var_typs: &HashMap<&'a VarIdent, &'a Typ>,

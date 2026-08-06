@@ -680,10 +680,10 @@ struct Serializer<'a> {
     /// `LocalDeclKind::AssertByVar` locals (assert-forall skolems),
     /// mirroring `WpCtx.assert_by_var_typs` — a DeadEnd scope
     /// referencing any of these ∀-binds them in production's goal
-    /// telescope (`Wp::Scope.scope_vars`), which stage A cannot
-    /// express: census-reject loud (`assert-forall`, endgame
-    /// A6-short). The real quantifier-binder arm is planned post-flip
-    /// (endgame table row 11b).
+    /// telescope (`Wp::Scope.scope_vars`). The DeadEnd arm transcribes
+    /// them into the node's `scope_binders`/`scope_bounds` slots
+    /// (bootstrap-81, endgame row 11b; the A6-short `assert-forall`
+    /// census tag is retired — the telescope arm IS this arm).
     assert_by_var_typs: std::collections::HashMap<&'a vir::ast::VarIdent, &'a Typ>,
     /// The declared return var's NAME text (`sanitize`d, finding-4's
     /// `pending_ret_name` companion) — the eq-leaf pair for the hoisted
@@ -713,6 +713,17 @@ struct Serializer<'a> {
     /// `mark_poison_forced`) and census-rejected loud,
     /// `hoist-mixed-shadow`, endgame P2/b68.)
     bound_names: std::collections::HashSet<String>,
+    /// Names pushed as ∀-BINDERS on the current walk path — production's
+    /// `Wp::Scope` `already_bound` filter set (CtxFrame::Binder frames
+    /// ONLY, not lets/hyps): DeadEnd assert-forall scope binders (the
+    /// DeadEnd arm), Loop mod-var binders (`loop_stm`), N2 IfCtor field
+    /// binders (`ctor_fork_frames`, then-path). The DeadEnd arm's dedup
+    /// filter READS this set (bootstrap-81: a nested assert-forall
+    /// referencing an outer skolem must NOT rebind it). Bundled into
+    /// `branch_state`/`restore_branch` so sibling branches don't leak;
+    /// the Loop arm restores it at loop exit (production's post-loop
+    /// obl drops the mod-var binders).
+    forall_bound_names: std::collections::HashSet<String>,
     /// The active shadow renames (source name → freshened name), from
     /// `fresh_let_name` on a taken let dest. Applied to every
     /// subsequently rendered LExpr (hyp props, assign rhs, conds, ret
@@ -1091,15 +1102,16 @@ impl<'a> Serializer<'a> {
     /// AssertQueryNl): the per-path state that must not leak across
     /// branches. The hyp ORDINAL has its own snapshot rule (each branch
     /// resumes from the pre-If count); this bundles the rest.
-    fn branch_state(&self) -> (std::collections::HashSet<String>, HashMap<String, crate::lean_name::LeanName>, bool, bool) {
-        (self.bound_names.clone(), self.rename_env.clone(), self.flet_forced, self.poison_forced)
+    fn branch_state(&self) -> (std::collections::HashSet<String>, std::collections::HashSet<String>, HashMap<String, crate::lean_name::LeanName>, bool, bool) {
+        (self.bound_names.clone(), self.forall_bound_names.clone(), self.rename_env.clone(), self.flet_forced, self.poison_forced)
     }
 
-    fn restore_branch(&mut self, state: (std::collections::HashSet<String>, HashMap<String, crate::lean_name::LeanName>, bool, bool)) {
+    fn restore_branch(&mut self, state: (std::collections::HashSet<String>, std::collections::HashSet<String>, HashMap<String, crate::lean_name::LeanName>, bool, bool)) {
         self.bound_names = state.0;
-        self.rename_env = state.1;
-        self.flet_forced = state.2;
-        self.poison_forced = state.3;
+        self.forall_bound_names = state.1;
+        self.rename_env = state.2;
+        self.flet_forced = state.3;
+        self.poison_forced = state.4;
     }
 
     /// Apply the active shadow renames to a rendered LExpr
@@ -1384,6 +1396,11 @@ impl<'a> Serializer<'a> {
             let id = self.text_leaf(&fname);
             let ty = self.typ_leaf(&fty);
             entries.push((id, ty));
+            // b81: the N2 field binders are CtxFrame::Binder frames
+            // (production's `branch_ctor_frames`) — they join the
+            // DeadEnd dedup set on the then-path (restored at the If
+            // boundary via `branch_state`).
+            self.forall_bound_names.insert(fname.clone());
             args.push(LExpr::var_synthetic(fname));
         }
         let ctor = LExpr::var_synthetic(format!("{}.{}", dt_lean, var_san));
@@ -3295,7 +3312,7 @@ impl<'a> Serializer<'a> {
                 // Undiagnosed CLOSE-BROKE without the tag; population 0
                 // (diverging branches are exempt — nothing survives
                 // them). Sharp reject until a subject pins the modeling.
-                let base_forced = (bstate.2, bstate.3);
+                let base_forced = (bstate.3, bstate.4);
                 if (!stm_diverges(then_stm) && then_forced != base_forced)
                     || (else_stm.as_ref().map_or(false, |s| !stm_diverges(s))
                         && else_forced != base_forced)
@@ -3342,27 +3359,63 @@ impl<'a> Serializer<'a> {
             }
 
             StmX::DeadEnd(inner) => {
-                // Assert-forall skolems (endgame A6-short): production
-                // ∀-binds referenced AssertByVar locals in this scope's
-                // goal telescope — the stage-A arm lands in era 2
-                // (bootstrap-81); reject loud until then (SAME detection
-                // as production's `collect_assert_by_vars`). Era 1: the
-                // vocabulary slots exist (`Nil`/`Nil` here — no skolems
-                // reach this arm, so both are always empty).
-                if !crate::sst_to_lean::collect_assert_by_vars_in(
+                // Assert-forall skolems (bootstrap-81, endgame row 11b —
+                // the A6-short `assert-forall` census tag is RETIRED by
+                // this arm): production ∀-binds referenced AssertByVar
+                // locals on every in-scope goal (`Wp::Scope`'s walker
+                // pushes each via `push_mod_var_frames`, minus names an
+                // enclosing scope already bound as CtxFrame::Binder).
+                // Mirror: SAME detection (`collect_assert_by_vars_in`),
+                // the SAME `already_bound` filter (`forall_bound_names`),
+                // and the Loop arm's binder/bound transcription.
+                let scope_vars = crate::sst_to_lean::collect_assert_by_vars_in(
                     inner,
                     &self.assert_by_var_typs,
-                )
-                .is_empty()
-                {
-                    return Err("assert-forall".to_string());
+                );
+                let pre_scope = self.forall_bound_names.clone();
+                let mut binder_entries: Vec<(u64, u64)> = Vec::new();
+                let mut bound_entries: Vec<Option<(u64, u64)>> = Vec::new();
+                for &(vid, typ) in scope_vars.iter() {
+                    let name = crate::lean_name::LeanName::from_var_ident(vid);
+                    // `already_bound` dedup (sst_to_lean.rs:3073): an
+                    // enclosing scope's binder shadows — do NOT rebind.
+                    if self.forall_bound_names.contains(name.as_str()) {
+                        continue;
+                    }
+                    let bid = self.binder_id(vid);
+                    let tleaf = self.typ_leaf(typ);
+                    binder_entries.push((bid, tleaf));
+                    // Names claim the SOURCE names (production never
+                    // freshens scope binders); register in both name
+                    // sets (loop-arm precedent for `bound_names`).
+                    self.bound_names.insert(name.as_str().to_string());
+                    self.forall_bound_names.insert(name.as_str().to_string());
+                    // `push_mod_var_frames` re-asserts the type bound
+                    // right after the binder iff `type_bound_predicate`
+                    // is Some (`Int`/`Nat` → None ⇒ NoBound — the
+                    // `True →` in production's telescope is the SST
+                    // lowering's ordinary `assume(has_typ)` instead).
+                    match crate::to_lean_sst_expr::type_bound_predicate(
+                        &LExpr::var(name.clone()),
+                        typ,
+                    ) {
+                        Some(pred) => {
+                            let hname = self.next_hyp_name();
+                            let prop = self.leaves.intern(pp_expr(&pred));
+                            bound_entries.push(Some((hname, prop)));
+                        }
+                        None => bound_entries.push(None),
+                    }
                 }
                 let b = self.stm(inner)?;
+                // The scope's binders do not leak into the continuation
+                // (production walks `after` under the ORIGINAL obl).
+                self.forall_bound_names = pre_scope;
                 Ok(format!(
                     "({}.StmData.DeadEnd {} {} {})",
                     NS,
-                    self.binder_list(&[]),
-                    self.param_bound_list(&[]),
+                    box_(&self.binder_list(&binder_entries)),
+                    box_(&self.param_bound_list(&bound_entries)),
                     box_(&b)
                 ))
             }
@@ -3845,8 +3898,8 @@ impl<'a> Serializer<'a> {
                     // without this tag; population 0 today. The long fix
                     // is per-branch continuation serialization (which
                     // would also retire call-in-branch-join) — card §3.
-                    if then_forced != (bstate.2, bstate.3)
-                        || (self.flet_forced, self.poison_forced) != (bstate.2, bstate.3)
+                    if then_forced != (bstate.3, bstate.4)
+                        || (self.flet_forced, self.poison_forced) != (bstate.3, bstate.4)
                     {
                         return Err("branch-forced-state-join".to_string());
                     }
@@ -4097,6 +4150,11 @@ impl<'a> Serializer<'a> {
         decrease: &[Exp],
         loop_id: u64,
     ) -> Sr<String> {
+        // b81: snapshot the DeadEnd dedup set — the mod-var ∀-binders
+        // inserted below are live only for the loop's body walk
+        // (production's post-loop obl drops them); restored before the
+        // Ok return.
+        let pre_loop_forall = self.forall_bound_names.clone();
         // Recover the while-condition from `cond` or the preserved
         // `original_cond` (break-lowering nulls `cond`). A genuine
         // `loop {}` (both None) has no cond leaf the mirror can carry.
@@ -4172,6 +4230,10 @@ impl<'a> Serializer<'a> {
             binder_entries.push((bid, tleaf));
             let name = crate::lean_name::LeanName::from_var_ident(vid);
             self.bound_names.insert(name.as_str().to_string());
+            // b81: the mod-var ∀-binders join the DeadEnd dedup set for
+            // the loop's body walk (restored at loop exit — production's
+            // post-loop obl drops them).
+            self.forall_bound_names.insert(name.as_str().to_string());
             match crate::to_lean_sst_expr::type_bound_predicate(&LExpr::var(name.clone()), &typ) {
                 Some(pred) => {
                     let hname = self.next_hyp_name();
@@ -4381,6 +4443,9 @@ impl<'a> Serializer<'a> {
             self.rename_env = save_renames;
             self.bound_names = save_bound;
         }
+
+        // b81: the mod-var ∀-binders' scope ends with the loop.
+        self.forall_bound_names = pre_loop_forall;
 
         Ok(format!(
             "({}.StmData.Loop {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {})",

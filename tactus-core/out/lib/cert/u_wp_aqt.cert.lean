@@ -25,7 +25,7 @@ set_option autoImplicit false
 -- leaf 11: ⟦0 ≤ h ∧ h < 18446744073709551616⟧
 -- leaf 12: ⟦h_h_bound⟧
 -- leaf 13: ⟦lib.wp_stm pp f (lib.StmData.AssertQueryTactus o hn h) = lib.GoalList.Cons (Tactus.Box.mk (lib.close_e pp (lib.frame_append f (lib.FrameList.FUserCloser (Tactus.Box.mk lib.FrameList.FNil))) o)) (Tactus.Box.mk lib.GoalList.Nil)⟧
--- leaf 14: ⟦/- @rust:tactus-core/lib.rs:5262:13 -/ lib.wp_stm pp f (lib.StmData.AssertQueryTactus o hn h) = lib.GoalList.Cons (Tactus.Box.mk (lib.close_e pp (lib.frame_append f (lib.FrameList.FUserCloser (Tactus.Box.mk lib.FrameList.FNil))) o)) (Tactus.Box.mk lib.GoalList.Nil)⟧
+-- leaf 14: ⟦/- @rust:tactus-core/lib.rs:5278:13 -/ lib.wp_stm pp f (lib.StmData.AssertQueryTactus o hn h) = lib.GoalList.Cons (Tactus.Box.mk (lib.close_e pp (lib.frame_append f (lib.FrameList.FUserCloser (Tactus.Box.mk lib.FrameList.FNil))) o)) (Tactus.Box.mk lib.GoalList.Nil)⟧
 -- leaf 15: ⟦lib.wp_stm⟧
 -- leaf 16: ⟦lib.GoalList⟧
 -- leaf 17: ⟦lib.StmData⟧
@@ -39,7 +39,7 @@ set_option autoImplicit false
 example : lib.stm_size cert_u_wp_aqt_sst = 2 := by decide
 
 -- ── production goals (N3b) ──────────────────────────────────
--- goal 0: _tactus_postcondition_u_wp_aqt_at_lib_5262_13_1
+-- goal 0: _tactus_postcondition_u_wp_aqt_at_lib_5278_13_1
 @[reducible] def cert_u_wp_aqt_goals : lib.GoalList :=
   lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 2 3 (Tactus.Box.mk (lib.GoalData.All 4 5 (Tactus.Box.mk (lib.GoalData.All 6 7 (Tactus.Box.mk (lib.GoalData.All 9 8 (Tactus.Box.mk (lib.GoalData.All 10 7 (Tactus.Box.mk (lib.GoalData.All 12 11 (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.Atom 14))))))))))))))))) (Tactus.Box.mk lib.GoalList.Nil)
 
