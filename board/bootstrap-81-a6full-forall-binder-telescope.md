@@ -180,6 +180,13 @@ then mirror `sst_to_lean.rs:3073-3090` exactly:
    `obl.clone()` per path; sibling-branch names must not leak into
    the filter). Separate set from `bound_names`: production's
    `already_bound` counts ONLY `CtxFrame::Binder`, not lets/hyps.
+   **Impl-time amendment (2026-08-06, confirmed in source):** the
+   Binder set also includes the N2 IfCtor field binders
+   (`branch_ctor_frames` pushes `CtxFrame::Binder`,
+   `sst_to_lean.rs:802`) — the IfCtor arm inserts its
+   `pos_binders` names on the then-path (restored at the If
+   boundary via the existing `branch_state`/`restore_branch`
+   bundle, which `forall_bound_names` joins).
 2. **Transcribe (Loop-arm template, `:4150-4176`):** per surviving
    var — `binder_id(vid)`, `typ_leaf(&typ)`; bound entry =
    `type_bound_predicate(&LExpr::var(name), &typ)` → `Some((hname,
@@ -251,6 +258,32 @@ Done-when (all):
 5. `wp_stm_sound`/`ref_wp_sound` still verify with the DeadEnd arm
    threaded (D2) — axiom closures unchanged (⊆ [propext,
    Classical.choice, Quot.sound]).
+
+## Era 1 implementation notes (2026-08-06)
+
+D1+D2 landed as designed — `wp_stm_sound`'s DeadEnd arm absorbed the
+extended frame with ZERO statement changes (the b74 dispatcher
+payoff, as predicted). One surprise, worth recording for future
+frame-algebra work: the two W5e closure pins broke because
+`frame_append(f, mod_var_frames(Nil, Nil))` is NOT reducible for a
+variable `f` (frame_append recurses on its FIRST argument), and the
+right-identity lemma `frame_append(f, FNil) == f` did not exist.
+Added: `frame_append_fnil_right` (structural induction) + the four
+missing `u_fapp_*` per-ctor one-step unfolds (FLetH/FLet/FLetR/
+FUserCloser) + `u_mvf_nil_nil`. Lessons, all already documented in
+reference_tactus_proof_authoring_idioms and confirmed again here:
+(1) `frame_append`'s Box'd-subterm recursion emits as `rec_1`, so NO
+closer may `rw [lib.frame_append]` — the per-ctor unfolds must enter
+VCs as HYPS via `u_*` calls in each arm; (2) the default `rw`-rung
+fails HARD (aborts elaboration, no `first |` backtracking) — the
+recursive fn needs a custom `tactus_tactic` string with the b79
+termination-first ordering (`cases f <;> omega` before the zetaDelta
+simp branch); (3) the FNil arm's definitional close does not fire
+through the match-guard — put `u_fapp_fnil(FNil)` in the arm so the
+goal fact enters as a hyp; (4) `simp` does not bridge
+`frame_append f (mod_var_frames Nil Nil)` vs `frame_append f FNil`
+(defeq but not syntactic) — `u_mvf_nil_nil` supplies the rewrite.
+Gate 297/0 (+6 proof fns over the 291 handoff baseline).
 
 ## Churn checklist (impl-time, in order)
 

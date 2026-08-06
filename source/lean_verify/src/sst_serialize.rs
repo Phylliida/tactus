@@ -3344,8 +3344,11 @@ impl<'a> Serializer<'a> {
             StmX::DeadEnd(inner) => {
                 // Assert-forall skolems (endgame A6-short): production
                 // ∀-binds referenced AssertByVar locals in this scope's
-                // goal telescope — no stage-A arm for that; reject loud
-                // (SAME detection as production's `collect_assert_by_vars`).
+                // goal telescope — the stage-A arm lands in era 2
+                // (bootstrap-81); reject loud until then (SAME detection
+                // as production's `collect_assert_by_vars`). Era 1: the
+                // vocabulary slots exist (`Nil`/`Nil` here — no skolems
+                // reach this arm, so both are always empty).
                 if !crate::sst_to_lean::collect_assert_by_vars_in(
                     inner,
                     &self.assert_by_var_typs,
@@ -3355,7 +3358,13 @@ impl<'a> Serializer<'a> {
                     return Err("assert-forall".to_string());
                 }
                 let b = self.stm(inner)?;
-                Ok(format!("({}.StmData.DeadEnd {})", NS, box_(&b)))
+                Ok(format!(
+                    "({}.StmData.DeadEnd {} {} {})",
+                    NS,
+                    self.binder_list(&[]),
+                    self.param_bound_list(&[]),
+                    box_(&b)
+                ))
             }
 
             // Transparent passthrough — the walker returns `after`

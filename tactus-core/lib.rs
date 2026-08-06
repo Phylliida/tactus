@@ -268,8 +268,15 @@ pub enum StmData {
     /// and this generalizes to the coming `&mut` post-state / prophecy
     /// frames instead of perpetually growing refWp's Call arm.
     Call { reqs: Box<RawExpList>, post: Box<FrameList> },
-    /// StmX::DeadEnd — verify inside, discard facts after.
-    DeadEnd(Box<StmData>),
+    /// StmX::DeadEnd — verify inside, discard facts after. The
+    /// `scope_binders`/`scope_bounds` slots are the assert-forall skolem
+    /// ∀-binders production pushes on the scope's goals (`Wp::Scope`'s
+    /// `push_mod_var_frames`, bootstrap-81 row 11b): same shape as the
+    /// Loop havoc set — `BinderList` `(id, typ leaf)` pairs + the
+    /// parallel `ParamBoundList` bound hyps, folded by
+    /// `mod_var_frames`. Ordinary `assert(P) by { … }` blocks (no
+    /// skolems) carry `Nil`/`Nil`.
+    DeadEnd(Box<BinderList>, Box<ParamBoundList>, Box<StmData>),
     /// StmX::Return — annotated ensures obligations (a `RawExpList` of DEEP
     /// obligations, one span_mark'd obligation per postcondition, closed via
     /// `close_each_e` at the return site like production's `WpCtx`
@@ -934,7 +941,10 @@ pub open spec fn stm_size(s: StmData) -> nat
         // mirrors the serializer's `stm_size_of` token count: stmt heads +
         // RawExpList `Cons` (reqs) + FrameList `FBind`/`FHyp`/`FLet` (post).
         StmData::Call { reqs, post } => 1 + raw_exp_list_len(*reqs) + frame_len(*post),
-        StmData::DeadEnd(b) => 1 + stm_size(*b),
+        // Mirrors the serializer's textual token count: `StmData.DeadEnd`
+        // head + `BinderList.Cons` tokens (ParamBoundList NOT counted,
+        // same convention as Loop's `binder_bounds`).
+        StmData::DeadEnd(bs, _bds, b) => 1 + binder_len(*bs) + stm_size(*b),
         StmData::AssertQueryNl(b, _tq) => 1 + stm_size(*b),
         StmData::AssertQueryTactus(_o, _hn, _h) => 1,
         StmData::Ret(es, _rb) => 1 + raw_exp_list_len(*es),
@@ -3005,7 +3015,7 @@ pub open spec fn diverges(s: StmData) -> nat
 {
     match s {
         StmData::Ret(_es, _rb) => 1,
-        StmData::DeadEnd(_b) => 1,           // `false` context: control does not continue
+        StmData::DeadEnd(..) => 1,           // `false` context: control does not continue
         StmData::Seq(a, b) =>
             if diverges(*a) == 1 || diverges(*b) == 1 { 1 } else { 0 },
         StmData::If(_c, _cn, _nc, _ncn, t, e) =>
@@ -3074,7 +3084,7 @@ pub open spec fn frame_after(pp: LeafList, f: FrameList, s: StmData) -> FrameLis
         // Pass-through: append the serializer-transcribed post-call frame
         // verbatim (the ∀-path or #128 ret-eq shape both live in `post`).
         StmData::Call { reqs: _, post } => frame_append(f, *post),
-        StmData::DeadEnd(_b) => f,          // facts discarded
+        StmData::DeadEnd(..) => f,          // facts discarded
         StmData::AssertQueryNl(_b, _tq) => f,    // isolated query: no frame delta
         // The proven P re-enters the main flow as a forward hyp
         // (production's AssertFact push after the assert-by theorem).
@@ -3163,7 +3173,11 @@ pub open spec fn wp_stm(pp: LeafList, f: FrameList, s: StmData) -> GoalList
         StmData::AssignH(_x, _ty, _v, _en, _ep) => GoalList::Nil,
         StmData::AssignR(_x, _v) => GoalList::Nil,
         StmData::Call { reqs, post: _ } => close_each_e(pp, f, *reqs),
-        StmData::DeadEnd(b) => wp_stm(pp, f, *b),
+        // The scope's assert-forall skolems ∀-bind every in-scope goal
+        // (production's `Wp::Scope` walker pushes them via
+        // `push_mod_var_frames` before the body walk, bootstrap-81).
+        StmData::DeadEnd(bs, bds, b) =>
+            wp_stm(pp, frame_append(f, mod_var_frames(*bs, *bds)), *b),
         StmData::AssertQueryNl(b, tq) =>
             goals_append(
                 wp_stm(pp, strip_hyps(f), *b),
@@ -4458,7 +4472,8 @@ pub open spec fn exec_safe_f(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOra
         StmData::AssignH(_x, _ty, _v, _en, _ep) => true,
         StmData::AssignR(_x, _v) => true,
         StmData::Call { reqs, post: _ } => close_sem_obligs(pp, hp, he, lv, f, st, *reqs),
-        StmData::DeadEnd(b) => exec_safe_f(pp, hp, he, lv, f, *b, st),
+        StmData::DeadEnd(bs, bds, b) =>
+            exec_safe_f(pp, hp, he, lv, frame_append(f, mod_var_frames(*bs, *bds)), *b, st),
         StmData::AssertQueryNl(b, tq) =>
             exec_safe_f(pp, hp, he, lv, strip_hyps(f), *b, st)
                 && close_sem_e(pp, hp, he, lv, frame_after(pp, strip_hyps(f), *b), st, tq),
@@ -4925,9 +4940,9 @@ pub proof fn u_esf_call(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, 
         == close_sem_obligs(pp, hp, he, lv, f, st, *reqs)
 {}
 #[verifier::tactus_tactic("first | tactus_auto | (intros <;> rfl)")]
-pub proof fn u_esf_deadend(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, b: Box<StmData>)
-    ensures forall|st: St| #[trigger] exec_safe_f(pp, hp, he, lv, f, StmData::DeadEnd(b), st)
-        == exec_safe_f(pp, hp, he, lv, f, *b, st)
+pub proof fn u_esf_deadend(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, bs: Box<BinderList>, bds: Box<ParamBoundList>, b: Box<StmData>)
+    ensures forall|st: St| #[trigger] exec_safe_f(pp, hp, he, lv, f, StmData::DeadEnd(bs, bds, b), st)
+        == exec_safe_f(pp, hp, he, lv, frame_append(f, mod_var_frames(*bs, *bds)), *b, st)
 {}
 pub proof fn u_esf_aqnl(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, b: Box<StmData>, tq: RawExp)
     ensures forall|st: St| #[trigger] exec_safe_f(pp, hp, he, lv, f, StmData::AssertQueryNl(b, tq), st)
@@ -5231,8 +5246,9 @@ pub proof fn u_wp_assignr(pp: LeafList, f: FrameList, x: u64, v: u64)
 pub proof fn u_wp_call(pp: LeafList, f: FrameList, reqs: Box<RawExpList>, post: Box<FrameList>)
     ensures wp_stm(pp, f, StmData::Call { reqs, post }) == close_each_e(pp, f, *reqs)
 {}
-pub proof fn u_wp_deadend(pp: LeafList, f: FrameList, b: Box<StmData>)
-    ensures wp_stm(pp, f, StmData::DeadEnd(b)) == wp_stm(pp, f, *b)
+pub proof fn u_wp_deadend(pp: LeafList, f: FrameList, bs: Box<BinderList>, bds: Box<ParamBoundList>, b: Box<StmData>)
+    ensures wp_stm(pp, f, StmData::DeadEnd(bs, bds, b))
+        == wp_stm(pp, frame_append(f, mod_var_frames(*bs, *bds)), *b)
 {}
 pub proof fn u_wp_aqnl(pp: LeafList, f: FrameList, b: Box<StmData>, tq: RawExp)
     ensures wp_stm(pp, f, StmData::AssertQueryNl(b, tq))
@@ -6257,10 +6273,10 @@ pub proof fn wp_stm_sound(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle
             holds_all_close_each_e(pp, hp, he, lv, f, *reqs, st);
             u_esf_call(pp, hp, he, lv, f, reqs, post);
         }
-        StmData::DeadEnd(b) => {
-            u_wp_deadend(pp, f, b);
-            u_esf_deadend(pp, hp, he, lv, f, b);
-            wp_stm_sound(pp, hp, he, lv, f, *b, st);                // IH
+        StmData::DeadEnd(bs, bds, b) => {
+            u_wp_deadend(pp, f, bs, bds, b);
+            u_esf_deadend(pp, hp, he, lv, f, bs, bds, b);
+            wp_stm_sound(pp, hp, he, lv, frame_append(f, mod_var_frames(*bs, *bds)), *b, st);  // IH at the scope-binder frame
         }
         StmData::AssertQueryNl(b, tq) => {
             u_wp_aqnl(pp, f, b, tq);
@@ -6386,8 +6402,8 @@ pub proof fn u_fa_assume(pp: LeafList, f: FrameList, e: u64)
     ensures frame_after(pp, f, StmData::Assume(0, e))
         == frame_append(f, FrameList::FHyp(0, e, Box::new(FrameList::FNil)))
 {}
-pub proof fn u_fa_deadend(pp: LeafList, f: FrameList, b: Box<StmData>)
-    ensures frame_after(pp, f, StmData::DeadEnd(b)) == f
+pub proof fn u_fa_deadend(pp: LeafList, f: FrameList, bs: Box<BinderList>, bds: Box<ParamBoundList>, b: Box<StmData>)
+    ensures frame_after(pp, f, StmData::DeadEnd(bs, bds, b)) == f
 {}
 pub proof fn u_fa_seq(pp: LeafList, f: FrameList, a: Box<StmData>, b: Box<StmData>)
     ensures frame_after(pp, f, StmData::Seq(a, b)) == frame_after(pp, frame_after(pp, f, *a), *b)
@@ -6395,6 +6411,59 @@ pub proof fn u_fa_seq(pp: LeafList, f: FrameList, a: Box<StmData>, b: Box<StmDat
 pub proof fn u_fapp_fnil(g: FrameList)
     ensures frame_append(FrameList::FNil, g) == g
 {}
+/// `mod_var_frames` at the empty scope (ordinary assert-by DeadEnd,
+/// b81): no binders, no frames. Entered as a HYP so closers can
+/// rewrite `mod_var_frames Nil Nil` to `FNil` without unfolding the
+/// (eq-lemma-less) definition.
+pub proof fn u_mvf_nil_nil()
+    ensures mod_var_frames(BinderList::Nil, ParamBoundList::Nil) == FrameList::FNil
+{}
+/// RIGHT identity — `frame_append(f, FNil) == f`. NOT definitional
+/// (`frame_append` recurses on its FIRST argument); structural
+/// induction with the per-ctor `u_fapp_*` one-step unfold as a HYP in
+/// each arm (the `rec_1` eq-lemma gap means no closer may
+/// `rw [lib.frame_append]` — reference_tactus_proof_authoring_idioms
+/// §75-80) plus the IH. (b81: the DeadEnd scope-binder arm routes
+/// through `frame_append(f, mod_var_frames(Nil, Nil))`, which is
+/// `frame_append(f, FNil)` for ordinary assert-by blocks.)
+/// Closer: termination VCs are pure height inequalities (cases+omega
+/// FIRST, the b79 ordering); postcondition VCs close from the u_*/IH
+/// equation hyps (zetaDelta simp).
+#[verifier::tactus_tactic("first | (intros <;> cases f <;> omega) | (intros <;> cases f <;> with_reducible rfl) | tactus_auto | (intros <;> simp_all (config := { zetaDelta := true }) [and_assoc])")]
+pub proof fn frame_append_fnil_right(f: FrameList)
+    ensures frame_append(f, FrameList::FNil) == f
+    decreases f
+{
+    match f {
+        FrameList::FNil => {
+            u_fapp_fnil(FrameList::FNil);
+        }
+        FrameList::FBind(id, typ, t) => {
+            u_fapp_fbind(id, typ, t, FrameList::FNil);
+            frame_append_fnil_right(*t);
+        }
+        FrameList::FHyp(hn, h, t) => {
+            u_fapp_fhyp(hn, h, t, FrameList::FNil);
+            frame_append_fnil_right(*t);
+        }
+        FrameList::FLetH(x, ty, v, en, ep, t) => {
+            u_fapp_fleth(x, ty, v, en, ep, t, FrameList::FNil);
+            frame_append_fnil_right(*t);
+        }
+        FrameList::FLet(id, v, t) => {
+            u_fapp_flet(id, v, t, FrameList::FNil);
+            frame_append_fnil_right(*t);
+        }
+        FrameList::FLetR(id, v, t) => {
+            u_fapp_fletr(id, v, t, FrameList::FNil);
+            frame_append_fnil_right(*t);
+        }
+        FrameList::FUserCloser(t) => {
+            u_fapp_fucl(t, FrameList::FNil);
+            frame_append_fnil_right(*t);
+        }
+    }
+}
 pub proof fn u_fapp_fbind(x: u64, ty: u64, t: Box<FrameList>, g: FrameList)
     ensures frame_append(FrameList::FBind(x, ty, t), g)
         == FrameList::FBind(x, ty, Box::new(frame_append(*t, g)))
@@ -6402,6 +6471,22 @@ pub proof fn u_fapp_fbind(x: u64, ty: u64, t: Box<FrameList>, g: FrameList)
 pub proof fn u_fapp_fhyp(n: u64, h: u64, t: Box<FrameList>, g: FrameList)
     ensures frame_append(FrameList::FHyp(n, h, t), g)
         == FrameList::FHyp(n, h, Box::new(frame_append(*t, g)))
+{}
+pub proof fn u_fapp_fleth(x: u64, ty: u64, v: u64, en: u64, ep: u64, t: Box<FrameList>, g: FrameList)
+    ensures frame_append(FrameList::FLetH(x, ty, v, en, ep, t), g)
+        == FrameList::FLetH(x, ty, v, en, ep, Box::new(frame_append(*t, g)))
+{}
+pub proof fn u_fapp_flet(x: u64, v: u64, t: Box<FrameList>, g: FrameList)
+    ensures frame_append(FrameList::FLet(x, v, t), g)
+        == FrameList::FLet(x, v, Box::new(frame_append(*t, g)))
+{}
+pub proof fn u_fapp_fletr(x: u64, v: u64, t: Box<FrameList>, g: FrameList)
+    ensures frame_append(FrameList::FLetR(x, v, t), g)
+        == FrameList::FLetR(x, v, Box::new(frame_append(*t, g)))
+{}
+pub proof fn u_fapp_fucl(t: Box<FrameList>, g: FrameList)
+    ensures frame_append(FrameList::FUserCloser(t), g)
+        == FrameList::FUserCloser(Box::new(frame_append(*t, g)))
 {}
 
 // ═════════════════════════════════════════════════════════════════════
@@ -6509,16 +6594,20 @@ pub proof fn prophecy_swapped_sound(pp: LeafList, xfut: u64, ty: u64, resolve: u
 pub proof fn closure_creation_sound(pp: LeafList, hp: HpOracle, he: HeOracle, lv: LvOracle, f: FrameList, body: Box<StmData>, ext: u64, st: St)
     ensures holds_all(hp, he, lv,
             wp_stm(pp, f, StmData::Seq(
-                Box::new(StmData::DeadEnd(body)),
+                Box::new(StmData::DeadEnd(Box::new(BinderList::Nil), Box::new(ParamBoundList::Nil), body)),
                 Box::new(StmData::Assume(0, ext)))), st)
         == exec_safe_f(pp, hp, he, lv, f, *body, st)
 {
     wp_stm_sound(pp, hp, he, lv, f,
-        StmData::Seq(Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(0, ext))), st);
-    u_esf_seq(pp, hp, he, lv, f, Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(0, ext)));
-    u_esf_deadend(pp, hp, he, lv, f, body);
-    u_fa_deadend(pp, f, body);
-    u_esf_assume(pp, hp, he, lv, frame_after(pp, f, StmData::DeadEnd(body)), 0, ext);
+        StmData::Seq(Box::new(StmData::DeadEnd(Box::new(BinderList::Nil), Box::new(ParamBoundList::Nil), body)), Box::new(StmData::Assume(0, ext))), st);
+    u_esf_seq(pp, hp, he, lv, f, Box::new(StmData::DeadEnd(Box::new(BinderList::Nil), Box::new(ParamBoundList::Nil), body)), Box::new(StmData::Assume(0, ext)));
+    u_esf_deadend(pp, hp, he, lv, f, Box::new(BinderList::Nil), Box::new(ParamBoundList::Nil), body);
+    u_fa_deadend(pp, f, Box::new(BinderList::Nil), Box::new(ParamBoundList::Nil), body);
+    // b81: the DeadEnd arm now routes through
+    // `frame_append(f, mod_var_frames(Nil, Nil))` — collapse the FNil tail.
+    u_mvf_nil_nil();
+    frame_append_fnil_right(f);
+    u_esf_assume(pp, hp, he, lv, frame_after(pp, f, StmData::DeadEnd(Box::new(BinderList::Nil), Box::new(ParamBoundList::Nil), body)), 0, ext);
 }
 
 /// W5e ISOLATION (probe26 `closure_deadend_isolates`) — STRUCTURAL
@@ -6526,16 +6615,16 @@ pub proof fn closure_creation_sound(pp: LeafList, hp: HpOracle, he: HeOracle, lv
 /// assert's goal carries NO binder for q.
 pub proof fn closure_deadend_isolates(pp: LeafList, q: u64, h: u64, obl: RawExp)
     ensures wp_stm(pp, FrameList::FNil, StmData::Seq(
-                Box::new(StmData::DeadEnd(Box::new(StmData::Assume(0, q)))),
+                Box::new(StmData::DeadEnd(Box::new(BinderList::Nil), Box::new(ParamBoundList::Nil), Box::new(StmData::Assume(0, q)))),
                 Box::new(StmData::Assert(obl, 0, h))))
         == GoalList::Cons(Box::new(GoalData::LeafE(render_exp(obl))), Box::new(GoalList::Nil))
 {
     u_wp_seq(pp, FrameList::FNil,
-        Box::new(StmData::DeadEnd(Box::new(StmData::Assume(0, q)))),
+        Box::new(StmData::DeadEnd(Box::new(BinderList::Nil), Box::new(ParamBoundList::Nil), Box::new(StmData::Assume(0, q)))),
         Box::new(StmData::Assert(obl, 0, h)));
-    u_wp_deadend(pp, FrameList::FNil, Box::new(StmData::Assume(0, q)));
+    u_wp_deadend(pp, FrameList::FNil, Box::new(BinderList::Nil), Box::new(ParamBoundList::Nil), Box::new(StmData::Assume(0, q)));
     u_wp_assume(pp, FrameList::FNil, 0, q);
-    u_fa_deadend(pp, FrameList::FNil, Box::new(StmData::Assume(0, q)));
+    u_fa_deadend(pp, FrameList::FNil, Box::new(BinderList::Nil), Box::new(ParamBoundList::Nil), Box::new(StmData::Assume(0, q)));
     u_wp_assert(pp, FrameList::FNil, obl, 0, h);
     u_gapp_nil(wp_stm(pp, FrameList::FNil, StmData::Assert(obl, 0, h)));
     u_gate_nil();
@@ -6600,24 +6689,28 @@ pub proof fn closure_forwards_contract(pp: LeafList, hp: HpOracle, he: HeOracle,
     ensures holds_all(hp, he, lv,
             wp_stm(pp, FrameList::FNil, StmData::Seq(
                 Box::new(StmData::Seq(
-                    Box::new(StmData::DeadEnd(body)),
+                    Box::new(StmData::DeadEnd(Box::new(BinderList::Nil), Box::new(ParamBoundList::Nil), body)),
                     Box::new(StmData::Assume(0, ext)))),
                 Box::new(StmData::Assert(obl, 0, h)))), st)
         == (exec_safe_f(pp, hp, he, lv, FrameList::FNil, *body, st)
             && (forall|v: int| #[trigger] he(render_exp(obl), upd(st, 0, v))))
 {
     wp_stm_sound(pp, hp, he, lv, FrameList::FNil, StmData::Seq(
-        Box::new(StmData::Seq(Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(0, ext)))),
+        Box::new(StmData::Seq(Box::new(StmData::DeadEnd(Box::new(BinderList::Nil), Box::new(ParamBoundList::Nil), body)), Box::new(StmData::Assume(0, ext)))),
         Box::new(StmData::Assert(obl, 0, h))), st);
     u_esf_seq(pp, hp, he, lv, FrameList::FNil,
-        Box::new(StmData::Seq(Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(0, ext)))),
+        Box::new(StmData::Seq(Box::new(StmData::DeadEnd(Box::new(BinderList::Nil), Box::new(ParamBoundList::Nil), body)), Box::new(StmData::Assume(0, ext)))),
         Box::new(StmData::Assert(obl, 0, h)));
-    u_esf_seq(pp, hp, he, lv, FrameList::FNil, Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(0, ext)));
-    u_esf_deadend(pp, hp, he, lv, FrameList::FNil, body);
-    u_fa_deadend(pp, FrameList::FNil, body);
-    u_esf_assume(pp, hp, he, lv, frame_after(pp, FrameList::FNil, StmData::DeadEnd(body)), 0, ext);
-    u_fa_seq(pp, FrameList::FNil, Box::new(StmData::DeadEnd(body)), Box::new(StmData::Assume(0, ext)));
-    u_fa_assume(pp, frame_after(pp, FrameList::FNil, StmData::DeadEnd(body)), ext);
+    u_esf_seq(pp, hp, he, lv, FrameList::FNil, Box::new(StmData::DeadEnd(Box::new(BinderList::Nil), Box::new(ParamBoundList::Nil), body)), Box::new(StmData::Assume(0, ext)));
+    u_esf_deadend(pp, hp, he, lv, FrameList::FNil, Box::new(BinderList::Nil), Box::new(ParamBoundList::Nil), body);
+    u_fa_deadend(pp, FrameList::FNil, Box::new(BinderList::Nil), Box::new(ParamBoundList::Nil), body);
+    // b81: the DeadEnd arm now routes through
+    // `frame_append(f, mod_var_frames(Nil, Nil))` — collapse the FNil tail.
+    u_mvf_nil_nil();
+    frame_append_fnil_right(FrameList::FNil);
+    u_esf_assume(pp, hp, he, lv, frame_after(pp, FrameList::FNil, StmData::DeadEnd(Box::new(BinderList::Nil), Box::new(ParamBoundList::Nil), body)), 0, ext);
+    u_fa_seq(pp, FrameList::FNil, Box::new(StmData::DeadEnd(Box::new(BinderList::Nil), Box::new(ParamBoundList::Nil), body)), Box::new(StmData::Assume(0, ext)));
+    u_fa_assume(pp, frame_after(pp, FrameList::FNil, StmData::DeadEnd(Box::new(BinderList::Nil), Box::new(ParamBoundList::Nil), body)), ext);
     u_fapp_fnil(FrameList::FHyp(0, ext, Box::new(FrameList::FNil)));
     u_esf_assert(pp, hp, he, lv, FrameList::FHyp(0, ext, Box::new(FrameList::FNil)), obl, 0, h);
     u_gate_hyp(0, ext, Box::new(FrameList::FNil));
