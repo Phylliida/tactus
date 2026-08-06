@@ -29,7 +29,25 @@ probe13 → 25 classes (3 new scope kills: binder drop / bound drop /
 typ flip).** Battery: gate 298/0 (+7 fns) + pkg 54 + discharge 205/0
 + bridge 172/172 live, units 437+7/0, probes 9/11/13/14/17/37/38 ✓,
 golden re-vendored (pure @rust: line drift), D-column pin
-`deadend_scope_binder_pin` in tactus-core. **NEXT per the endgame map:
+`deadend_scope_binder_pin` in tactus-core. **REVIEW ROUND (same day,
+Danielle-requested) found ONE REAL LATENT BUG via two coverage gaps:
+(R1) the Bound-hyp name was bridge-invisible in every subject
+(preceding assert latches goals to wrap) — new F30
+`forall_leading_prefix` CLOSE-BROKE on it: production's `_h_hoist_k`
+numbering is PER-GOAL-PATH (the scope's discarded hyps don't count
+post-scope) but the serializer's `hyp_ordinal` never restored at
+DeadEnd exit — ordinal-restore fix landed (latent pre-b81 for any
+assert-by DeadEnd with inner asserts + a post-scope named hyp); (R2)
+the `already_bound` dedup was untested — new F31 `forall_nested_shadow`
+covers it (outer scope binds {j,k} — collect walks INTO nested scopes;
+inner dedups to Nil — production's exact behavior). probe13 → 27
+classes (`scope_exit_name_drift` pins the ordinal restore,
+`scope_dedup_rebind` pins the dedup); (R3) probe9 gained the
+subject-population pin (35 subjects + mix_trip2 documented-absent);
+(R4) post-scope freshening checked NOT a bug (monotonic freshening
+set, fill_zeros evidence); endgame doc row 11b → DONE.** Battery
+post-round: probe9 37/37, probe11 13/13 (post-fix regen), gate 298/0 +
+bridge 172/172 live, probes 14/17/37/38, units 437+7/0, e2e 829/2. **NEXT per the endgame map:
 milestone F gap-work (prelude hygiene / vstd package / dual-backend
 differential) — milestone A is now FULLY CLOSED (A1–A7 all landed);
 milestone E (W8 authority flip, b13) remains gated on the B SOAK

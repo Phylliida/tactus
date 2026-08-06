@@ -491,10 +491,11 @@ proof fn forall_int_skolem(n: nat)
 
 // F29 (b81, row 11b): assert-forall — U64 skolem (ParamBoundList
 // Bound: production's push_mod_var_frames re-asserts the type bound
-// `0 ≤ k < 2^64` right after the ∀-binder). NO lets precede the
-// assert-forall, so the binder/bound pair lands in the goal's
-// LEADING PREFIX (named-theorem-binder rendering) — the D3 impl-time
-// `_h_hoist_k` ordinal check.
+// `0 ≤ k < 2^64` right after the ∀-binder). The preceding `assert`
+// produces a goal-position let, so the skolem lands MID-PROPOSITION
+// past the latch (anonymous rendering — the bound hyp appears TWICE:
+// the Bound entry + the has_typ(u64) Assume duplicate). The
+// leading-prefix named-binder case is F30's (b81 review R1).
 proof fn forall_u64_skolem(n: u64)
     requires n < 1000,
     ensures n <= n + 1,
@@ -503,6 +504,43 @@ proof fn forall_u64_skolem(n: u64)
     assert forall|k: u64| k < n implies #[trigger] bump(k) <= (n as int) by {
         assert(bump(k) <= (n as int));
     }
+}
+
+// F30 (b81 review, R1): the LEADING-PREFIX case F29 does NOT hit —
+// F29's preceding `assert` produces a goal-position let, latching the
+// goals to wrap (anonymous) rendering BEFORE the skolem, so the
+// Bound hyp's `_h_hoist_k` name is bridge-invisible there. Here the
+// assert-forall is the fn's FIRST stm: no let precedes the binder,
+// so production's split_leading_binders extracts the skolem binder +
+// bound hyp as NAMED theorem binders and the ordinal is pinned by the
+// bridge.
+proof fn forall_leading_prefix(n: u64)
+    requires n < 1000,
+    ensures n <= n + 1,
+{
+    assert forall|k: u64| k < n implies #[trigger] bump(k) <= (n as int) by {
+        assert(bump(k) <= (n as int));
+    }
+    assert(n <= n + 1);
+}
+
+// F31 (b81 review, R2): the `already_bound` dedup — a nested
+// assert-forall whose inner block REFERENCES the outer skolem (the
+// inner guard mentions k). Production's Wp::Scope walker collects
+// both skolems for the inner scope but binds only j (k is already
+// bound as a CtxFrame::Binder); the serializer's forall_bound_names
+// mirror must skip k identically or the inner goals gain a shadowing
+// ∀k (unconstrained — unbridgeable).
+proof fn forall_nested_shadow(n: nat)
+    ensures n <= n + 1,
+{
+    assert forall|k: int| 0 <= k < (n as int) implies #[trigger] bumpi(k) <= (n as int) by {
+        assert forall|j: int| 0 <= j < k implies #[trigger] bumpi(j) <= k by {
+            assert(j <= k);
+        }
+        assert(k <= (n as int));
+    }
+    assert(n <= n + 1);
 }
 
 } // verus!

@@ -262,6 +262,45 @@ Done-when (all):
    threaded (D2) — axiom closures unchanged (⊆ [propext,
    Classical.choice, Quot.sound]).
 
+## Review round (2026-08-06, Danielle-requested design review) — found
+TWO REAL GAPS and, through them, ONE REAL LATENT BUG
+
+The review inspected both commits' diffs, the emitted goal spines
+line-by-line, and the probe surface. Findings R1/R2 (coverage) turned
+out to be a REAL bug; R3–R5 landed as hygiene. **(R1) The Bound-hyp
+NAME was an unpinned channel:** F29's preceding `assert` produces a
+goal-position let, latching its goals to wrap (anonymous) rendering
+BEFORE the skolem — the `_h_hoist_k` bound-hyp name never reached the
+bridge. F30 (`forall_leading_prefix`, assert-forall as the fn's FIRST
+stm) exercises the named-theorem-binder extraction… and CLOSE-BROKE:
+production names the post-scope ∀-fact hyp `_h_hoist_1` (its
+`_h_hoist_k` numbering is PER-GOAL-PATH — the scope's discarded hyps
+don't count on post-scope paths), but the serializer's walk counter
+never restored at DeadEnd exit. **The ordinal-restore fix** (save at
+arm entry, restore alongside `forall_bound_names`) is the b81 review
+round's real catch — latent pre-b81 too (any assert-by DeadEnd with
+inner asserts + a post-scope NAMED hyp would have diverged; no corpus
+subject existed). probe13 kill `scope_exit_name_drift` pins it (drifts
+the trailing Assume's name `_h_hoist_1 → _h_hoist_2`). **(R2) The
+`already_bound` dedup was untested code** — F31
+(`forall_nested_shadow`) exercises it: `collect_assert_by_vars_in`
+walks INTO nested scopes, so the OUTER scope binds {j, k} and the
+inner dedups to Nil/Nil — production's exact behavior, mirrored;
+bridges CLOSE post-fix. probe13 kill `scope_dedup_rebind` proves the
+dedup mirror load-bearing. **(R3) probe9 gained the subject-population
+pin** (35 expected subjects + mix_trip2 documented-absent
+`hoist-mixed-shadow`) — the b78 S5 masking class closed on the fixture
+lane too. **(R4, checked NOT a bug):** post-scope freshening —
+production's freshening set is monotonic over the walk path (fill_zeros
+`v_hoist1` evidence), so permanent `bound_names` insertion is the
+faithful mirror. **(R5, reassuring):** the Bound+mid-proposition
+interplay WAS already covered — F29's goal 1 renders the bound hyp
+TWICE anonymously (`Imp 16 Imp 16`: Bound entry + the has_typ(u64)
+Assume duplicate) and bridges. **(R6):** endgame doc row 11b → DONE.
+Battery post-round: probe9 37/37 ✓, probe13 27 classes, units
+437+7/0, gate + probe11 + probes 14/17/37/38 + e2e re-confirmed (see
+commit message).
+
 ## Era 2 implementation notes (2026-08-06, in progress)
 
 - **Latent era-1 bug caught by era 2's first subjects:** era 1's

@@ -149,5 +149,39 @@ EOF
 done
 
 echo
+
+# ── Subject-population pin (b81 review R3, 2026-08-06; modelled on
+# probe11's b78 S5 pin) ─────────────────────────────────────────────
+# A cert that VANISHES between emits is silent coverage loss (the loop
+# above only iterates what is on disk). Every previously-seen subject
+# is either present above or listed in expected_absent_reason with its
+# census tag. A documented-absent subject that REAPPEARS must be
+# reclassified loud (its tag was retired or its arm landed).
+expected_absent_reason() {
+  case "$1" in
+    mix_trip2) printf '%s' "hoist-mixed-shadow" ;;
+    *) printf '%s' '' ;;
+  esac
+}
+# Every fn ever seen as a bridge subject or documented absentee.
+expected_subjects="add_capped assert_by_default call_g2_ob call_g3_ob call_inc call_swap_incr clamped_inc count_down count_to_len double_exec fill_zeros find_square forall_int_skolem forall_leading_prefix forall_nested_shadow forall_u64_skolem head_exec head_via_let id_generic inc max_u64 mk_point mul_bound pick_max proof_block_fn quad_exec scope_shape sum_to swap_incr swap_pair tri_one use_clamped use_multiarg vec_push7 vec_read mix_trip2"
+
+for fn in $expected_subjects; do
+  if [ -f "$CERT_DIR/$fn.cert.lean" ]; then
+    reason="$(expected_absent_reason "$fn")"
+    if [ -n "$reason" ]; then
+      echo "SUBJECT-RETURNED: $fn has a cert again — retire its expected_absent_reason entry and classify the bridge verdict."; fail=1
+    fi
+  else
+    reason="$(expected_absent_reason "$fn")"
+    if [ -n "$reason" ]; then
+      echo "absent-ok  $fn  ($reason)"
+    else
+      echo "SUBJECT-VANISHED: $fn — no cert and no documented absence (silent coverage loss)"; fail=1
+    fi
+  fi
+done
+
+echo
 if [ $fail -eq 0 ]; then echo "ALL BRIDGES BEHAVE AS CLASSIFIED ✓"; else echo "SOME BRIDGES DIVERGED FROM CLASSIFICATION ✗"; fi
 exit $fail

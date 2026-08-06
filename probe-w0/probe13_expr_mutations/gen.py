@@ -416,6 +416,56 @@ def scope_binder_typ_flip(sst):
     return sst[:b0] + mut + sst[b1:]
 
 
+def scope_exit_name_drift(sst):
+    """b81 review R1 kill (SST-side): drift the POST-SCOPE hyp's name —
+    the trailing ∀-fact Assume carries `_h_hoist_1` (leaf 10): the
+    scope's discarded hyps do NOT count on post-scope goal paths
+    (production's per-goal-path numbering; the serializer restores
+    hyp_ordinal at DeadEnd exit). Rewriting it to `_h_hoist_2` (leaf
+    12) reproduces the pre-restore bug: refWp's leading prefix names
+    the hyp `_h_hoist_2` where production has `_h_hoist_1`."""
+    pat = "lib.StmData.Assume 10 23"
+    i = sst.find(pat)
+    assert i != -1, "scope_exit_name_drift: trailing ∀-fact Assume (10, 23) not found — renumbered?"
+    assert sst.find(pat, i + 1) == -1, "scope_exit_name_drift: pattern not unique"
+    return sst[:i] + "lib.StmData.Assume 12 23" + sst[i + len(pat):]
+
+
+def _deadend_args_nth(sst, n):
+    """Like `_deadend_args` but for the n-th (0-based) `lib.StmData.DeadEnd`
+    node — the nested assert-forall subject (F31) has two."""
+    key = "lib.StmData.DeadEnd "
+    j = -1
+    for _ in range(n + 1):
+        j = sst.find(key, j + 1)
+        assert j != -1, f"deadend: fewer than {n + 1} DeadEnd nodes"
+    i = j + len(key)
+    binders = take_sexpr(sst, i)
+    bounds = take_sexpr(sst, binders[1])
+    body = take_sexpr(sst, bounds[1])
+    for name, sp in (("binders", binders), ("bounds", bounds), ("body", body)):
+        assert sst[sp[0]] == '(', f"deadend[{n}]: {name} not a paren group"
+    return binders, bounds, body
+
+
+def scope_dedup_rebind(sst):
+    """b81 review R2 kill (SST-side): REBIND the dedup'd skolem — the
+    nested subject's inner DeadEnd carries Nil/Nil binders (j and k are
+    already bound by the OUTER scope — production's `already_bound`
+    filter). Re-inserting j makes refWp ∀-bind j a second time on the
+    inner goals where production does not — pins that the dedup mirror
+    is load-bearing (a serializer that naively rebound every
+    assert-forall's skolems would diverge exactly here)."""
+    (b0, b1), _, _ = _deadend_args_nth(sst, 1)
+    binders = sst[b0:b1]
+    assert binders == "(Tactus.Box.mk lib.BinderList.Nil)", \
+        f"scope_dedup_rebind: inner binders not dedup'd to Nil: {binders!r}"
+    outer, _, _ = _deadend_args_nth(sst, 0)
+    assert "lib.BinderList.Cons 5 6" in sst[outer[0]:outer[1]], \
+        "scope_dedup_rebind: outer j-binder (Cons 5 6) not found — leaf ids renumbered?"
+    return sst[:b0] + "(Tactus.Box.mk (lib.BinderList.Cons 5 6 (Tactus.Box.mk lib.BinderList.Nil)))" + sst[b1:]
+
+
 def _find_nth(s, key, n):
     """Offset of the n-th (1-based) occurrence of `key`."""
     i = -1
@@ -647,6 +697,12 @@ CLASSES = [
     ("forall_int_skolem", "scope_binder_drop", "DeadEnd: drop the assert-forall scope binder (b81 ∀-telescope arm)", scope_binder_drop, "sst", "close"),
     ("forall_u64_skolem", "scope_bound_drop", "DeadEnd: drop the skolem type-bound hyp (b81 Bound slot)", scope_bound_drop, "sst", "close"),
     ("forall_int_skolem", "scope_binder_typ_flip", "DeadEnd: flip the skolem binder typ leaf Int→Nat (b81)", scope_binder_typ_flip, "sst", "close"),
+    # b81 review R2: the dedup mirror is load-bearing — rebinding the
+    # dedup'd skolem on the inner scope flips the bridge.
+    ("forall_nested_shadow", "scope_dedup_rebind", "DeadEnd: rebind the dedup'd skolem on the inner scope (b81 R2 dedup channel)", scope_dedup_rebind, "sst", "close"),
+    # b81 review R1: the post-scope hyp-name channel — drifts to the
+    # pre-restore value (the ordinal-restore fix's regression pin).
+    ("forall_leading_prefix", "scope_exit_name_drift", "DeadEnd: drift the post-scope ∀-fact hyp name _h_hoist_1→_h_hoist_2 (b81 R1 ordinal channel)", scope_exit_name_drift, "sst", "close"),
 ]
 
 

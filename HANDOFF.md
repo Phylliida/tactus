@@ -35,13 +35,18 @@ is `board/bootstrap-81-a6full-forall-binder-telescope.md`.
   rawvir-dt-struct×5, rawvir-field-pat×8, rawvir-readplace-nonlocal×5,
   typ-specfn×17) — **all unmodelable-construct tags; no
   modeled-but-unmirrored tags remain** (`assert-forall` retired).
-- probe9 35/35 (incl. NEW F28/F29 assert-forall subjects) + probe11
-  **13/13** (incl. both `lemma_runtime_word_view_*` fns, certified and
-  bridge-closed on their first live run) — zero honest-fails
-  corpus-wide. probe13 **25 classes** (+3 scope-binder kills), probes
-  14/17/37/38 ✓, lean_verify units **437+7/0**, golden re-vendored
-  (pure @rust: line drift), e2e **829/2** (documented pre-existing
-  examples pair flat_combine/tutorial_fifo).
+- probe9 37/37 (incl. F28/F29 assert-forall subjects + F30
+  `forall_leading_prefix` + F31 `forall_nested_shadow` from the review
+  round) + probe11 **13/13** (incl. both `lemma_runtime_word_view_*`
+  fns, certified and bridge-closed on their first live run) — zero
+  honest-fails corpus-wide. probe13 **27 classes** (+3 scope-binder
+  kills +2 review-round kills: `scope_exit_name_drift`,
+  `scope_dedup_rebind`), probes 14/17/37/38 ✓, lean_verify units
+  **437+7/0**, golden re-vendored (pure @rust: line drift), e2e
+  **829/2** (documented pre-existing examples pair
+  flat_combine/tutorial_fifo). probe9 has a subject-population pin now
+  (35 expected subjects + mix_trip2 documented-absent) — same class as
+  probe11's b78 S5 pin.
 - probe20 stays deferred (vendored old-shape tgt defcerts; no tgt
   gates — Danielle's constraint; probe11's scoped per-module emits are
   the accepted lighter path).
@@ -120,6 +125,14 @@ is `board/bootstrap-81-a6full-forall-binder-telescope.md`.
 
 ## Gotchas (all bitten; b81 additions first)
 
+- **The `hyp_ordinal` walk counter is PER-GOAL-PATH, not global** —
+  production's `split_leading_binders` numbers each goal's Hyp frames
+  1-based after the base binders, so any construct that DISCARDS hyps
+  from the path (DeadEnd scopes today) must restore the ordinal at
+  exit (the b81 review round's real catch: latent pre-b81, surfaced by
+  F30's post-scope named ∀-fact; pinned by probe13
+  `scope_exit_name_drift`). The If arms already do this via
+  `branch_state`; the DeadEnd arm now mirrors it.
 - **Vocabulary ctor fields of list type are `Box<…>` — `box_()` the
   slot terms.** Era 1 emitted the DeadEnd list slots unboxed; EVERY
   era-1 cert was ill-typed-by-construction and no probe caught it
