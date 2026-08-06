@@ -1,5 +1,20 @@
 # NEXT — bootstrap work queue (2026-07-21; superseded 2026-07-24)
 
+**2026-08-06: row 11b (A6-full ∀-binder telescope arm) CARDED —
+`board/bootstrap-81-a6full-forall-binder-telescope.md`, DESIGN PROPOSED,
+awaiting Danielle's review before implementation.** Step-0 evidence
+frozen from the live probe11 out-tree: the `assert-forall` census
+population is exactly 2 tgt fns (`lemma_runtime_word_view_subrange`/
+`append`); the only unmodeled content is the ∀-binder frame itself
+(the `True →` in production's telescope is the SST lowering's
+`assume(has_typ(k, int))`, an ordinary Assume already mirrored).
+Design: `StmData::DeadEnd` gains `BinderList`/`ParamBoundList` slots
+(byte-stable Nil/Nil elsewhere), refWp reuses `mod_var_frames`
+unchanged, serializer mirrors `Wp::Scope`'s `already_bound` dedup,
+tag DELETED (not kept at 0), fixture gains its first assert-forall
+subject, probe11 expects SUBJECT-RETURNED → 13/13. Three open
+questions on the card for Danielle. Implementation NOT started.
+
 **2026-08-03: milestone B2 (b68 bridge default flip) DONE — MILESTONE B
 (b67+b68) COMPLETE; bootstrap-09 (W4) CLOSED.** Full record + design
 reviews on `board/bootstrap-68-w4c-bridge-default-flip.md`. THREE
