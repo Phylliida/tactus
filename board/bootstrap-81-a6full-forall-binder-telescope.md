@@ -262,6 +262,153 @@ Done-when (all):
    threaded (D2) — axiom closures unchanged (⊆ [propext,
    Classical.choice, Quot.sound]).
 
+## Retrospective design review (2026-08-06, Danielle-requested, second
+round — the arc itself, not the code)
+
+### A. Verdict per design decision
+
+- **D1 (reuse the Loop slot family — `BinderList`/`ParamBoundList` +
+  `mod_var_frames` — for the DeadEnd scope binders): RIGHT, and the
+  strongest decision of the brick.** Zero new close/render/semantics
+  machinery (FBind→All, holds's value-quantification, mod_var_frames
+  all pre-existing); era-1 byte-stability fell out of
+  `mod_var_frames(Nil, Nil) = FNil` by construction; the W5 soundness
+  absorbed the arm with zero statement changes. The generalizable
+  pattern: *a new arm should first look for the existing frame shape
+  that already models production's behavior and reuse the slot family
+  verbatim* — vocabulary growth over machinery growth.
+- **D2 (two-era staging): VALIDATED, with one refinement learned.**
+  The era split did catch the unboxed-slot bug at era 2's first
+  subject — but era 1's "byte-stable" proof had a blind spot worth
+  naming: it covers only emission paths the CURRENT corpus
+  instantiates. No era-1 cert had a DeadEnd node, so era 1 shipped an
+  ill-typed emission latently. Refinement (now in HANDOFF): *a
+  vocabulary arm's first live subject must probe ELABORATION
+  separately from goal drift* — and stronger: grow the corpus subject
+  FIRST (era 0), so era 1's stability era exercises the rejection
+  path and era 2 the close path with the subject already in place.
+- **D3 (dedup mirror via `forall_bound_names`): faithful but shipped
+  untested for a day — a process miss, not a design miss.** The design
+  was right (enumerate producers of production's `CtxFrame::Binder`
+  set: scope vars, loop mod vars, IfCtor field binders — the IfCtor
+  one was caught at card-amendment time, not in the original design;
+  enumerating producers should be a CARD-time step). The miss: no
+  corpus subject exercised it until F31 (see §C).
+- **D4 (step-0 evidence before design): paid off again.** Reading the
+  SST lowering (`assume_has_typ`) before designing collapsed the arm
+  to "the binder frame and nothing else" — without it we would have
+  built bound-hyp machinery for Int skolems (wrong). The b74 lesson
+  holds: no card without frozen step-0 evidence from live emissions.
+- **D5 (mutation-kill-per-channel): worked, and the review round
+  extended it correctly.** But note the ordinal/name channel was NOT
+  enumerated as a kill at card time — the kills pointed at the
+  emitted slots (binder/bound/typ), not at the THREADED state
+  (counters, name sets). Threaded state is where the real bug lived.
+- **D6 (fixture subjects F28/F29): covered the vocabulary dimensions
+  (NoBound/Bound × leading/mid — or so I thought) but not the
+  PRODUCTION-BEHAVIOR dimensions.** The correct matrix for this arm
+  was {leading-prefix vs past-latch} × {flat vs nested} ×
+  {NoBound vs Bound}; F28/F29 covered one cell each and R1/R2 were
+  the missing rows. *Subject matrices belong over production-behavior
+  dimensions, enumerated at card time.*
+
+### B. Bug taxonomy for the day (3 real bugs + near-misses)
+
+1. **box_() arity (era 1)** — class: emission-shape bug invisible to
+   byte-stability (no corpus cert instantiated the path). Caught by:
+   era-2 first-subject elaboration. Would have caught earlier: era-0
+   subject-first discipline (§A-D2).
+2. **hyp_ordinal not restored at DeadEnd exit (era 2, review round)**
+   — class: threaded-state invariant NEVER WRITTEN DOWN. The walk
+   counter is per-goal-path; the If arms maintain this via
+   branch_state (whose comment documents the ordinal's "own snapshot
+   rule"), but no artifact lists WHICH state is per-path, so a new
+   path-discarding construct (DeadEnd — the only one besides If)
+   inherited the violation. Latent pre-b81: any assert-by DeadEnd
+   with inner asserts + a post-scope named hyp would have diverged.
+   Caught by: F30 (a subject built to probe an unpinned channel).
+   Would have caught earlier: a per-path state audit at card time
+   (§D below).
+3. **Dedup mirror untested (era 2, review round)** — class: untested
+   interaction (faithful but unproven). Caught by: F31. Would have
+   caught earlier: the production-behavior subject matrix (§A-D6).
+4. Near-misses (self-inflicted, caught in minutes): a stray
+   `tactus_tactic` attribute on u_esf_deadend, one
+   replace-instead-of-append edit in probe13/gen.py — both caught by
+   immediate re-read. The Edit discipline (read-before-edit, unique
+   anchors) held otherwise.
+
+### C. Principle audit (Danielle's 5)
+
+1. **Right way / cleaner:** mostly yes — D1's reuse is the cleanest
+   possible shape; the frame-algebra lemmas added
+   (`frame_append_fnil_right`, 4 `u_fapp_*`, `u_mvf_nil_nil`) are
+   permanent, reusable library, not brick-local workarounds.
+2. **Trusted surface: SHRANK.** One census silencing tag retired;
+   one construct family moved from excluded to checked; every new
+   serializer predicate (dedup membership, ordinal behavior) is
+   bridge-checked or kill-pinned; bound props come from production's
+   own `type_bound_predicate` (shared single-source).
+3. **Lean-idiomatic:** the emitted telescopes are production's own
+   (∀ (k : Int) in-goal); no mirror invention.
+4. **Transparency:** the cert literal shows `scope_binders`/
+   `scope_bounds` next to the DeadEnd node, readable against the
+   Rust `assert forall`; Bound/NoBound maps visibly to production's
+   type_bound_predicate presence.
+5. **Predictability:** zero special cases (uniform Nil/Nil, reused
+   fold, no Int-only carve-out). The one moment a special case
+   beckoned (skipping the FNil append) it was correctly refused and
+   the general lemma was built instead.
+
+### D. Process changes this retro recommends (for the card template
+and Done-when)
+
+1. **Subject matrix at card time, over production-behavior
+   dimensions** (not vocabulary dimensions). For this arm it would
+   have been {leading-prefix, past-latch} × {flat, nested} ×
+   {NoBound, Bound} — R1/R2 were the missing rows, free to foresee.
+2. **Per-path state audit at card time for any construct that
+   DISCARDS path state.** Enumerate explicitly: bound_names,
+   forall_bound_names, rename_env, flet_forced, poison_forced,
+   hyp_ordinal (per-path) vs emit_ordinal (global — correctly NOT
+   restored). One open audit item from this retro: `let_binder_typs`
+   is written monotonically (line 3987, call-dest lets) with NO
+   branch/scope restore, while production's OblCtx ledger is cloned
+   per path — a PRE-EXISTING divergence candidate (needs a
+   same-name-different-typ Ref-coerced read across paths; no corpus
+   subject; the field's own doc already flags the class as
+   demand-driven). Not a confirmed bug — listed so the next arm that
+   touches let-records audits it.
+3. **Era-0 subject-first discipline for vocabulary arms:** grow the
+   fixture subject before the serializer arm, so era 1 validates the
+   rejection and era 2 validates the close against an already-present
+   subject; the first live subject always probes elaboration
+   separately from drift.
+4. **Done-when gains "review round completed"** — the post-landing
+   skeptic review is 3-for-3 on major bricks (b77 contract
+   overstatement, b78 unpinned two-mut-arg + forced-state leak, b81
+   box_ + ordinal restore). It is not polish; it is where the
+   interaction bugs live.
+5. **Recursive proof fns in tactus-core: copy the nearest existing
+   one's shape FIRST** (attributes, u_*-unfolds-in-arm pattern,
+   closer string) — the rec_1 fight cost 4 gate iterations
+   rediscovering what `holds_close_e_wrap` already demonstrated.
+
+### E. Production quirks observed (faithful mirroring confirmed;
+flagged for possible upstream attention)
+
+- For a u64 skolem, the bound hyp renders TWICE in the telescope
+  (`Imp 16 Imp 16`): push_mod_var_frames' bound + the SST lowering's
+  `assume(has_typ(k, u64))` — the same `0 ≤ k < 2^64` fact from two
+  sources. For Int the has_typ is `True` (noise, but harmless).
+- `collect_assert_by_vars_in` walks INTO nested DeadEnd scopes, so an
+  inner assert-forall's skolem is ∀-bound on the OUTER scope's goals
+  (visible before its syntactic scope starts) and dedup'd at the
+  inner scope. Coherent, but surprising — the mirror reproduces it
+  exactly (F31); if production ever tightens collection to
+  own-scope-only, the inner dedup path dies with it and F31 + the
+  `scope_dedup_rebind` kill will say so loud.
+
 ## Review round (2026-08-06, Danielle-requested design review) — found
 TWO REAL GAPS and, through them, ONE REAL LATENT BUG
 
