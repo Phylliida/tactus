@@ -1,8 +1,9 @@
 # bootstrap-81 — A6-full: the ∀-binder telescope arm (kills the `assert-forall` tag)
 
-Status: **DESIGN PROPOSED 2026-08-06 — step-0 evidence frozen (§
-"Step-0 evidence"), design review requested before implementation**
-(the b67/b79/b80 model: review on the card FIRST, then implement).
+Status: **DESIGN FROZEN 2026-08-06 — step-0 evidence frozen (§
+"Step-0 evidence"); all 3 open questions resolved by Danielle's
+standing principles (§ "Open questions" below). Era 1 (D1+D2
+model-only, byte-stability era) IN PROGRESS.**
 Implements endgame table row 11b (DESIGN-bootstrap-endgame.md §8):
 retire the `assert-forall` census tag — b68 scaffolding, never
 permanent — by modeling `assert forall … by { … }` skolem binders in
@@ -267,17 +268,29 @@ Done-when (all):
 6. Full battery (D7) → commit sequence: model / serializer /
    fixture+probes, battery green at each.
 
-## Open questions for Danielle
+## Open questions for Danielle — RESOLVED 2026-08-06 (Danielle: rule by
+the standing principles — right-way/cleaner, trusted-surface shrink,
+Lean-idiomatic, transparency, predictability-over-special-cases)
 
-1. **Tag deletion vs 0-population tripwire (D4):** delete outright
-   (modeled construct, tag unfireable) or keep as a permanent
-   tripwire? Recommendation: delete — P2's hard-error channel (O7
-   unclassified drift) already catches any bridge failure the tag
-   would have softened; a dead tag is inventory noise.
-2. **Fixture subject shape (D5):** one proof-fn subject (Int skolem,
-   NoBound) + one bounded-typ variant — enough, or also an exec fn
-   with assert-forall? (tgt has no exec-mode assert-forall subject
-   today; census says the vocabulary need is the proof-fn shape.)
-3. Anything in D2/D3 you'd rather see staged differently (e.g.
-   D1+D2 model-only commit verified against the byte-stability pins
-   before the serializer arm lands — the b80 two-era pattern).
+1. **Tag deletion vs 0-population tripwire (D4) — RESOLVED: DELETE.**
+   A census tag is a silencing channel: it converts an unbridged fn
+   from a hard error into an accepted exclusion. A tag that "can't
+   fire" only decides what happens if it ever DOES fire (a
+   serialization regression on an assert-forall fn) — and kept, the
+   answer is "inventoried quietly"; deleted, it's unclassified drift =
+   O7 hard error post-flip. Strictly louder (principle 2; the b78 S5
+   masking lesson; the endgame text itself calls the tag b68
+   scaffolding, never permanent).
+2. **Fixture subject shape (D5) — RESOLVED: two proof-fn subjects
+   (Int NoBound + u64 Bound), NO exec subject.** The vocabulary delta
+   has exactly two shapes. tgt's corpus has only Int skolems and
+   exec-vs-proof mode doesn't interact with the DeadEnd arm, so exec
+   composition coverage without corpus evidence is speculative
+   generality (principle 5) — but the Bound path must be BOTH
+   implemented and tested, since an Int-only arm would be exactly the
+   special case principle 5 forbids.
+3. **Staging (D7) — RESOLVED: b80 two-era pattern.** Era 1 = D1+D2
+   model-only (serializer still rejects; Nil/Nil everywhere) with the
+   byte-stability pins as the drift proof; era 2 = D3 serializer arm +
+   D5/D6 fixture/probes. Cheap, bisectable, and byte-stability is the
+   validation the architecture already provides (principle 1).
