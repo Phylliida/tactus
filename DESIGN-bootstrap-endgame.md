@@ -243,6 +243,18 @@ The real fix (the `∀ (k : Int)` stage-A telescope binder arm) stays
 planned post-flip work — row 11b, per Q4: the tag is b68 scaffolding,
 never permanent. **Acceptance (full, 11b):** the tag population drops
 to 0 and the binder frame enters the D in-model column.
+**ROW 11b DONE 2026-08-06 (bootstrap-81, era-1 `0f311a66` + era-2
+`bdda526c` + review follow-ups): the arm LANDED as designed —
+`StmData::DeadEnd(BinderList, ParamBoundList, body)` + serializer
+transcription with the `already_bound` dedup mirror; the tag is
+RETIRED (population 0 by deletion); the binder frame is in the D
+column (`deadend_scope_binder_pin`). Both tgt subjects bridge-CLOSE
+(probe11 13/13). The post-landing review found + fixed two real
+gaps: the leading-prefix named-binder rendering and the nested
+dedup were untested, and F30/F31 surfaced a REAL latent bug — the
+serializer's `hyp_ordinal` walk counter must restore at DeadEnd exit
+(production's `_h_hoist_k` numbering is per-goal-path; the scope's
+discarded hyps don't count on post-scope paths).**
 
 ### A7 — stage-B deep-leaf growth: the vec_read class (medium)
 
@@ -368,7 +380,7 @@ Independent of the critical path; pick up in gap sessions:
 | 9 | D — in-model tripwire column | small | new | — |
 | 10 | B1 — b67 caching + fingerprint + costs | medium | b67 | — |
 | 11 | B2 — b68 default flip | small | b68 | P2, P3, 1–8, 10 |
-| 11b | A6-full — ∀-binder telescope arm (kills the tag) | medium | new | post-flip (Q4) |
+| 11b | A6-full — ∀-binder telescope arm (kills the tag) | **DONE 08-06** | b81 (closed) | post-flip (Q4) |
 | 12 | E — W8 authority flip | small-med | b13 | B soak (Q2) |
 | 13 | F — hygiene / vstd / differential | small ×3 | new ×3 | — |
 

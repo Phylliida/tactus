@@ -3373,6 +3373,14 @@ impl<'a> Serializer<'a> {
                     &self.assert_by_var_typs,
                 );
                 let pre_scope = self.forall_bound_names.clone();
+                // The hyp ordinal is PER-GOAL-PATH (production's
+                // split_leading_binders numbers each goal's Hyp frames
+                // 1-based after the base binders) — the scope's hyps are
+                // NOT on post-scope goals' paths, so the ordinal restores
+                // at scope exit alongside the binder set (F30 evidence:
+                // production's post-scope ∀-fact is `_h_hoist_1`, not
+                // the walk counter's next value).
+                let pre_scope_ordinal = self.hyp_ordinal;
                 let mut binder_entries: Vec<(u64, u64)> = Vec::new();
                 let mut bound_entries: Vec<Option<(u64, u64)>> = Vec::new();
                 for &(vid, typ) in scope_vars.iter() {
@@ -3409,8 +3417,11 @@ impl<'a> Serializer<'a> {
                 }
                 let b = self.stm(inner)?;
                 // The scope's binders do not leak into the continuation
-                // (production walks `after` under the ORIGINAL obl).
+                // (production walks `after` under the ORIGINAL obl) —
+                // and neither do its hyp ordinals (per-goal-path
+                // numbering, above).
                 self.forall_bound_names = pre_scope;
+                self.hyp_ordinal = pre_scope_ordinal;
                 Ok(format!(
                     "({}.StmData.DeadEnd {} {} {})",
                     NS,
