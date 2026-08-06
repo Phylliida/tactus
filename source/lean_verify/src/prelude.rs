@@ -178,6 +178,29 @@ pub fn ensure_prelude_olean() -> Result<PathBuf, String> {
     if fresh {
         return Ok(dir);
     }
+    // Serialize rebuilds process-wide. The gate's verifier threads share
+    // one process — and therefore one pid-unique `build-<pid>-<name>`
+    // dir. Without the lock, every thread that sees not-fresh (e.g.
+    // right after a prelude-text bump, when the new prelude-<hash> dir
+    // doesn't exist yet) enters `build_module` CONCURRENTLY in the same
+    // build dir, and the first finisher's `remove_dir_all(build)`
+    // deletes the cwd of the others' still-running `lean` — "failed to
+    // create file 'TactusDefs.olean'" (latent since the pid-unique build
+    // dir; first bitten 2026-08-06 on b82's prelude bump, 230 fns red).
+    // Cross-process builders need no lock: distinct pids get distinct
+    // build dirs and write identical content.
+    static REBUILD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = REBUILD_LOCK
+        .lock()
+        .map_err(|e| format!("prelude rebuild lock poisoned: {}", e))?;
+    // Re-check under the lock: a thread that got here first may have
+    // completed the rebuild while we waited.
+    if defs_olean.exists()
+        && search_olean.exists()
+        && std::fs::read_to_string(&marker).ok().as_deref() == Some(&marker_content)
+    {
+        return Ok(dir);
+    }
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("could not create {}: {}", dir.display(), e))?;
     std::fs::write(&defs_lean, TACTUS_DEFS)
