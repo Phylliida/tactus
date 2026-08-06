@@ -434,7 +434,9 @@ pub fn census_excluded_summary() -> (u64, String) {
 /// way to exercise the bridge-fail channel in-harness (the gate
 /// re-emits certs from SST every run, so an on-disk cert edit never
 /// reaches the bridge). Loud when it matches; test-only hook, never
-/// set in production.
+/// set in production. Living in the trusted serializer is acceptable
+/// because the hook is ONE-DIRECTIONAL: it injects drift, which can
+/// only force the bridge RED — it cannot manufacture a false pass.
 fn bridge_perturb_matches(fn_short: &str) -> bool {
     static KNOB: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let knob = KNOB.get_or_init(|| {

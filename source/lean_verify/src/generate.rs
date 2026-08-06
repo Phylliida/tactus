@@ -2967,32 +2967,67 @@ static STMTS_OLEAN_MEMO: std::sync::OnceLock<
         String, std::sync::Arc<std::sync::OnceLock<Result<(), String>>>>>,
 > = std::sync::OnceLock::new();
 
-/// P3(a)/b68: content key tying a built olean to the exact source it
-/// was built from — {module `.lean` content, Lean toolchain, prelude}.
-/// FNV-1a, matching `vocab_hash` / `core_olean_hash` /
-/// `bridge_cache_key` style; the `w4c1` tag versions the scheme.
-/// The prelude dir's name is content-addressed, so its path string
-/// stands in for a prelude fingerprint.
-fn olean_srckey(lean_content: &str, prelude_dir: &Path) -> String {
+/// P3(a)/b68: FNV-1a over the tagged piece list, matching `vocab_hash` /
+/// `core_olean_hash` / `bridge_cache_key` style. Each piece gets a
+/// separator (FNV over concatenation would be ambiguous).
+fn srckey_hash(parts: &[&str]) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
-    let mut mix = |piece: &str, h: &mut u64| {
+    for piece in parts {
         for b in piece.as_bytes() {
-            *h ^= *b as u64;
-            *h = h.wrapping_mul(0x100000001b3);
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
         }
-        // Component separator (FNV over concatenation would be ambiguous).
-        *h ^= 0xff;
-        *h = h.wrapping_mul(0x100000001b3);
-    };
-    mix("w4c1", &mut h);
-    mix(lean_content, &mut h);
-    mix(crate::project::toolchain_fingerprint(), &mut h);
-    mix(&prelude_dir.to_string_lossy(), &mut h);
+        h ^= 0xff;
+        h = h.wrapping_mul(0x100000001b3);
+    }
     format!("fnv1a:{:016x}", h)
 }
 
+/// Content key for a STMT module's olean (`w4c1`): {module `.lean`
+/// content, Lean toolchain, prelude}. The prelude dir's name is
+/// content-addressed, so its path string stands in for a prelude
+/// fingerprint. `None` when the `.lean` is unreadable (treated as
+/// not-fresh by callers).
+fn stmt_srckey(lean_path: &Path, prelude_dir: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(lean_path).ok()?;
+    Some(srckey_hash(&[
+        "w4c1",
+        &content,
+        crate::project::toolchain_fingerprint(),
+        &prelude_dir.to_string_lossy(),
+    ]))
+}
+
+/// Content key for a PKG module's olean (`w4c2`): own `.lean` content,
+/// toolchain, prelude, AND the current `.lean` content of every
+/// imported `TactusStmts_*` module — the import list read off the
+/// artifact (it IS the dependency manifest, M5d-2). The stmt half is
+/// load-bearing (P3(a) residual, found in the post-landing design
+/// review): a pkg module references its helpers' stmt defs BY NAME, so
+/// its text is unchanged when a helper's statement changes — and Lean
+/// never re-checks olean contents on load, so a pkg olean built
+/// against the OLD stmt olean would be silently trusted (warm green
+/// where a cold tree reds) if the key didn't cover it. The stmt
+/// `.lean` content (not the stmt's own srckey file) is mixed because
+/// that file can itself be stale at decision time. `None` when any
+/// needed file is unreadable (treated as not-fresh by callers).
+fn pkg_srckey(lean_path: &Path, defs_dir: &Path, prelude_dir: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(lean_path).ok()?;
+    let imports = crate::driver_client::header_imports(lean_path)?;
+    let mut parts: Vec<String> = vec![
+        "w4c2".to_string(),
+        content,
+        crate::project::toolchain_fingerprint().to_string(),
+        prelude_dir.to_string_lossy().into_owned(),
+    ];
+    for imp in imports.iter().filter(|i| i.starts_with("TactusStmts_")) {
+        parts.push(std::fs::read_to_string(defs_dir.join(format!("{imp}.lean"))).ok()?);
+    }
+    Some(srckey_hash(&parts.iter().map(|s| s.as_str()).collect::<Vec<_>>()))
+}
+
 /// Path of an olean's freshness marker: `<olean>.srckey`, holding the
-/// `olean_srckey` of the source the olean was built from.
+/// srckey of the source the olean was built from.
 fn srckey_path(olean: &Path) -> PathBuf {
     let mut p = olean.as_os_str().to_owned();
     p.push(".srckey");
@@ -3000,33 +3035,23 @@ fn srckey_path(olean: &Path) -> PathBuf {
 }
 
 /// Cross-run freshness for a built olean (P3(a)): the olean exists AND
-/// its srckey marker matches the current `.lean` content — the marker
-/// is written only after a successful build, so a match means the
-/// olean was provably built from this exact source. Bare existence is
-/// NOT sufficient: an interrupted run leaves a fresh `.lean` beside a
+/// its srckey marker matches the freshly-computed key — the marker is
+/// written only after a successful build, so a match means the olean
+/// was provably built from exactly this source. Bare existence is NOT
+/// sufficient: an interrupted run leaves a fresh `.lean` beside a
 /// stale olean, and existence-only trust turns that skew into a
 /// misleading Type-mismatch/sorry cascade downstream (FINDINGS §4).
-fn olean_fresh(olean: &Path, lean_path: &Path, prelude_dir: &Path) -> bool {
-    if !olean.exists() {
-        return false;
-    }
-    let (Ok(content), Ok(marker)) = (
-        std::fs::read_to_string(lean_path),
-        std::fs::read_to_string(srckey_path(olean)),
-    ) else {
-        return false;
-    };
-    marker == olean_srckey(&content, prelude_dir)
+fn olean_fresh(olean: &Path, key: &str) -> bool {
+    olean.exists()
+        && std::fs::read_to_string(srckey_path(olean)).ok().as_deref() == Some(key)
 }
 
 /// Island-marker discipline for olean freshness (P3(a)): after a
 /// successful build, record the source key; before any live build the
 /// caller removes the marker, so a crashed or failed run leaves no
 /// stale trust.
-fn record_olean_built(olean: &Path, lean_path: &Path, prelude_dir: &Path) {
-    if let Ok(content) = std::fs::read_to_string(lean_path) {
-        let _ = std::fs::write(srckey_path(olean), olean_srckey(&content, prelude_dir));
-    }
+fn record_olean_built(olean: &Path, key: &str) {
+    let _ = std::fs::write(srckey_path(olean), key);
 }
 
 /// Ensure ONE stmt module's olean exists (M5d-2; the `.lean` was
@@ -3049,7 +3074,8 @@ fn ensure_stmt_olean(
     cell.get_or_init(|| {
         let lean_path = defs.dir.join(format!("{}.lean", module));
         let olean_path = defs.dir.join(format!("{}.olean", module));
-        if may_skip && olean_fresh(&olean_path, &lean_path, prelude_dir) {
+        let key = stmt_srckey(&lean_path, prelude_dir);
+        if may_skip && key.as_deref().map_or(false, |k| olean_fresh(&olean_path, k)) {
             skipped.set(true);
             return Ok(());
         }
@@ -3061,7 +3087,9 @@ fn ensure_stmt_olean(
         run_lean(&defs.dir, module, true, &base_path, &mut failures);
         match failures.pop() {
             None => {
-                record_olean_built(&olean_path, &lean_path, prelude_dir);
+                if let Some(k) = key {
+                    record_olean_built(&olean_path, &k);
+                }
                 Ok(())
             }
             Some((_, out)) => Err(format!("stmt olean build failed ({}):\n{}", module, out)),
@@ -3225,11 +3253,12 @@ pub fn prime_lean_driver(
     // fall back).
     let mut wide: Vec<String> = vec![defs.module_name.clone()];
     wide.extend(stmt_list.iter()
-        .filter(|(m, _)| olean_fresh(
-            &defs.dir.join(format!("{m}.olean")),
-            &defs.dir.join(format!("{m}.lean")),
-            &prelude_dir,
-        ))
+        .filter(|(m, _)| {
+            stmt_srckey(&defs.dir.join(format!("{m}.lean")), &prelude_dir)
+                .map_or(false, |k| {
+                    olean_fresh(&defs.dir.join(format!("{m}.olean")), &k)
+                })
+        })
         .map(|(m, _)| (*m).clone()));
     crate::driver_client::add_snapshot_all("wide", &wide);
     // Search-ladder variant: pkg files whose closers needed the search
@@ -3287,14 +3316,17 @@ fn check_proof_fn_via_package(
         Ok(PkgEmitOutcome::Single { leaf, path, source_map, stmt_modules, changed }) => {
             // Cross-run cache (M5e): everything this module sees is
             // unchanged (own text, stmt imports, defs non-breaking) and
-            // its olean exists — the prior verdict stands. Sorry
+            // its olean carries a matching srckey marker — provably
+            // built from exactly this content against exactly these
+            // stmt sources (P3(a)) — so the prior verdict stands. Sorry
             // remains gated: the Link pass re-checks the closure every
             // run, so a cached fn can't smuggle one through.
             let olean = path.with_extension("olean");
             let cacheable = !changed
                 && stmt_modules.iter().all(|(_, ch)| !ch)
                 && !defs.breaking
-                && olean_fresh(&olean, &path, &prelude_dir);
+                && pkg_srckey(&path, &defs.dir, &prelude_dir)
+                    .map_or(false, |k| olean_fresh(&olean, &k));
             if cacheable {
                 record_pkg_olean_built(&path);
                 PKG_CACHED_VERDICTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3315,7 +3347,9 @@ fn check_proof_fn_via_package(
             let result = run_lean_json(&pkg_dir, &leaf, true, &base_path);
             if matches!(&result, Ok(r) if r.success) {
                 record_pkg_olean_built(&path);
-                record_olean_built(&olean, &path, &prelude_dir);
+                if let Some(k) = pkg_srckey(&path, &defs.dir, &prelude_dir) {
+                    record_olean_built(&olean, &k);
+                }
             }
             Some(format_lean_check_result(result, proof_fn, &path, &source_map))
         }
@@ -3330,7 +3364,8 @@ fn check_proof_fn_via_package(
             let cacheable = !changed
                 && stmt_modules.iter().all(|(_, ch)| !ch)
                 && !defs.breaking
-                && olean_fresh(&olean, &path, &prelude_dir);
+                && pkg_srckey(&path, &defs.dir, &prelude_dir)
+                    .map_or(false, |k| olean_fresh(&olean, &k));
             let cell = memo_cell(&MUTUAL_CHECK_MEMO, &path);
             let verdict = cell.get_or_init(|| {
                 if cacheable {
@@ -3368,7 +3403,9 @@ fn check_proof_fn_via_package(
             };
             if verdict.success {
                 record_pkg_olean_built(&path);
-                record_olean_built(&olean, &path, &prelude_dir);
+                if let Some(k) = pkg_srckey(&path, &defs.dir, &prelude_dir) {
+                    record_olean_built(&olean, &k);
+                }
                 let warnings: Vec<String> = verdict.diagnostics.iter()
                     .filter(|d| d.severity == "warning" && d.data.contains("sorry"))
                     .filter(|d| own_region(d))
@@ -3969,9 +4006,9 @@ pub fn check_package(
             let before = failures.len();
             run_lean(&pkg_dir, leaf, true, &base_path, &mut failures);
             if failures.len() == before {
-                record_olean_built(
-                    &lean_path.with_extension("olean"), &lean_path, &prelude_dir,
-                );
+                if let Some(k) = pkg_srckey(&lean_path, &defs.dir, &prelude_dir) {
+                    record_olean_built(&lean_path.with_extension("olean"), &k);
+                }
             }
         }
     }
@@ -5859,7 +5896,8 @@ fn check_exec_fn_via_package(
             let cacheable = !changed
                 && stmt_modules.iter().all(|(_, ch)| !ch)
                 && !defs.breaking
-                && olean_fresh(&olean, &path, &prelude_dir);
+                && pkg_srckey(&path, &defs.dir, &prelude_dir)
+                    .map_or(false, |k| olean_fresh(&olean, &k));
             if cacheable {
                 record_pkg_olean_built(&path);
                 PKG_CACHED_VERDICTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5884,7 +5922,9 @@ fn check_exec_fn_via_package(
             // an ungated sorry.)
             if matches!(&result, Ok(r) if r.success) {
                 record_pkg_olean_built(&path);
-                record_olean_built(&olean, &path, &prelude_dir);
+                if let Some(k) = pkg_srckey(&path, &defs.dir, &prelude_dir) {
+                    record_olean_built(&olean, &k);
+                }
             }
             // assume(P)-site warnings: same collection as the island
             // path (`emit_exec_fn`) — the pkg route previously dropped

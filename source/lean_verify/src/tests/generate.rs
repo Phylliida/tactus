@@ -333,21 +333,24 @@ fn olean_srckey_freshness_contract() {
     let prelude = std::path::Path::new("/tactus-p3a-test-prelude");
     std::fs::write(&lean, "theorem a : True := by triv").unwrap();
     std::fs::write(&olean, b"olean-bytes").unwrap();
+    let key_v1 = stmt_srckey(&lean, prelude).unwrap();
     // Existence alone is NOT freshness (the P3(a) hole).
-    assert!(!olean_fresh(&olean, &lean, prelude));
+    assert!(!olean_fresh(&olean, &key_v1));
     // After a successful build the marker makes it fresh...
-    record_olean_built(&olean, &lean, prelude);
-    assert!(olean_fresh(&olean, &lean, prelude));
+    record_olean_built(&olean, &key_v1);
+    assert!(olean_fresh(&olean, &key_v1));
     // ...and any source change invalidates it (the skew detector).
     std::fs::write(&lean, "theorem a : True := by triv\n-- touched\n").unwrap();
-    assert!(!olean_fresh(&olean, &lean, prelude));
+    let key_v2 = stmt_srckey(&lean, prelude).unwrap();
+    assert_ne!(key_v1, key_v2);
+    assert!(!olean_fresh(&olean, &key_v2));
     // Re-recording after a rebuild restores freshness.
-    record_olean_built(&olean, &lean, prelude);
-    assert!(olean_fresh(&olean, &lean, prelude));
+    record_olean_built(&olean, &key_v2);
+    assert!(olean_fresh(&olean, &key_v2));
     // Marker removed before a live run (island discipline) → not
     // fresh even with the content unchanged.
     std::fs::remove_file(srckey_path(&olean)).unwrap();
-    assert!(!olean_fresh(&olean, &lean, prelude));
+    assert!(!olean_fresh(&olean, &key_v2));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -358,16 +361,70 @@ fn olean_srckey_freshness_contract() {
 fn olean_srckey_components() {
     let prelude_a = std::path::Path::new("/prelude-a");
     let prelude_b = std::path::Path::new("/prelude-b");
+    let lean = std::env::temp_dir().join(format!("tactus_p3a_c_{}.lean", std::process::id()));
+    std::fs::write(&lean, "x").unwrap();
+    let key_with = |p: &std::path::Path| stmt_srckey(&lean, p).unwrap();
     assert_ne!(
-        olean_srckey("text", prelude_a), olean_srckey("text", prelude_b),
+        key_with(prelude_a), key_with(prelude_b),
         "prelude fingerprint is part of the key"
     );
-    assert_ne!(
-        olean_srckey("ab", prelude_a), olean_srckey("a\nb", prelude_a),
-        "content is part of the key"
-    );
+    std::fs::write(&lean, "ab").unwrap();
+    let k1 = key_with(prelude_a);
+    std::fs::write(&lean, "a\nb").unwrap();
+    assert_ne!(k1, key_with(prelude_a), "content is part of the key");
     assert!(
-        olean_srckey("text", prelude_a).starts_with("fnv1a:"),
-        "scheme-tagged key, got {}", olean_srckey("text", prelude_a)
+        k1.starts_with("fnv1a:"),
+        "scheme-tagged key, got {}", k1
     );
+    let _ = std::fs::remove_file(&lean);
+}
+
+/// R1 pin (post-landing review, b68): a pkg olean's key covers the
+/// CURRENT content of every imported `TactusStmts_*` module — a pkg
+/// module references helper stmt defs BY NAME, so its own text is
+/// unchanged when a helper's statement changes, and Lean never
+/// re-checks olean contents on load. Without the import half the pkg
+/// olean would be silently trusted (warm green where a cold tree
+/// reds).
+#[test]
+fn pkg_srckey_covers_stmt_imports() {
+    let dir = std::env::temp_dir().join(format!("tactus_p3a_pkg_{}", std::process::id()));
+    let defs_dir = dir.join("defs");
+    std::fs::create_dir_all(&defs_dir).unwrap();
+    let prelude = std::path::Path::new("/tactus-p3a-test-prelude");
+    let stmt = defs_dir.join("TactusStmts_x__x__lemma_a.lean");
+    std::fs::write(&stmt, "-- stmt v1\n").unwrap();
+    let pkg = dir.join("pkg.lean");
+    std::fs::write(
+        &pkg,
+        "import TactusDefs_x\nimport TactusStmts_x__x__lemma_a\ntheorem t : True := by triv\n",
+    )
+    .unwrap();
+    let k1 = pkg_srckey(&pkg, &defs_dir, prelude).unwrap();
+    // Own-content change flips the key...
+    std::fs::write(
+        &pkg,
+        "import TactusDefs_x\nimport TactusStmts_x__x__lemma_a\ntheorem t : True := by triv\n-- v2\n",
+    )
+    .unwrap();
+    let k2 = pkg_srckey(&pkg, &defs_dir, prelude).unwrap();
+    assert_ne!(k1, k2, "own content is part of the key");
+    std::fs::write(
+        &pkg,
+        "import TactusDefs_x\nimport TactusStmts_x__x__lemma_a\ntheorem t : True := by triv\n",
+    )
+    .unwrap();
+    assert_eq!(k1, pkg_srckey(&pkg, &defs_dir, prelude).unwrap());
+    // ...and so does an imported stmt module's content change, with
+    // the pkg text untouched (the R1 hole).
+    std::fs::write(&stmt, "-- stmt v2\n").unwrap();
+    assert_ne!(
+        k1,
+        pkg_srckey(&pkg, &defs_dir, prelude).unwrap(),
+        "imported stmt content is part of the key (R1)"
+    );
+    // A missing imported stmt module is not-fresh, never a silent key.
+    std::fs::remove_file(&stmt).unwrap();
+    assert!(pkg_srckey(&pkg, &defs_dir, prelude).is_none());
+    let _ = std::fs::remove_dir_all(&dir);
 }
