@@ -1,5 +1,32 @@
 # NEXT — bootstrap work queue (2026-07-21; superseded 2026-07-24)
 
+**2026-08-06 (pm): milestone F brick 1 (b82 prelude hygiene) DONE —
+card `board/bootstrap-82-f1-prelude-hygiene.md` (completion + review
+records).** The three "shrink over time" prelude axioms are gone:
+`Tactus.index` → `noncomputable def` (bounds-check + `Classical.choice`
+fallback, N2 `[Nonempty α]` bracket retained),
+`Tactus.hasResolved`/`Tactus.heightLt` → `opaque` Prop families
+(heightLt companion audit: ZERO — the SST cert path never emits it,
+nothing assumes well-foundedness). **The `arch_word_bits` pair is now
+the ONLY tactus prelude axiom** (closure-check base list shrunk to
+match) — the endgame's prelude-hygiene end state REACHED. Same-day
+catch: the prelude bump surfaced a latent cold-prelude rebuild THREAD
+race (pid-unique build dir shared by 64 gate threads → 230 fns red);
+fixed with `REBUILD_LOCK` in `ensure_prelude_olean` and validated by a
+deliberately cold-prelude gate rerun. Review round: no
+opacity-reliant consumers, no vstd-boundary elaboration differences,
+no stale `expected`-list entries. Battery: units 437+7/0, vstd
+1531/0, gate 298/0 + pkg 54 + discharge 205/0 + bridge 172/172 live
+(warm AND cold), probe9 all-classified, probe11 13/13 (post-regen),
+probe13 27 classes, probes 14/17/37 (adequacy leaves on `[propext]`
+alone — the machine-checked shrink witness)/38 ✓, golden byte-stable,
+e2e 829/2. **NEXT per the endgame map: milestone F siblings
+(vstd-as-package; dual-backend differential runner) — milestone E
+(W8 authority flip, b13) remains gated on the B SOAK (started
+2026-08-03).** Also standing: port the decreasing_by fixes
+(`00827513`) to `tactus/source`; class-3 residual stays HELD for the
+Z3-tactic-recreation arc (Danielle 2026-08-02).
+
 **2026-08-06: row 11b (A6-full ∀-binder telescope arm) DONE — card
 `board/bootstrap-81-a6full-forall-binder-telescope.md` (completion
 record); the `assert-forall` census tag is RETIRED.** Two-era landing

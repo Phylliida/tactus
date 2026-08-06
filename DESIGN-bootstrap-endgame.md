@@ -347,9 +347,15 @@ errors, before starting E. **Card:** `bootstrap-13` (todo, existing).
 
 Independent of the critical path; pick up in gap sessions:
 
-- **Prelude hygiene** (closure-doc §4): definitionalize `Tactus.index`,
-  `Tactus.hasResolved`; audit the `Tactus.heightLt` companions. Target
-  end state: the `arch_word_bits` pair is the only tactus axiom.
+- **Prelude hygiene** (closure-doc §4) — **DONE 2026-08-06 (b82,
+  card `board/bootstrap-82-f1-prelude-hygiene.md`)**: `Tactus.index` →
+  `noncomputable def` (bounds-check + `Classical.choice` fallback, N2
+  bracket retained), `Tactus.hasResolved`/`Tactus.heightLt` → `opaque`
+  Prop families (heightLt companion audit: zero — nothing assumed
+  about the relation). **Target end state REACHED: the `arch_word_bits`
+  pair is the only tactus prelude axiom** (closure-check base list
+  shrunk to match). Also fixed the cold-prelude rebuild thread race
+  (REBUILD_LOCK) the prelude bump surfaced.
 - **vstd as a package**: the Boundary module shrinks to imports; the
   remaining vstd axioms become the explicit, closure-checked cross-crate
   trust surface.
@@ -382,7 +388,7 @@ Independent of the critical path; pick up in gap sessions:
 | 11 | B2 — b68 default flip | small | b68 | P2, P3, 1–8, 10 |
 | 11b | A6-full — ∀-binder telescope arm (kills the tag) | **DONE 08-06** | b81 (closed) | post-flip (Q4) |
 | 12 | E — W8 authority flip | small-med | b13 | B soak (Q2) |
-| 13 | F — hygiene / vstd / differential | small ×3 | new ×3 | — |
+| 13 | F — hygiene (**DONE 08-06, b82: arch pair is the only prelude axiom**) / vstd / differential | small ×3 | b82 (closed), new ×2 | — |
 
 Items 2–4 are independent of each other and of 1; parallelize freely.
 7, 7b and 8 are the only real machinery arcs left in the program.

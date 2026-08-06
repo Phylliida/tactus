@@ -1,9 +1,18 @@
 # bootstrap-82 — F1: prelude hygiene (definitionalize `Tactus.index` / `Tactus.hasResolved` / `Tactus.heightLt`)
 
-Status: **IMPLEMENTATION 2026-08-06 — D1–D5a landed (prelude
-redeclarations + base-list shrink + sanity extractor `opaque` support),
-units 437+7/0 green; battery in progress.** Implements endgame table
-row 13,
+Status: **DONE 2026-08-06 — the `arch_word_bits` pair is now the ONLY
+tactus prelude axiom.** Battery: units 437+7/0, vstd 1531/0, fixture
+certs re-emit rc=0 (golden byte-stable — certs import the prelude, no
+re-vendor needed), tactus-core gate 298/0 + pkg 54 + discharge 205/0 +
+bridge 172/172 live (validated WARM and COLD-prelude — the cold run
+rebuilt the prelude oleans from scratch under 64 threads, zero
+failures), probes 9 (all-classified) / 11 (13/13 post-regen — the b81
+∀-binder subjects close against the new prelude) / 13 (27 classes,
+kills flip) / 14 / 17 / 37 (PASS — adequacy leaves now rest on
+`[propext]` alone, the machine-checked witness of the shrink) / 38 ✓,
+e2e 829/2 (the documented pre-existing flat_combine/tutorial_fifo
+pair). Review round below. Completion record: § "Implementation
+notes". Implements endgame table row 13,
 first of the three milestone-F bricks (DESIGN-bootstrap-endgame.md §7;
 spec = closure-doc §4 item 2, DESIGN-axiom-closure-check.md:174-189;
 program-table row 8, DESIGN-bootstrap.md:106). Target end state: the
@@ -221,21 +230,87 @@ exercisers are the e2e tactus.rs tests + probe11's tgt lane.
    differences in the vstd boundary files, (c) `expected`-list entries
    anywhere naming the three symbols (now inert — confirm harmless).
 
-## Open questions for Danielle
+## Open questions for Danielle — RESOLVED 2026-08-06
 
-- **Q1 — scope: all three in one brick, or index first?** The endgame
-  wording is "definitionalize index/hasResolved, AUDIT heightLt
-  companions". The audit (E2) found zero companions, so D3 reaches the
-  stated end state (arch pair only) in this brick. Recommend: all
-  three; the audit IS the heightLt deliverable and it came back empty.
-- **Q2 — the `:= True` fallback ban.** If opaque elaboration fails
-  (R1), the fallback is keeping that symbol an axiom, not giving the
-  opaque an explicit `True` witness: an explicit witness commits to
-  the everywhere-True interpretation, which is *a* model of the axiom
-  but contradicts the documented intent ("no assumption that it holds
-  or fails"). Confirm the conservative ordering.
-- **Q3 — `arch_word_bits` itself.** Out of scope here (honest platform
-  assumption, closure-doc §4: "the one pair that's honestly an
-  axiom"), but noting for the record: nothing in this brick makes it
-  definitionalizable. Agreed to leave as the standing single axiom
-  pair?
+Danielle: "I trust your judgement for ordering as long as we are
+following the principles, goal is to minimize trust surface as much as
+possible." Resolutions: **Q1 → all three in one brick** (landed); **Q2
+→ keep-axiom fallback confirmed** (moot — opaque elaborated fine, R1
+de-risked pre-card); **Q3 → `arch_word_bits` pair stays** as the
+standing single honest axiom pair.
+
+## Implementation notes (2026-08-06, one session)
+
+Landings, in order:
+
+1. **D1–D4** (`95230d45`): the three redeclarations + closure-check
+   base-list shrink in `TactusDefs.lean`; standalone elaboration of the
+   edited prelude passes. D1's def is
+   `if h : 0 ≤ i ∧ i.toNat < n then a[i.toNat]'h.2 else
+   Classical.choice inferInstance` — `noncomputable` (choice isn't
+   code-generable); core v4.25.0 has no `Classical.arbitrary` (Mathlib
+   name), the fallback is `Classical.choice inferInstance`.
+2. **D5a** (same commit): `sanity.rs`'s `extract_prelude_names`
+   learned the `opaque NAME …` form (the prelude vocabulary now uses
+   it; the extractor's documented contract is every prelude-form lands
+   in the allowlist automatically) + `my_opaque` form-test pin +
+   a `Tactus`-head pin in `recognises_current_prelude`. Dotted
+   references were never at risk (`name_resolves` passes dotted names;
+   the `Tactus` head stays allowlisted via the index def) — this was
+   the right-way fix, not a red test. Units 437+7/0.
+3. **Fixture certs**: re-emit rc=0 (51/57, all census tags
+   unmodelable-construct — no `assert-forall` resurrection). Golden
+   BYTE-STABLE: certs `import TactusDefs` rather than vendoring it, so
+   R4's expected churn was a non-event; no re-vendor needed.
+4. **R0 surfaced and fixed** (`902fb99b` incl. the gate-validated
+   out/ tree): first gate run went 230-fns red — the cold-prelude
+   rebuild raced across verifier threads (see § Risks R0). Fixed with
+   `REBUILD_LOCK` + re-check in `prelude.rs`; validated by a
+   deliberately COLD-prelude gate rerun (prelude dir wiped; oleans
+   rebuilt from scratch under 64 threads, zero failures). Gate 298/0 +
+   pkg 54 + discharge 205/0 + bridge 172/172 live, both warm and cold.
+   Bridge markers + `lib_exec.ladder` re-keyed on the b82 prelude —
+   intentional content drift (b81's gate runs left the ladder
+   untouched because the prelude text didn't change there).
+5. **Probes**: 9 (all-classified incl. the mix_trip2 absent-pin) / 13
+   (27 classes, baselines close + kills flip) / 14 / 17 / 38 ✓;
+   probe37 PASS — its closure printout now shows the adequacy leaves
+   resting on `[propext]` only. probe11 regen = the two scoped cold
+   emits (runtime + todd_coxeter_rt, prelude hash changed) → 13/13
+   CLOSE, incl. both `lemma_runtime_word_view_*` ∀-binder subjects
+   against the new prelude.
+6. **e2e 829/2** — the documented pre-existing
+   flat_combine/tutorial_fifo pair; nothing else moved. The N2 pin
+   (`test_soundness_hole_prelude_index_inhabits_empty`) still blocks
+   the `Tactus.index (α := Empty)` exploit under the def (same
+   `[Nonempty α]` bracket).
+
+## Review round (2026-08-06, same day — per Done-when 5)
+
+Hunt targets and verdicts:
+
+- **(a) opacity-reliant consumers — NONE FOUND.** The model-narrowing
+  argument held up: the def adds kernel reduction power only
+  (strictly-more-provability direction); in-range it returns the actual
+  element = the correct spec-indexing semantics; out-of-range stays
+  choice-unspecified. vstd's array/seq/vec axioms are the trusted
+  content and re-elaborated unchanged everywhere they run (pkg gate
+  "axiom closures kernel-verified"; probe11's tgt lane — the real
+  `Tactus.index`/`heightLt` consumers — 13/13).
+- **(b) opaque-vs-axiom elaboration in the vstd boundary — NONE
+  FOUND.** The VIR-AST renderer emits the same names, which resolve to
+  the new declarations identically (`Tactus.index a i` renders
+  byte-identically — no goal drift possible, confirmed by the bridge
+  staying 172/172 live with zero cached on the first green run).
+- **(c) stale `expected`-list entries naming the three — NONE EXIST.**
+  Grep over both generated trees: no `#tactus_check_axioms` call sites
+  name them. Even if one did: names still resolve (defs exist) + the
+  check is subset-not-equality — inert by construction. Only ONE copy
+  of the base list exists (TactusDefs.lean itself).
+- **The battery's own catch was R0** (the prelude rebuild race) —
+  found by the first gate run, not by review; fixed and cold-validated
+  before landing. Process note: it was exactly the class the b81
+  retrospective's "per-path state audit" misses (infra concurrency,
+  not walk-path state) — the detection layer that worked was "run the
+  battery cold at least once after any prelude-text change".
+
