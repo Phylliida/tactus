@@ -358,6 +358,64 @@ def aqt_hyp_drop(sst):
     return sst[:s] + "0" + sst[e:]
 
 
+def _deadend_args(sst):
+    """Locate the (single) `lib.StmData.DeadEnd` node and return the spans
+    of its three args: (scope_binders, scope_bounds, body). Layout per
+    tactus-core (b81): Box'd BinderList, Box'd ParamBoundList, Box'd body."""
+    key = "lib.StmData.DeadEnd "
+    j = sst.find(key)
+    assert j != -1, "deadend: no `lib.StmData.DeadEnd` node — fixture lost its b81 assert-forall"
+    assert sst.find(key, j + 1) == -1, "deadend: multiple DeadEnd nodes; splitter assumes one"
+    i = j + len(key)
+    binders = take_sexpr(sst, i)
+    bounds = take_sexpr(sst, binders[1])
+    body = take_sexpr(sst, bounds[1])
+    for name, sp in (("binders", binders), ("bounds", bounds), ("body", body)):
+        assert sst[sp[0]] == '(', f"deadend: {name} not a paren group"
+    return binders, bounds, body
+
+
+def scope_binder_drop(sst):
+    """b81 kill (SST-side): drop the assert-forall SCOPE BINDER — replace
+    the DeadEnd's Box'd BinderList with Nil. refWp's in-scope goals lose
+    their `All k Int` frames (the `Wp::Scope` ∀-telescope) while
+    production goals still carry them — pins that the scope_binders slot
+    is load-bearing in the bridge."""
+    (b0, b1), _, _ = _deadend_args(sst)
+    binders = sst[b0:b1]
+    assert "lib.BinderList.Cons" in binders, "scope_binder_drop: scope_binders already empty"
+    return sst[:b0] + "(Tactus.Box.mk lib.BinderList.Nil)" + sst[b1:]
+
+
+def scope_bound_drop(sst):
+    """b81 kill (SST-side): drop the skolem's TYPE-BOUND hyp — replace the
+    DeadEnd's `ParamBoundList.Bound name prop` with `NoBound`
+    (forall_u64_skolem, the u64-skolem subject: production's
+    push_mod_var_frames re-asserts `0 ≤ k < 2^64` right after the
+    ∀-binder). refWp loses the bound FHyp in the leading telescope while
+    production goals carry it."""
+    _, (b0, b1), _ = _deadend_args(sst)
+    bounds = sst[b0:b1]
+    assert "lib.ParamBoundList.Bound" in bounds, "scope_bound_drop: no Bound entry — wrong subject?"
+    return sst[:b0] + "(Tactus.Box.mk (lib.ParamBoundList.NoBound (Tactus.Box.mk lib.ParamBoundList.Nil)))" + sst[b1:]
+
+
+def scope_binder_typ_flip(sst):
+    """b81 kill (SST-side): flip the skolem binder's TYP LEAF — rewrite the
+    BinderList.Cons typ scalar Int(leaf 16) → Nat(leaf 1, the param n's
+    typ leaf, already interned in this cert). refWp emits `All k Nat`
+    where production goals carry `All k Int` — the binder typ is
+    load-bearing, not just the binder's presence."""
+    (b0, b1), _, _ = _deadend_args(sst)
+    binders = sst[b0:b1]
+    pat = "lib.BinderList.Cons 15 16"
+    i = binders.find(pat)
+    assert i != -1, f"scope_binder_typ_flip: no `Cons 15 16` in {binders!r} (leaf ids renumbered?)"
+    mut = binders[:i] + "lib.BinderList.Cons 15 1" + binders[i + len(pat):]
+    assert mut != binders
+    return sst[:b0] + mut + sst[b1:]
+
+
 def _find_nth(s, key, n):
     """Offset of the n-th (1-based) occurrence of `key`."""
     i = -1
@@ -583,6 +641,12 @@ CLASSES = [
     # param typs the RawList pairs carry are load-bearing (flipping one
     # flips the derived `Int.ofNat`, hence the bridge).
     ("vec_read", "expected_typ_drop", "drop the Seq.index arg's EXPECTED typ TyInt→TyNat (A7 reconcile channel)", expected_typ_drop, "sst", "close"),
+    # bootstrap-81 (row 11b): the assert-forall scope-binder kills — one
+    # per DeadEnd-arm output channel (binder presence, bound hyp, binder
+    # typ), on the two new fixture subjects (Int NoBound / u64 Bound).
+    ("forall_int_skolem", "scope_binder_drop", "DeadEnd: drop the assert-forall scope binder (b81 ∀-telescope arm)", scope_binder_drop, "sst", "close"),
+    ("forall_u64_skolem", "scope_bound_drop", "DeadEnd: drop the skolem type-bound hyp (b81 Bound slot)", scope_bound_drop, "sst", "close"),
+    ("forall_int_skolem", "scope_binder_typ_flip", "DeadEnd: flip the skolem binder typ leaf Int→Nat (b81)", scope_binder_typ_flip, "sst", "close"),
 ]
 
 

@@ -20,7 +20,7 @@ set_option autoImplicit false
 -- leaf 6: ⟦tq⟧
 -- leaf 7: ⟦lib.RawExp⟧
 -- leaf 8: ⟦lib.wp_stm pp f (lib.StmData.AssertQueryNl b tq) = lib.goals_append (lib.wp_stm pp (lib.strip_hyps f) b) (lib.GoalList.Cons (Tactus.Box.mk (lib.close_e pp (lib.frame_after pp (lib.strip_hyps f) b) tq)) (Tactus.Box.mk lib.GoalList.Nil))⟧
--- leaf 9: ⟦/- @rust:tactus-core/lib.rs:5254:13 -/ lib.wp_stm pp f (lib.StmData.AssertQueryNl b tq) = lib.goals_append (lib.wp_stm pp (lib.strip_hyps f) b.deref) (lib.GoalList.Cons (Tactus.Box.mk (lib.close_e pp (lib.frame_after pp (lib.strip_hyps f) b.deref) tq)) (Tactus.Box.mk lib.GoalList.Nil))⟧
+-- leaf 9: ⟦/- @rust:tactus-core/lib.rs:5270:13 -/ lib.wp_stm pp f (lib.StmData.AssertQueryNl b tq) = lib.goals_append (lib.wp_stm pp (lib.strip_hyps f) b.deref) (lib.GoalList.Cons (Tactus.Box.mk (lib.close_e pp (lib.frame_after pp (lib.strip_hyps f) b.deref) tq)) (Tactus.Box.mk lib.GoalList.Nil))⟧
 -- leaf 10: ⟦lib.wp_stm⟧
 -- leaf 11: ⟦lib.GoalList⟧
 -- leaf 12: ⟦lib.StmData⟧
@@ -34,7 +34,7 @@ set_option autoImplicit false
 example : lib.stm_size cert_u_wp_aqnl_sst = 2 := by decide
 
 -- ── production goals (N3b) ──────────────────────────────────
--- goal 0: _tactus_postcondition_u_wp_aqnl_at_lib_5254_13_1
+-- goal 0: _tactus_postcondition_u_wp_aqnl_at_lib_5270_13_1
 @[reducible] def cert_u_wp_aqnl_goals : lib.GoalList :=
   lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 2 3 (Tactus.Box.mk (lib.GoalData.All 4 5 (Tactus.Box.mk (lib.GoalData.All 6 7 (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.Atom 9))))))))))) (Tactus.Box.mk lib.GoalList.Nil)
 

@@ -1,9 +1,12 @@
 # bootstrap-81 — A6-full: the ∀-binder telescope arm (kills the `assert-forall` tag)
 
-Status: **DESIGN FROZEN 2026-08-06 — step-0 evidence frozen (§
-"Step-0 evidence"); all 3 open questions resolved by Danielle's
-standing principles (§ "Open questions" below). Era 1 (D1+D2
-model-only, byte-stability era) IN PROGRESS.**
+Status: **DONE 2026-08-06 (era 1 `0f311a66` + era 2) — the
+`assert-forall` census tag is RETIRED; both tgt subjects bridge-CLOSE
+(probe11 13/13); fixture F28/F29 close probe9; probe13 → 25 classes.
+Battery: gate 298/0 + pkg 54 + discharge 205/0 + bridge 172/172 live,
+units 437+7/0, probes 9/11/13/14/17/37/38 ✓, golden re-vendored
+(pure @rust: line drift), e2e 829/2 standing. Completion record: §
+"Era 1 implementation notes" + § "Era 2 implementation notes" below.**
 Implements endgame table row 11b (DESIGN-bootstrap-endgame.md §8):
 retire the `assert-forall` census tag — b68 scaffolding, never
 permanent — by modeling `assert forall … by { … }` skolem binders in
@@ -258,6 +261,41 @@ Done-when (all):
 5. `wp_stm_sound`/`ref_wp_sound` still verify with the DeadEnd arm
    threaded (D2) — axiom closures unchanged (⊆ [propext,
    Classical.choice, Quot.sound]).
+
+## Era 2 implementation notes (2026-08-06, in progress)
+
+- **Latent era-1 bug caught by era 2's first subjects:** era 1's
+  `Nil`/`Nil` emission passed the list slots UNBOXED, but the ctor
+  fields are `Box<BinderList>`/`Box<ParamBoundList>` — every era-1
+  cert was ill-typed-by-construction and NO probe caught it, because
+  no corpus cert contained a DeadEnd NODE (the only DeadEnd-body
+  subjects were the 2 census-rejected tgt fns; AQT/proof-block fns
+  use other variants). F28/F29's first probe9 run CLOSE-BROKE on the
+  elaboration error, not on goal drift — exactly the early-warning
+  the two-era split was for. Fixed: `box_()` both slots (the Loop
+  arm's own convention). Lesson recorded: a vocabulary arm's first
+  live subject should probe ELABORATION separately from goal drift —
+  probe9's CLOSE-BROKE distinction did this for free.
+- F28/F29 fixture shaping needed two Verus-level adjustments:
+  (1) arithmetic-only quantifier bodies fail trigger inference —
+  added `bumpi`/`bump` spec fns so `#[trigger]` has a cast-free
+  application over the binder; (2) spec-mode `+` on `u64` promotes
+  to `int`, so `bump` returns `int` (the BINDER's typ is what the
+  Bound path reads, not the helper's codomain).
+- **Both tgt subjects bridge-closed on their FIRST live run**
+  (probe11: `lemma_runtime_word_view_subrange` + `_append` CLOSE —
+  serializer transcribes the scope binders, refWp wraps via
+  `mod_var_frames`, production's telescopes match node-for-node,
+  `decide` proves `goals_eq = 1`). probe11 13/13, expected_subjects
+  pin updated (a future vanishing is loud).
+- The D in-model column's field-shape pin landed as
+  `deadend_scope_binder_pin` in tactus-core (kernel-computed: one
+  skolem over one Assert → the `All`-spined goal). The variant-level
+  columns in `tests/bootstrap_coverage.rs` needed NO change (DeadEnd
+  was already `true` in both; the file's own scope note routes
+  field-shape pins to in-crate decides).
+- The golden re-vendor was pure `@rust:` line-number drift (the
+  `bumpi`/`bump` helpers shifted the fixture's fns down 8 lines).
 
 ## Era 1 implementation notes (2026-08-06)
 

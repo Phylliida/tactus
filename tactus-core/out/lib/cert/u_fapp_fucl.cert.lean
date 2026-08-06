@@ -16,7 +16,7 @@ set_option autoImplicit false
 -- leaf 2: ⟦g⟧
 -- leaf 3: ⟦lib.FrameList⟧
 -- leaf 4: ⟦lib.frame_append (lib.FrameList.FUserCloser t) g = lib.FrameList.FUserCloser (Tactus.Box.mk (lib.frame_append t g))⟧
--- leaf 5: ⟦/- @rust:tactus-core/lib.rs:6488:13 -/ lib.frame_append (lib.FrameList.FUserCloser t) g = lib.FrameList.FUserCloser (Tactus.Box.mk (lib.frame_append t.deref g))⟧
+-- leaf 5: ⟦/- @rust:tactus-core/lib.rs:6504:13 -/ lib.frame_append (lib.FrameList.FUserCloser t) g = lib.FrameList.FUserCloser (Tactus.Box.mk (lib.frame_append t.deref g))⟧
 -- leaf 6: ⟦lib.frame_append⟧
 
 @[reducible] def cert_u_fapp_fucl_ctx : lib.FnCtxData :=
@@ -28,7 +28,7 @@ set_option autoImplicit false
 example : lib.stm_size cert_u_fapp_fucl_sst = 2 := by decide
 
 -- ── production goals (N3b) ──────────────────────────────────
--- goal 0: _tactus_postcondition_u_fapp_fucl_at_lib_6488_13_1
+-- goal 0: _tactus_postcondition_u_fapp_fucl_at_lib_6504_13_1
 @[reducible] def cert_u_fapp_fucl_goals : lib.GoalList :=
   lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 2 3 (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.Atom 5))))))) (Tactus.Box.mk lib.GoalList.Nil)
 

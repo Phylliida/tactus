@@ -34,7 +34,7 @@ set_option autoImplicit false
 -- leaf 20: ⟦Tactus.Box lib.StmData⟧
 -- leaf 21: ⟦els⟧
 -- leaf 22: ⟦lib.wp_stm pp f (lib.StmData.IfCtor pos_binders eq_name eq_prop neg_name neg_prop thn els) = lib.goals_append (lib.wp_stm pp (lib.frame_append f (lib.ctor_pos_frame pos_binders eq_name eq_prop)) thn) (lib.wp_stm pp (lib.frame_append f (lib.FrameList.FHyp neg_name neg_prop (Tactus.Box.mk lib.FrameList.FNil))) els)⟧
--- leaf 23: ⟦/- @rust:tactus-core/lib.rs:5268:13 -/ lib.wp_stm pp f (lib.StmData.IfCtor pos_binders eq_name eq_prop neg_name neg_prop thn els) = lib.goals_append (lib.wp_stm pp (lib.frame_append f (lib.ctor_pos_frame pos_binders.deref eq_name eq_prop)) thn.deref) (lib.wp_stm pp (lib.frame_append f (lib.FrameList.FHyp neg_name neg_prop (Tactus.Box.mk lib.FrameList.FNil))) els.deref)⟧
+-- leaf 23: ⟦/- @rust:tactus-core/lib.rs:5284:13 -/ lib.wp_stm pp f (lib.StmData.IfCtor pos_binders eq_name eq_prop neg_name neg_prop thn els) = lib.goals_append (lib.wp_stm pp (lib.frame_append f (lib.ctor_pos_frame pos_binders.deref eq_name eq_prop)) thn.deref) (lib.wp_stm pp (lib.frame_append f (lib.FrameList.FHyp neg_name neg_prop (Tactus.Box.mk lib.FrameList.FNil))) els.deref)⟧
 -- leaf 24: ⟦lib.wp_stm⟧
 -- leaf 25: ⟦lib.GoalList⟧
 -- leaf 26: ⟦lib.StmData⟧
@@ -48,7 +48,7 @@ set_option autoImplicit false
 example : lib.stm_size cert_u_wp_ifctor_sst = 2 := by decide
 
 -- ── production goals (N3b) ──────────────────────────────────
--- goal 0: _tactus_postcondition_u_wp_ifctor_at_lib_5268_13_1
+-- goal 0: _tactus_postcondition_u_wp_ifctor_at_lib_5284_13_1
 @[reducible] def cert_u_wp_ifctor_goals : lib.GoalList :=
   lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 2 3 (Tactus.Box.mk (lib.GoalData.All 4 5 (Tactus.Box.mk (lib.GoalData.All 6 7 (Tactus.Box.mk (lib.GoalData.All 9 8 (Tactus.Box.mk (lib.GoalData.All 10 7 (Tactus.Box.mk (lib.GoalData.All 12 11 (Tactus.Box.mk (lib.GoalData.All 13 7 (Tactus.Box.mk (lib.GoalData.All 15 14 (Tactus.Box.mk (lib.GoalData.All 16 7 (Tactus.Box.mk (lib.GoalData.All 18 17 (Tactus.Box.mk (lib.GoalData.All 19 20 (Tactus.Box.mk (lib.GoalData.All 21 20 (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.Atom 23))))))))))))))))))))))))))))) (Tactus.Box.mk lib.GoalList.Nil)
 

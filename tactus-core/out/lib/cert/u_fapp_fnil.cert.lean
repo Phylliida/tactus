@@ -14,7 +14,7 @@ set_option autoImplicit false
 -- leaf 0: ⟦g⟧
 -- leaf 1: ⟦lib.FrameList⟧
 -- leaf 2: ⟦lib.frame_append lib.FrameList.FNil g = g⟧
--- leaf 3: ⟦/- @rust:tactus-core/lib.rs:6412:13 -/ lib.frame_append lib.FrameList.FNil g = g⟧
+-- leaf 3: ⟦/- @rust:tactus-core/lib.rs:6428:13 -/ lib.frame_append lib.FrameList.FNil g = g⟧
 -- leaf 4: ⟦lib.frame_append⟧
 
 @[reducible] def cert_u_fapp_fnil_ctx : lib.FnCtxData :=
@@ -26,7 +26,7 @@ set_option autoImplicit false
 example : lib.stm_size cert_u_fapp_fnil_sst = 2 := by decide
 
 -- ── production goals (N3b) ──────────────────────────────────
--- goal 0: _tactus_postcondition_u_fapp_fnil_at_lib_6412_13_1
+-- goal 0: _tactus_postcondition_u_fapp_fnil_at_lib_6428_13_1
 @[reducible] def cert_u_fapp_fnil_goals : lib.GoalList :=
   lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.Atom 3))))) (Tactus.Box.mk lib.GoalList.Nil)
 

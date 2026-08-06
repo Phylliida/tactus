@@ -16,7 +16,7 @@ set_option autoImplicit false
 -- leaf 2: ⟦f⟧
 -- leaf 3: ⟦lib.FrameList⟧
 -- leaf 4: ⟦lib.wp_stm pp f lib.StmData.Skip = lib.GoalList.Nil⟧
--- leaf 5: ⟦/- @rust:tactus-core/lib.rs:5320:13 -/ lib.wp_stm pp f lib.StmData.Skip = lib.GoalList.Nil⟧
+-- leaf 5: ⟦/- @rust:tactus-core/lib.rs:5336:13 -/ lib.wp_stm pp f lib.StmData.Skip = lib.GoalList.Nil⟧
 -- leaf 6: ⟦lib.wp_stm⟧
 -- leaf 7: ⟦lib.GoalList⟧
 -- leaf 8: ⟦lib.StmData⟧
@@ -30,7 +30,7 @@ set_option autoImplicit false
 example : lib.stm_size cert_u_wp_skip_sst = 2 := by decide
 
 -- ── production goals (N3b) ──────────────────────────────────
--- goal 0: _tactus_postcondition_u_wp_skip_at_lib_5320_13_1
+-- goal 0: _tactus_postcondition_u_wp_skip_at_lib_5336_13_1
 @[reducible] def cert_u_wp_skip_goals : lib.GoalList :=
   lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 2 3 (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.Atom 5))))))) (Tactus.Box.mk lib.GoalList.Nil)
 

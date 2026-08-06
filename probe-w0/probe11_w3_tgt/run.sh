@@ -78,11 +78,12 @@ export LEAN_PATH="$CORE_OUT:$CORE_OUT/pkg:$PRELUDE"
 # ret_typ) — in the Return arm, so the RetBind value renders `self.deref`
 # (leaf 5) and the SST RetLet 4 5 matches the goal's Let 4 5. Removed from the
 # honest-fail set; it must now close-ok.
-# NOTE (endgame A6-short, 2026-07-24): the lemma_runtime_word_view_* fns now
-# census-reject at emission (`assert-forall` tag — skolem binders unmodeled at
-# stage A; detection = production's own collect_assert_by_vars). They emit NO
-# cert and are no longer bridge subjects; if one ever reappears with a cert
-# and no quantifier-binder arm, it lands UNCLASSIFIED and fails this runner.
+# NOTE (bootstrap-81, 2026-08-06 — supersedes the A6-short note): the
+# ∀-binder telescope arm LANDED (endgame row 11b) — the
+# lemma_runtime_word_view_* fns CERTIFY and bridge-CLOSE (the DeadEnd
+# scope_binders/scope_bounds slots carry the skolem ∀-binders; the
+# `assert-forall` census tag is retired). Both are now expected-CLOSE
+# and pinned in expected_subjects below.
 # NOTE (endgame A2, 2026-07-24): apply_hom_gen/inv are now expected-CLOSE.
 # The b74-sweep honest-fail was the CLOSER GATE, not arg-temp LetRaw: these
 # fns carry user tactus_tactic closers, and production's emit_leaf_theorem
@@ -130,7 +131,7 @@ expected_absent_reason() {
   esac
 }
 # Every fn ever seen as a bridge subject or documented absentee.
-expected_subjects="runtime__apply_hom_gen runtime__apply_hom_inv runtime__apply_hom_symbol_exec runtime__impl__4__clone runtime__is_inverse_pair_exec runtime__find_cancellation_exec runtime__copy_word todd_coxeter_rt__inverse_column_exec todd_coxeter_rt__lemma_overflow_bounds todd_coxeter_rt__lemma_rt_trace_word_unfold todd_coxeter_rt__symbol_to_column_exec"
+expected_subjects="runtime__apply_hom_gen runtime__apply_hom_inv runtime__apply_hom_symbol_exec runtime__impl__4__clone runtime__is_inverse_pair_exec runtime__find_cancellation_exec runtime__copy_word runtime__lemma_runtime_word_view_append runtime__lemma_runtime_word_view_subrange todd_coxeter_rt__inverse_column_exec todd_coxeter_rt__lemma_overflow_bounds todd_coxeter_rt__lemma_rt_trace_word_unfold todd_coxeter_rt__symbol_to_column_exec"
 
 echo "== W3 differential gate over tgt =="
 echo "cert dir : $CERT_DIR"

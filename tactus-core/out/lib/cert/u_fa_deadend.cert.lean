@@ -22,7 +22,7 @@ set_option autoImplicit false
 -- leaf 8: ⟦b⟧
 -- leaf 9: ⟦Tactus.Box lib.StmData⟧
 -- leaf 10: ⟦lib.frame_after pp f (lib.StmData.DeadEnd bs bds b) = f⟧
--- leaf 11: ⟦/- @rust:tactus-core/lib.rs:6406:13 -/ lib.frame_after pp f (lib.StmData.DeadEnd bs bds b) = f⟧
+-- leaf 11: ⟦/- @rust:tactus-core/lib.rs:6422:13 -/ lib.frame_after pp f (lib.StmData.DeadEnd bs bds b) = f⟧
 -- leaf 12: ⟦lib.frame_after⟧
 -- leaf 13: ⟦lib.StmData⟧
 
@@ -35,7 +35,7 @@ set_option autoImplicit false
 example : lib.stm_size cert_u_fa_deadend_sst = 2 := by decide
 
 -- ── production goals (N3b) ──────────────────────────────────
--- goal 0: _tactus_postcondition_u_fa_deadend_at_lib_6406_13_1
+-- goal 0: _tactus_postcondition_u_fa_deadend_at_lib_6422_13_1
 @[reducible] def cert_u_fa_deadend_goals : lib.GoalList :=
   lib.GoalList.Cons (Tactus.Box.mk (lib.GoalData.All 0 1 (Tactus.Box.mk (lib.GoalData.All 2 3 (Tactus.Box.mk (lib.GoalData.All 4 5 (Tactus.Box.mk (lib.GoalData.All 6 7 (Tactus.Box.mk (lib.GoalData.All 8 9 (Tactus.Box.mk (lib.GoalData.LeafE (lib.ExprData.Atom 11))))))))))))) (Tactus.Box.mk lib.GoalList.Nil)
 
