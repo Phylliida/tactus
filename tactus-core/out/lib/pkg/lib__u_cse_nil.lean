@@ -5,6 +5,6 @@ set_option linter.unusedVariables false
 set_option maxHeartbeats 800000
 set_option autoImplicit false
 -- tactus-closer: user
-theorem _tactus_postcondition_u_cse_nil_at_lib_4563_13_1 (pp : lib.LeafList) (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (o : lib.RawExp) :
-    /- @rust:tactus-core/lib.rs:4563:13 -/ ∀ (st : Int → Int), lib.close_sem_e pp hp he lv lib.FrameList.FNil st o = he (lib.render_exp o) st := by
+theorem _tactus_postcondition_u_cse_nil_at_lib_4578_13_1 (pp : lib.LeafList) (hp : Int → (Int → Int) → Prop) (he : lib.ExprData → (Int → Int) → Prop) (lv : Int → (Int → Int) → Int) (o : lib.RawExp) :
+    /- @rust:tactus-core/lib.rs:4578:13 -/ ∀ (st : Int → Int), lib.close_sem_e pp hp he lv lib.FrameList.FNil st o = he (lib.render_exp o) st := by
   first | tactus_auto | (intros <;> rfl)

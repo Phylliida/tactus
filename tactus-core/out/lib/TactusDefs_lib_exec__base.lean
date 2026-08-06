@@ -444,7 +444,7 @@ inductive lib.StmData where
   | AssignH (val0 : Int) (val1 : Int) (val2 : Int) (val3 : Int) (val4 : Int)
   | AssignR (val0 : Int) (val1 : Int)
   | Call (reqs : Tactus.Box lib.RawExpList) (post : Tactus.Box lib.FrameList)
-  | DeadEnd (val0 : Tactus.Box lib.StmData)
+  | DeadEnd (val0 : Tactus.Box lib.BinderList) (val1 : Tactus.Box lib.ParamBoundList) (val2 : Tactus.Box lib.StmData)
   | Ret (val0 : Tactus.Box lib.RawExpList) (val1 : lib.RetBind)
   | If (val0 : Int) (val1 : Int) (val2 : Int) (val3 : Int) (val4 : Tactus.Box lib.StmData) (val5 : Tactus.Box lib.StmData)
   | Loop (inv_hyps : Tactus.Box lib.BinderList) (inv_obligs : Tactus.Box lib.RawExpList) (inv_obligs_exit : Tactus.Box lib.RawExpList) (inv_obligs_break : Tactus.Box lib.RawExpList) (binders : Tactus.Box lib.BinderList) (binder_bounds : Tactus.Box lib.ParamBoundList) (cond_name : Int) (cond_ann : Int) (neg_cond_ann : Int) (neg_neg_cond_ann : Int) (break_guard_ann : Int) (break_use_ann : Int) (d_old_name : Int) (d_old_ty : Int) (d_old_val : Int) (d_old_eq_name : Int) (d_old_eq_prop : Int) (decrease_oblig : lib.RawExp) (setup : Tactus.Box lib.StmData) (body : Tactus.Box lib.StmData)
@@ -467,7 +467,7 @@ inductive lib.StmData where
 @[simp] noncomputable def lib.StmData.isCall (x : lib.StmData) : Prop :=
   match x with | lib.StmData.Call _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isDeadEnd (x : lib.StmData) : Prop :=
-  match x with | lib.StmData.DeadEnd _ => True | _ => False
+  match x with | lib.StmData.DeadEnd _ _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isRet (x : lib.StmData) : Prop :=
   match x with | lib.StmData.Ret _ _ => True | _ => False
 @[simp] noncomputable def lib.StmData.isIf (x : lib.StmData) : Prop :=
@@ -516,8 +516,12 @@ inductive lib.StmData where
   match x with | lib.StmData.Call reqs _ => reqs | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Call_post (x : lib.StmData) : Tactus.Box lib.FrameList :=
   match x with | lib.StmData.Call _ post => post | _ => Classical.ofNonempty
-@[simp] noncomputable def lib.StmData.DeadEnd_val0 (x : lib.StmData) : Tactus.Box lib.StmData :=
-  match x with | lib.StmData.DeadEnd val0 => val0 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.DeadEnd_val0 (x : lib.StmData) : Tactus.Box lib.BinderList :=
+  match x with | lib.StmData.DeadEnd val0 _ _ => val0 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.DeadEnd_val1 (x : lib.StmData) : Tactus.Box lib.ParamBoundList :=
+  match x with | lib.StmData.DeadEnd _ val1 _ => val1 | _ => Classical.ofNonempty
+@[simp] noncomputable def lib.StmData.DeadEnd_val2 (x : lib.StmData) : Tactus.Box lib.StmData :=
+  match x with | lib.StmData.DeadEnd _ _ val2 => val2 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Ret_val0 (x : lib.StmData) : Tactus.Box lib.RawExpList :=
   match x with | lib.StmData.Ret val0 _ => val0 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.Ret_val1 (x : lib.StmData) : lib.RetBind :=
@@ -603,7 +607,7 @@ inductive lib.StmData where
 @[simp] noncomputable def lib.StmData.Seq_val1 (x : lib.StmData) : Tactus.Box lib.StmData :=
   match x with | lib.StmData.Seq _ val1 => val1 | _ => Classical.ofNonempty
 @[simp] noncomputable def lib.StmData.height (s : lib.StmData) : Nat :=
-  match s with | lib.StmData.Assert _ _ _ => 1 | lib.StmData.Assume _ _ => 1 | lib.StmData.Assign _ _ => 1 | lib.StmData.AssignH _ _ _ _ _ => 1 | lib.StmData.AssignR _ _ => 1 | lib.StmData.Call _ _ => 1 | lib.StmData.DeadEnd val0 => 1 + lib.StmData.height val0.deref | lib.StmData.Ret _ _ => 1 | lib.StmData.If _ _ _ _ val4 val5 => 1 + lib.StmData.height val4.deref + lib.StmData.height val5.deref | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ setup body => 1 + lib.StmData.height setup.deref + lib.StmData.height body.deref | lib.StmData.AssertQueryNl val0 _ => 1 + lib.StmData.height val0.deref | lib.StmData.AssertQueryTactus _ _ _ => 1 | lib.StmData.IfCtor _ _ _ _ _ thn els => 1 + lib.StmData.height thn.deref + lib.StmData.height els.deref | lib.StmData.Skip => 1 | lib.StmData.Seq val0 val1 => 1 + lib.StmData.height val0.deref + lib.StmData.height val1.deref
+  match s with | lib.StmData.Assert _ _ _ => 1 | lib.StmData.Assume _ _ => 1 | lib.StmData.Assign _ _ => 1 | lib.StmData.AssignH _ _ _ _ _ => 1 | lib.StmData.AssignR _ _ => 1 | lib.StmData.Call _ _ => 1 | lib.StmData.DeadEnd _ _ val2 => 1 + lib.StmData.height val2.deref | lib.StmData.Ret _ _ => 1 | lib.StmData.If _ _ _ _ val4 val5 => 1 + lib.StmData.height val4.deref + lib.StmData.height val5.deref | lib.StmData.Loop _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ setup body => 1 + lib.StmData.height setup.deref + lib.StmData.height body.deref | lib.StmData.AssertQueryNl val0 _ => 1 + lib.StmData.height val0.deref | lib.StmData.AssertQueryTactus _ _ _ => 1 | lib.StmData.IfCtor _ _ _ _ _ thn els => 1 + lib.StmData.height thn.deref + lib.StmData.height els.deref | lib.StmData.Skip => 1 | lib.StmData.Seq val0 val1 => 1 + lib.StmData.height val0.deref + lib.StmData.height val1.deref
 termination_by sizeOf s
 decreasing_by all_goals (simp_all only [if_pos, if_neg, if_true, if_false, reduceIte, reduceCtorEq, Int.mul_one, Int.one_mul, Int.mul_zero, Int.zero_mul, Int.add_zero, Int.zero_add, Int.sub_zero, Int.natCast_add, Int.cast_ofNat_Int, Int.ofNat_eq_coe, Int.ofNat_zero_le, Int.mul_add, Int.add_mul, Int.mul_sub, Int.sub_mul, Int.natCast_sub, Nat.mul_zero, Nat.zero_mul, Nat.mul_one, Nat.one_mul, Nat.add_zero, Nat.zero_add, Tactus.Ref.sizeOf_deref, Tactus.MutRef.sizeOf_deref, Tactus.Box.sizeOf_deref, Tactus.Rc.sizeOf_deref, Tactus.Arc.sizeOf_deref, lib.StmData.Assert.sizeOf_spec, lib.StmData.Assume.sizeOf_spec, lib.StmData.Assign.sizeOf_spec, lib.StmData.AssignH.sizeOf_spec, lib.StmData.AssignR.sizeOf_spec, lib.StmData.Call.sizeOf_spec, lib.StmData.DeadEnd.sizeOf_spec, lib.StmData.Ret.sizeOf_spec, lib.StmData.If.sizeOf_spec, lib.StmData.Loop.sizeOf_spec, lib.StmData.AssertQueryNl.sizeOf_spec, lib.StmData.AssertQueryTactus.sizeOf_spec, lib.StmData.IfCtor.sizeOf_spec, lib.StmData.Skip.sizeOf_spec, lib.StmData.Seq.sizeOf_spec]; omega)
 inductive lib.CastKind where
