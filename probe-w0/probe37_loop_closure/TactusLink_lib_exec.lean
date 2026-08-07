@@ -1,4 +1,7 @@
 import TactusDefs_lib_exec
+-- ── Boundary inventory (the explicit cross-crate trust surface, b83) ──
+-- (empty — crate is self-contained)
+-- totals: 0 axiom(s): 0 stipulated-base, 0 proved-upstream, 0 unclassified
 import lib__expr_mirror_kernel_computes
 import lib__defs_expr_vocab_kernel_computes
 import lib__a7_reconcile_kernel_computes
