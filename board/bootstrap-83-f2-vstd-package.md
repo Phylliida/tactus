@@ -166,3 +166,54 @@ class: mitigated by construction (the whitelist IS derived from the
 same `Command::Axiom` stream) + the D3 counts make a class-less entry
 loud (counted as unclassified → gate note shows it; unit pin asserts
 no `None` classes on Boundary entries).
+
+## Implementation notes + review round (2026-08-06, same day)
+
+**Landed** (`bce50c13` + battery `e97cea03`): D1 `lean_ast::Axiom`
+gains `boundary_class` (compile-enforced at all 7 creation sites);
+D2 lean_pp `-- trust:` tag at declaration sites + sorted Link-header
+inventory with totals; D3 gate note `Boundary: N (S stipulated-base,
+P proved-upstream)`; D4 pins (2 units + e2e
+`test_boundary_inventory_note`); D6 = the b84 card. Live subject
+validated BEFORE pinning (era-0 discipline): a broadcast-using crate
+emits `Boundary: 19 (15 stipulated-base, 4 proved-upstream,
+0 unclassified)` — the E4 signal (`is_external_body` ⟺ `axiom fn`
+desugar, builtin_macros syntax.rs:1018-1024) verified empirically
+against real vstd content.
+
+**Review round (skeptic pass):**
+- (a) Classification edge cases: a user-authored `broadcast axiom fn`
+  → StipulatedBase ✓ (it IS stipulated); `external_body` on a
+  `broadcast proof fn` → StipulatedBase ✓ (not actually proved
+  upstream — the class name stays honest). Signal is exactly "was this
+  lemma proved in its source crate".
+- (b) Whitelist/manifest agreement: both derive from the SAME
+  `defs.cmds` stream at the same call (no registry, no copy) — drift
+  impossible by construction.
+- (c) Island-mode rendering: the lean_pp `-- trust:` tag is global;
+  island preambles gain comment lines. Battery confirms nothing
+  byte-pins against them (fixture golden byte-stable, probes all
+  green without probe11 regen — prelude hash unchanged this brick).
+- (d) Unclassified entries: impossible today (struct field is
+  compile-enforced at every literal); rendered `UNCLASSIFIED (!)` and
+  counted if one ever appears; the e2e pin asserts the note contains
+  none.
+- (e) No soundness surface change: WHAT is trusted is unchanged; the
+  brick is inventory + transparency only.
+
+**Battery**: units 439+7/0 (2 new), vstd 1531/0, fixture rc=0 +
+golden byte-stable, tactus-core gate 298/0 + pkg 54 + discharge
+205/0 + bridge 172/172 live + the new `Boundary: 0 — crate is
+self-contained` note, probes 9/11(vendored)/13(27)/14/17/37/38 ✓,
+e2e 829/2 (documented pre-existing pair).
+
+**STANDING-RECIPE FINDING (flagged, not fixed here):** the e2e recipe
+`vargo test -p rust_verify_test --release` fail-fasts at the
+pre-existing examples_state_machines pair — only ~31 of 130 test
+binaries run; the quoted "829/2" is that PREFIX. The tactus suite
+(562 tests, incl. this brick's pin) does NOT run in the standing
+recipe; b83 ran it explicitly (`--test tactus`) and a full
+`--no-fail-fast` pass for coverage. Future sessions: treat the
+standing number as prefix-only, or fix the recipe ( Danielle's call —
+changing the recipe changes the standing convention everywhere it's
+quoted).

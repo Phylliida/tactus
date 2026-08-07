@@ -302,8 +302,17 @@ pub fn parse_diags(
                 // (and `write failed`). These are non-JSON emission-coverage
                 // lines, not verification results; ignore them so the verdict
                 // matcher stays green with `--tactus-emit-cert` on (the file
-                // writes still happen). See board bootstrap-14.
-                if ss.trim_start().starts_with("tactus: cert:") {
+                // writes still happen). See board bootstrap-14. The
+                // `def-cert:`/`dt-cert:` prefixed lines (W7d, bootstrap-32)
+                // are the same verdict-neutral class — the filter predates
+                // their prefixes; the gap went unnoticed because the
+                // standing full-e2e recipe fail-fasts before the tactus
+                // suite (b83, 2026-08-06).
+                let trimmed = ss.trim_start();
+                if trimmed.starts_with("tactus: cert:")
+                    || trimmed.starts_with("tactus: def-cert:")
+                    || trimmed.starts_with("tactus: dt-cert:")
+                {
                     continue;
                 }
                 *is_failure = true;
