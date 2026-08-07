@@ -3902,6 +3902,10 @@ pub struct PackageGateReport {
     pub discharge_pending: usize,
     /// One-line kind/reason breakdown for the gate note.
     pub discharge_detail: String,
+    /// b83: the Boundary inventory one-liner — the crate's explicit
+    /// cross-crate trust surface as counts per class
+    /// (`Boundary: N (S stipulated-base, P proved-upstream)`).
+    pub boundary_note: String,
 }
 
 /// Crate-level package gate (DESIGN-emit-module.md M4): regenerate the
@@ -3921,6 +3925,35 @@ pub fn check_package(
     install_emit_tables(krate, crate_name);
     let defs = unified_package_defs(krate, crate_name, tactic_bodies)
         .ok_or("shared-defs module unavailable (defs build failed)")?;
+    // b83: the Boundary inventory one-liner, computed ONCE from the same
+    // defs-axiom stream the Link module's header and the closure-check
+    // whitelist derive from (single source, no drift).
+    let boundary_note = {
+        use crate::lean_ast::BoundaryClass;
+        let inventory = boundary_inventory(&defs.cmds);
+        let (mut s, mut p, mut u) = (0usize, 0usize, 0usize);
+        for (_, class) in &inventory {
+            match class {
+                Some(BoundaryClass::StipulatedBase) => s += 1,
+                Some(BoundaryClass::ProvedUpstream) => p += 1,
+                None => u += 1,
+            }
+        }
+        if inventory.is_empty() {
+            "Boundary: 0 cross-crate axioms — crate is self-contained".to_string()
+        } else if u > 0 {
+            format!(
+                "Boundary: {} cross-crate axiom(s): {} stipulated-base, {} proved-upstream, \
+                 {} UNCLASSIFIED (!)",
+                inventory.len(), s, p, u
+            )
+        } else {
+            format!(
+                "Boundary: {} cross-crate axiom(s): {} stipulated-base, {} proved-upstream",
+                inventory.len(), s, p
+            )
+        }
+    };
     let g = package_graph_for(krate, crate_name, tactic_bodies);
     let graph = g.view();
     let mut leafs: Vec<String> = Vec::new();
@@ -3995,6 +4028,7 @@ pub fn check_package(
                 .lock().unwrap_or_else(|p| p.into_inner()).clone(),
             island_cached: ISLAND_CACHED_VERDICTS.load(std::sync::atomic::Ordering::Relaxed),
             skipped_sccs, failures, bridge_note: None,
+            boundary_note,
         });
     }
     let pkg_dir = lean_out_root().join(sanitize(crate_name)).join("pkg");
@@ -4046,6 +4080,7 @@ pub fn check_package(
         skipped_sccs,
         failures,
         bridge_note,
+        boundary_note,
     })
 }
 
@@ -4512,6 +4547,61 @@ static LINK_MEMO: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, Option<()>>>,
 > = std::sync::OnceLock::new();
 
+/// b83 (milestone F, explicit cross-crate trust surface): the crate's
+/// Boundary inventory — `(name, class)` per defs-module axiom, sorted
+/// by name for determinism. Derived from the same `Command::Axiom`
+/// stream the `#tactus_check_axioms` whitelist is built from, so the
+/// manifest and the machine check can never disagree. `None` class =
+/// unclassified (no creation site produces one today — the `Axiom`
+/// struct field is compile-enforced — but render it LOUD if one ever
+/// appears rather than silently dropping it from the counts).
+pub fn boundary_inventory(
+    cmds: &[Command],
+) -> Vec<(String, Option<crate::lean_ast::BoundaryClass>)> {
+    let mut v: Vec<(String, Option<crate::lean_ast::BoundaryClass>)> = cmds.iter()
+        .filter_map(|c| match c {
+            Command::Axiom(a) => Some((a.name.clone(), a.boundary_class)),
+            _ => None,
+        })
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+/// Render the inventory as the Link module's header comment block.
+pub fn boundary_inventory_header(
+    inventory: &[(String, Option<crate::lean_ast::BoundaryClass>)],
+) -> String {
+    use crate::lean_ast::BoundaryClass;
+    let (mut stipulated, mut proved, mut unclassified) = (0usize, 0usize, 0usize);
+    let mut s = String::from("-- ── Boundary inventory (the explicit cross-crate trust surface, b83) ──\n");
+    if inventory.is_empty() {
+        s.push_str("-- (empty — crate is self-contained)\n");
+    }
+    for (name, class) in inventory {
+        let tag = match class {
+            Some(BoundaryClass::StipulatedBase) => {
+                stipulated += 1;
+                "stipulated-base"
+            }
+            Some(BoundaryClass::ProvedUpstream) => {
+                proved += 1;
+                "proved-upstream (theorem-izable debt — proved in the source crate)"
+            }
+            None => {
+                unclassified += 1;
+                "UNCLASSIFIED (!)"
+            }
+        };
+        s.push_str(&format!("-- {} — {}\n", name, tag));
+    }
+    s.push_str(&format!(
+        "-- totals: {} axiom(s): {} stipulated-base, {} proved-upstream, {} unclassified\n",
+        inventory.len(), stipulated, proved, unclassified
+    ));
+    s
+}
+
 /// Build + write the crate's Link module (DESIGN-emit-module.md §2.1
 /// M3): the machine-generated closure that turns per-fn
 /// hypothesis-passing theorems into stmt-typed CLOSED theorems —
@@ -4659,8 +4749,17 @@ fn build_link_module(
         .collect();
     let boundary_list = boundary.join(", ");
 
+    // b83: Boundary inventory header — the crate's explicit cross-crate
+    // trust surface, one comment line per axiom with its class (why
+    // it's trusted). Derived from the SAME `Command::Axiom` stream as
+    // the whitelist above, so the manifest and the machine check can
+    // never disagree. Comment-only: the per-theorem
+    // `#tactus_check_axioms` lines remain the check.
+    let inventory = boundary_inventory(&defs.cmds);
+
     let mut cmds: Vec<Command> = Vec::new();
     cmds.push(Command::Import(defs.module_name.clone()));
+    cmds.push(Command::Raw(boundary_inventory_header(&inventory)));
     // Stmt names arrive transitively via the pkg module imports below
     // (Lean imports are transitive) — no monolithic stmts module
     // exists anymore (M5d-2).

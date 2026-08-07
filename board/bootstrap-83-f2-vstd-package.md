@@ -109,3 +109,60 @@ surface into a diff-able artifact; B is the next real arm and deserves
 its own card/subject-matrix cycle rather than being folded into an F
 brick. B's card can be drafted from this card's E3 (the blocker census
 is already frozen).
+
+---
+
+## DESIGN FROZEN 2026-08-06 (Danielle: "A now, B carded")
+
+**E4 — classification signal (frozen):** `broadcast axiom fn` desugars
+to `#[verifier::external_body] proof fn` with an `unimplemented!()`
+body (builtin_macros/src/syntax.rs:1018-1024), so
+`f.x.attrs.is_external_body` distinguishes the two classes at emission
+time: `true` → **stipulated-base** (irreducible while vstd keeps
+`external_body`), `false` → **proved-upstream** (vstd proved it;
+re-stipulating is DEBT — theorem-izable by B).
+
+- **D1 — the class travels on the declaration.** `lean_ast::Axiom`
+  gains `pub boundary_class: Option<BoundaryClass>`
+  (`StipulatedBase | ProvedUpstream`; `None` = not Boundary content).
+  Set at every `Command::Axiom` creation site: broadcast lemmas by the
+  E4 signal (`to_lean_fn::broadcast_lemma_axiom_cmd`); type axioms,
+  uninterpreted spec fns, external-body Inhabited stipulations,
+  `tactus_lean_axiom_eq` pairs → `StipulatedBase`. Single source of
+  truth — no side registry; the Link builder derives everything from
+  `defs.cmds` as today.
+- **D2 — Boundary inventory in the Link module header.** Generated
+  comment block, deterministic (sorted by name): one line per entry
+  `-- <name> — stipulated-base | proved-upstream`; empty Boundary
+  prints `(empty — crate is self-contained)`. lean_pp also tags the
+  class in the axiom's own comment at its declaration site (the
+  `Axiom.comment` field's documented purpose: "the artifact must SAY
+  so"). Comment-only — the per-theorem `#tactus_check_axioms` lines
+  remain the machine check; the inventory is the transparency/diff
+  artifact, not a second check.
+- **D3 — gate-note line.** The package-gate note gains
+  `Boundary: N (S stipulated-base, P proved-upstream)` — B's progress
+  later shows as P→0. tactus-core today: `Boundary: 0`.
+- **D4 — pins.** Unit: inventory derivation + classification from
+  synthetic cmds. e2e: a `--tactus-package-check` test with
+  `broadcast use group_seq_axioms;` → non-empty manifest with BOTH
+  classes pinned (existing package-check e2e harness, TACTUS_CORE_OUT
+  wired). tactus-core gate: empty-manifest path. probe37's
+  `TactusLink_lib_exec.lean` re-copies from the gate pkg out (comment
+  drift only).
+- **D5 — battery:** units, fixture, tactus-core gate (warm), probes
+  9/11/13/14/17/37/38, e2e. No prelude change (prelude hash stable;
+  no cold gate needed — the b82 R0 lesson applies to prelude-text
+  changes only; noted anyway).
+- **D6 — B's card** (`board/bootstrap-84-a8-trait-assoc-projections.md`)
+  drafted from E3: the trait associated-type/instance-projection
+  coverage class as the next milestone-A-style arm, gating
+  vstd-as-package proper (M6).
+
+Risks: R1 — `Axiom`-struct field addition churns the ~8 construction
+sites (mechanical; compiler-driven). R2 — comment-only manifest could
+drift from the actual whitelist if a future axiom site forgets the
+class: mitigated by construction (the whitelist IS derived from the
+same `Command::Axiom` stream) + the D3 counts make a class-less entry
+loud (counted as unclassified → gate note shows it; unit pin asserts
+no `None` classes on Boundary entries).

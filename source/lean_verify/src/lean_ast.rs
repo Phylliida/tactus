@@ -103,6 +103,27 @@ pub struct Def {
     pub decreasing_by: Option<String>,
 }
 
+/// Why a Boundary axiom is trusted (milestone-F b83: the explicit
+/// cross-crate trust surface). `None` = not Boundary content (same-
+/// crate machinery that never lands in a defs module's axiom set).
+///
+/// The classification signal at emission time: `broadcast axiom fn`
+/// desugars to `#[verifier::external_body] proof fn`
+/// (builtin_macros/src/syntax.rs:1018-1024), so
+/// `FunctionX.attrs.is_external_body` splits the two classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundaryClass {
+    /// Stipulated, irreducible while vstd keeps `external_body`:
+    /// `broadcast axiom fn`s, cross-crate type axioms, uninterpreted
+    /// spec fns, external-body Inhabited stipulations,
+    /// `tactus_lean_axiom_eq` defining-equation pairs.
+    StipulatedBase,
+    /// vstd PROVED this (`broadcast proof fn`) — re-stipulating it as
+    /// an axiom is DEBT: theorem-izable when vstd ships as a package
+    /// (M6 / the trait-assoc-projection arm, b84).
+    ProvedUpstream,
+}
+
 /// Axiom: declares a constant whose value is unspecified.
 /// `[@[attr₁] @[attr₂]] axiom <name> [binders] : <ret_ty>`.
 ///
@@ -129,6 +150,12 @@ pub struct Axiom {
     /// generated Lean should never have to guess why a def became an
     /// axiom.
     pub comment: Option<String>,
+    /// Boundary classification (b83) — see `BoundaryClass`. The Link
+    /// module's Boundary inventory and the gate note's trust-inventory
+    /// counts derive from this field over the defs module's axiom
+    /// stream, so the manifest and the `#tactus_check_axioms`
+    /// whitelist can never disagree by construction.
+    pub boundary_class: Option<BoundaryClass>,
 }
 
 /// Curried-form definition with pattern-matched equations.

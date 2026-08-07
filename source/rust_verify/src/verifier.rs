@@ -3427,6 +3427,14 @@ impl Verifier {
                             report.discharge_detail,
                         )).to_any());
                     }
+                    // b83: the Boundary inventory one-liner — the
+                    // crate's explicit cross-crate trust surface as
+                    // per-class counts (stipulated-base vs
+                    // proved-upstream debt).
+                    reporter.report_now(&note_bare(format!(
+                        "tactus: {}",
+                        report.boundary_note,
+                    )).to_any());
                     // W4c (b68): the in-gate bridge's trust-inventory
                     // line (green runs only — bridge failures are
                     // `failures` entries and print as errors below).
