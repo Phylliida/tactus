@@ -358,7 +358,14 @@ Independent of the critical path; pick up in gap sessions:
   (REBUILD_LOCK) the prelude bump surfaced.
 - **vstd as a package**: the Boundary module shrinks to imports; the
   remaining vstd axioms become the explicit, closure-checked cross-crate
-  trust surface.
+  trust surface. **b83 (2026-08-06) landed the explicit half:** every
+  Boundary axiom carries a compile-enforced class
+  (`stipulated-base` vs `proved-upstream` — the theorem-izable debt),
+  the Link module header prints the sorted inventory with totals, and
+  the package gate reports the per-class counts. The shrink-to-imports
+  half is gated on the trait-assoc-projection coverage arm (card
+  `board/bootstrap-84-a8-trait-assoc-projections.md` — b83's probe
+  found vstd's defs emission blocked on it, 140/140 errors one class).
 - **Dual-backend differential mode**: same crate through Verus-Z3 and
   tactus, verdicts compared fn-by-fn — the standing cheap evidence for
   the frontend residue (`VERIFICATION-PATH.md` §5). The machinery
@@ -388,7 +395,7 @@ Independent of the critical path; pick up in gap sessions:
 | 11 | B2 — b68 default flip | small | b68 | P2, P3, 1–8, 10 |
 | 11b | A6-full — ∀-binder telescope arm (kills the tag) | **DONE 08-06** | b81 (closed) | post-flip (Q4) |
 | 12 | E — W8 authority flip | small-med | b13 | B soak (Q2) |
-| 13 | F — hygiene (**DONE 08-06, b82: arch pair is the only prelude axiom**) / vstd / differential | small ×3 | b82 (closed), new ×2 | — |
+| 13 | F — hygiene (**DONE 08-06, b82**) / vstd (**explicit Boundary DONE 08-06, b83**; shrink-to-imports gated on b84) / differential | small ×3 | b82, b83 (closed), b84 (carded), new ×1 | — |
 
 Items 2–4 are independent of each other and of 1; parallelize freely.
 7, 7b and 8 are the only real machinery arcs left in the program.

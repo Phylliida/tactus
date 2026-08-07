@@ -1,5 +1,29 @@
 # NEXT — bootstrap work queue (2026-07-21; superseded 2026-07-24)
 
+**2026-08-06 (eve): milestone F brick 2 (b83 explicit Boundary) DONE —
+card `board/bootstrap-83-f2-vstd-package.md`.** Every Boundary axiom
+now carries a compile-enforced class (`stipulated-base` vs
+`proved-upstream` — the theorem-izable debt; signal = the
+`axiom fn`→`external_body` desugar), the Link header prints the sorted
+inventory with totals, the package gate reports per-class counts
+(live subject: `Boundary: 19 (15 stipulated, 4 proved)`). The
+SHRINK half (theorem-izing vstd's lemma layer) is carded as **b84**
+(trait-assoc-projection coverage arm — b83's probe found vstd's own
+defs emission blocked on it, 140/140 one class). **Two
+standing-convention findings:** (1) the full-e2e recipe fail-fasts at
+the pre-existing examples pair — "829/2" was always a PREFIX
+(~31/130 binaries); the tactus suite hadn't run since ≥b68; (2) the
+suite was pre-existing RED (attribution at fb1fcba7: 397/164) on W7d
+census-line prefixes the JSON harness filter never learned — filter
+fixed (b14-class), suite now 560/2, and the 2 remaining reds are REAL
+pre-existing stmt-emission bugs (deref-decoration on non-Ref terms),
+carded as **b85** with frozen repros. Battery: units 439+7/0, gate
+298/0 + pkg 54 + discharge 205/0 + bridge 172/172 live + Boundary:0
+note, probes 9/11/13/14/17/37/38 ✓, golden byte-stable, e2e 829/2
+prefix + tactus 560/2. **NEXT (Danielle picks): b85 (real bugs —
+arguably first), b84 (the actual trust shrink), the differential
+runner (F brick 3), E (soak-gated).**
+
 **2026-08-06 (pm): milestone F brick 1 (b82 prelude hygiene) DONE —
 card `board/bootstrap-82-f1-prelude-hygiene.md` (completion + review
 records).** The three "shrink over time" prelude axioms are gone:
