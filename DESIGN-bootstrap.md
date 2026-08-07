@@ -102,7 +102,7 @@ Sizes from `source/lean_verify/src/` (25,383 lines total in the crate).
 | 4 | Statement assembly: `to_lean_fn` 1,627 + `trait_emit` 1,207 + `impl_subst` 863 + `generate` 2,077 | 5,774 | drift between axiom-statement and discharged theorem | R1 packages (drift impossible: shared defs) + R2 bridge |
 | 5 | `lean_ast` 1,928 + `lean_pp` 931 | 2,859 | mis-printing a correct AST | R2 Bridge-D leaves pp trusted-but-tiny; Bridge-R eliminates it (§5.3) |
 | 6 | Dep ordering / same-crate axiomatization: `dep_order` 948, islands' circularity | 948 | circular axiomatization | **R1 landed** (import DAG + Link — structurally impossible) |
-| 7 | Broadcast/cross-crate/vstd axioms | — | stipulated theorems | R1 Boundary module (explicit, whitelisted) → shrinks when vstd becomes a package (R1/M-later) |
+| 7 | Broadcast/cross-crate/vstd axioms | — | stipulated theorems | R1 Boundary module (explicit, whitelisted) + **b83**: per-axiom class (`stipulated-base`/`proved-upstream`) + Link-header inventory + gate counts; vstd-as-package shrink gated on b84 (trait-assoc projections) |
 | 8 | Prelude axioms (2: `arch_word_bits`, `arch_word_bits_valid`) | — | genuine axioms | **b82 landed** (closure-doc §4 hygiene): `Tactus.index`→def, `heightLt`/`hasResolved`→opaque; arch pair stays (honest platform assumption) |
 | 9 | Axiom-environment consistency (`nonempty.rs` brackets) | 516 | inconsistent env ⇒ user tactics prove False | landed (DESIGN-nonempty-axioms, model argument in DESIGN.md); brackets carry into stmt defs unchanged |
 | 10 | Tactic ladder / `tactus_auto` / Mathlib simp drift | — | *not soundness* (kernel checks); predictability/transparency | T (squeeze-and-pin) |
