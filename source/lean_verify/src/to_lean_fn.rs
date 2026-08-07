@@ -800,6 +800,7 @@ pub fn builtin_spec_fn_signature_axiom(
              Prop-valued fn types are inhabited, so this is conservative"
                 .to_string(),
         ),
+        boundary_class: Some(crate::lean_ast::BoundaryClass::StipulatedBase),
     }))
 }
 
@@ -844,6 +845,7 @@ pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Vec<Com
                      termination was verified by Verus (Z3) — see the attribute's doc"
                         .to_string(),
                 ),
+                boundary_class: Some(crate::lean_ast::BoundaryClass::StipulatedBase),
             });
             // LHS: f applied to every named non-instance binder (typ
             // params + value params, in binder order). Instance binders
@@ -865,6 +867,7 @@ pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Vec<Com
                 ret_ty: eq_body,
                 attrs: vec![],
                 comment: None,
+                boundary_class: Some(crate::lean_ast::BoundaryClass::StipulatedBase),
             });
             return vec![value_axiom, eq_axiom];
         }
@@ -925,7 +928,8 @@ pub fn spec_fn_to_ast(f: &FunctionX, ectx: &crate::emit_ctx::EmitCtx) -> Vec<Com
                 "body contains `call_ensures`/`call_requires` (no Lean encoding); \
                  axiomatized signature — see expr_shared::spec_fn_emits_as_axiom"
             ));
-            vec![Command::Axiom(Axiom { name, binders, ret_ty, attrs: vec![], comment })]
+            vec![Command::Axiom(Axiom { name, binders, ret_ty, attrs: vec![], comment,
+                boundary_class: Some(crate::lean_ast::BoundaryClass::StipulatedBase) })]
         }
     }
 }
@@ -999,12 +1003,24 @@ pub fn broadcast_lemma_axiom_cmd(
     ectx: &crate::emit_ctx::EmitCtx,
 ) -> Command {
     let (binders, goal) = proof_fn_signature(f, ectx);
+    // b83 (explicit cross-crate trust surface): `broadcast axiom fn`
+    // desugars to `#[verifier::external_body] proof fn`
+    // (builtin_macros/src/syntax.rs:1018-1024), so is_external_body
+    // splits stipulated-base (irreducible while vstd keeps
+    // external_body) from proved-upstream (vstd PROVED it —
+    // re-stipulating is theorem-izable debt, M6/b84).
+    let boundary_class = if f.attrs.is_external_body {
+        crate::lean_ast::BoundaryClass::StipulatedBase
+    } else {
+        crate::lean_ast::BoundaryClass::ProvedUpstream
+    };
     Command::Axiom(crate::lean_ast::Axiom {
         comment: None,
         name: lean_name(&f.name.path),
         binders,
         ret_ty: goal,
         attrs: Vec::new(),
+        boundary_class: Some(boundary_class),
     })
 }
 
@@ -1421,6 +1437,7 @@ fn external_body_type_cmds(dt: &DatatypeX) -> Vec<Command> {
         binders: vec![],
         ret_ty: type_ret_ty,
         attrs: vec![],
+        boundary_class: Some(crate::lean_ast::BoundaryClass::StipulatedBase),
     };
     // Inhabited axiom: `@[instance] axiom T.instInhabited (A : Type) ... :
     //   Inhabited (T A ...)`.
@@ -1442,6 +1459,7 @@ fn external_body_type_cmds(dt: &DatatypeX) -> Vec<Command> {
         binders: inhabited_binders,
         ret_ty: inhabited_ret_ty,
         attrs: vec!["instance".into()],
+        boundary_class: Some(crate::lean_ast::BoundaryClass::StipulatedBase),
     };
     vec![Command::Axiom(type_axiom), Command::Axiom(inhabited_axiom)]
 }

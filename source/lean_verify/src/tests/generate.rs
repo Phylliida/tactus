@@ -428,3 +428,50 @@ fn pkg_srckey_covers_stmt_imports() {
     assert!(pkg_srckey(&pkg, &defs_dir, prelude).is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── b83: Boundary inventory (explicit cross-crate trust surface) ─────
+
+fn stub_axiom(name: &str, class: Option<crate::lean_ast::BoundaryClass>) -> Command {
+    Command::Axiom(crate::lean_ast::Axiom {
+        name: name.to_string(),
+        binders: Vec::new(),
+        ret_ty: LExpr::lit_bool(true),
+        attrs: Vec::new(),
+        comment: None,
+        boundary_class: class,
+    })
+}
+
+/// The inventory is derived from the same `Command::Axiom` stream the
+/// closure-check whitelist uses, sorted by name, with per-class totals;
+/// an unclassified entry is rendered LOUD, never silently dropped.
+#[test]
+fn boundary_inventory_classification_and_totals() {
+    use crate::lean_ast::BoundaryClass;
+    let cmds = vec![
+        // interleaved with non-axiom commands; unsorted on purpose
+        stub_axiom("z.seq.axiom_seq_push_len", Some(BoundaryClass::StipulatedBase)),
+        Command::Raw("theorem t : True := by triv\n".to_string()),
+        stub_axiom("a.seq_lib.lemma_concat", Some(BoundaryClass::ProvedUpstream)),
+        stub_axiom("m.mystery", None),
+    ];
+    let inv = boundary_inventory(&cmds);
+    let names: Vec<&str> = inv.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, vec!["a.seq_lib.lemma_concat", "m.mystery", "z.seq.axiom_seq_push_len"],
+        "sorted by name, non-axiom commands excluded");
+    let header = boundary_inventory_header(&inv);
+    assert!(header.contains("a.seq_lib.lemma_concat — proved-upstream"), "{}", header);
+    assert!(header.contains("z.seq.axiom_seq_push_len — stipulated-base"), "{}", header);
+    assert!(header.contains("m.mystery — UNCLASSIFIED (!)"), "{}", header);
+    assert!(header.contains("totals: 3 axiom(s): 1 stipulated-base, 1 proved-upstream, 1 unclassified"),
+        "{}", header);
+}
+
+/// The empty Boundary is explicit about it (tactus-core's shape).
+#[test]
+fn boundary_inventory_empty_is_explicit() {
+    let header = boundary_inventory_header(&[]);
+    assert!(header.contains("(empty — crate is self-contained)"), "{}", header);
+    assert!(header.contains("totals: 0 axiom(s): 0 stipulated-base, 0 proved-upstream, 0 unclassified"),
+        "{}", header);
+}

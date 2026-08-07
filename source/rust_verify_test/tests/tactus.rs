@@ -13690,6 +13690,65 @@ fn test_bridge_no_bridge_opt_out() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// b83 (milestone F): the package gate's Boundary inventory note — the
+// crate's explicit cross-crate trust surface as per-class counts. The
+// subject deliberately uses a `broadcast axiom fn` (axiom_seq_push_len
+// → stipulated-base) AND a `broadcast proof fn`
+// (lemma_seq_concat_contains_all_elements → proved-upstream, the
+// theorem-izable debt class), so BOTH classes must appear and neither
+// may be unclassified. The classification signal
+// (external_body ⟺ `axiom fn` desugar) is validated live here against
+// real vstd content.
+#[test]
+fn test_boundary_inventory_note() {
+    let dir = tactus_e2e_test_dir("boundary_inventory");
+    let code = format!(
+        "{}{}\nuse vstd::prelude::*;\nverus! {{\n\
+         #[verifier::tactus_auto]\n\
+         fn push_grows(s: Seq<u8>) -> (r: bool)\n\
+         \x20   ensures r == (s.push(0).len() == s.len() + 1)\n\
+         {{\n\
+         \x20   broadcast use vstd::seq::axiom_seq_push_len;\n\
+         \x20   true\n\
+         }}\n\
+         #[verifier::tactus_auto]\n\
+         fn concat_covers(x: Seq<u8>, y: Seq<u8>, elt: u8) -> (r: bool)\n\
+         \x20   ensures r == (x.add(y).contains(elt) == (x.contains(elt) || y.contains(elt)))\n\
+         {{\n\
+         \x20   broadcast use vstd::seq_lib::lemma_seq_concat_contains_all_elements;\n\
+         \x20   true\n\
+         }}\n\
+         proof fn lemma_a(n: nat) ensures n + 0 == n by {{ omega }}\n\
+         }}\n",
+        FEATURE_PRELUDE, USE_PRELUDE,
+    );
+    let entry = dir.join("test.rs");
+    std::fs::write(&entry, &code).unwrap();
+    let out = run_verus(&["--lean-backend"], &dir, &entry, true, false);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "run failed:\n{}", stderr);
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("Boundary:"))
+        .unwrap_or_else(|| panic!("no Boundary note in stderr:\n{}", stderr));
+    // "Boundary: N cross-crate axiom(s): S stipulated-base, P proved-upstream"
+    let nums: Vec<usize> = line
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.parse::<usize>().unwrap())
+        .collect();
+    assert!(nums.len() == 3, "expected N/S/P counts in {:?}; stderr:\n{}", line, stderr);
+    let (n, s, p) = (nums[0], nums[1], nums[2]);
+    assert!(s >= 1, "subject uses a broadcast axiom fn (stipulated-base): {}", line);
+    assert!(p >= 1, "subject uses a broadcast proof fn (proved-upstream): {}", line);
+    assert_eq!(n, s + p, "every Boundary entry classified: {}", line);
+    assert!(
+        !stderr.contains("UNCLASSIFIED"),
+        "no unclassified Boundary entries; stderr:\n{}", stderr,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // W4c (b68) red-path pin: a deliberately perturbed cert MUST turn the
 // run red. The gate re-emits certs from SST every run, so an on-disk
 // edit never reaches the bridge — the pin drives the emission-side

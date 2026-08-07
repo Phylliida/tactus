@@ -288,6 +288,18 @@ fn write_command(out: &mut String, cmd: &Command, lm: &mut Landmarks) {
 }
 
 fn write_axiom(out: &mut String, a: &Axiom, lm: &mut Landmarks) {
+    // b83: the class tag rides the declaration itself — the artifact's
+    // reader sees WHY each axiom is trusted without cross-referencing
+    // the Link module's inventory.
+    if let Some(class) = &a.boundary_class {
+        out.push_str("-- trust: ");
+        out.push_str(match class {
+            crate::lean_ast::BoundaryClass::StipulatedBase => "stipulated-base",
+            crate::lean_ast::BoundaryClass::ProvedUpstream =>
+                "proved-upstream (theorem-izable debt — vstd proved this)",
+        });
+        out.push('\n');
+    }
     if let Some(c) = &a.comment {
         out.push_str("-- ");
         out.push_str(c);
