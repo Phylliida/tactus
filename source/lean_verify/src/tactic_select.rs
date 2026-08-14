@@ -2009,7 +2009,20 @@ pub(crate) fn nonlin_ladder(goal: &Expr, binders: &[Binder]) -> String {
             "(simp only [lib.Rational.denom, lib.Rational.denom_nat]; omega)".to_string(),
         );
     }
-    format!("first | {}", branches.join(" | "))
+    // nla-15: the verified `nonlinear_arith` tactic (the
+    // lean-nonlinear-arith package — z3's nlsat ported, kernel-checked
+    // trace) is the ladder's FIRST arm. It reads the hypotheses from
+    // the context (the walker's `intros;` prefix supplies them) and
+    // skips the ambient ∀-axiom cluster as inert, so it subsumes the
+    // pool arm's transitivity/congruence class with a checked
+    // certificate instead of a capped search. The heuristic arms stay
+    // behind it as fallback — definition-unfolding shapes (the
+    // denominator-positivity branch) are definitionally invisible to
+    // any arithmetic tactic, and nla-16 owns measuring which arm
+    // closes what.
+    let mut all = vec!["nonlinear_arith".to_string()];
+    all.extend(branches);
+    format!("first | {}", all.join(" | "))
 }
 
 /// One arithmetic hypothesis from the theorem binders: a binder whose

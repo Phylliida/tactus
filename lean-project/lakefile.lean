@@ -13,3 +13,7 @@ lean_lib TactusTutorialHelpers where
 
 require mathlib from git
   "https://github.com/leanprover-community/mathlib4" @ "v4.25.0"
+
+-- nla-15: the verified nonlinear_arith tactic (z3's nlsat ported;
+-- kernel-checked traces). Same lean+mathlib pin as this package.
+require LeanNonlinearArith from "../../lean-nonlinear-arith"
