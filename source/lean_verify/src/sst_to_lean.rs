@@ -204,12 +204,20 @@ pub(crate) fn bitvec_preamble_fragments() -> Vec<PreambleFragment> {
 
 /// Preamble fragments required by an `assert(P) by(nonlinear_arith)`
 /// scope. `nlinarith` lives in Mathlib's Linarith module (it's
-/// `linarith` extended with nonlinear preprocessing). Attached to
+/// `linarith` extended with nonlinear preprocessing); the primary arm
+/// is now the verified `nonlinear_arith` tactic from the
+/// LeanNonlinearArith package (nla-15 — the z3 nlsat port with
+/// kernel-checked traces). Attached to
 /// every theorem emitted inside a `Wp::AssertQuery` scope via
 /// `OblCtx::closer_preamble`; `krate_preamble` aggregates and dedups
 /// across the file.
 pub(crate) fn nonlinear_preamble_fragments() -> Vec<PreambleFragment> {
-    vec![PreambleFragment::Import("Mathlib.Tactic.Linarith".to_string())]
+    vec![
+        PreambleFragment::Import("Mathlib.Tactic.Linarith".to_string()),
+        // nla-15: the verified `nonlinear_arith` primary arm (the
+        // ladder's first branch — see nonlin_ladder).
+        PreambleFragment::Import("LeanNonlinearArith".to_string()),
+    ]
 }
 
 /// Render a `Tactic` as a Lean tactic text snippet. `Named` emits
